@@ -1,3 +1,4 @@
 dist/
 node_modules/
 .codex-team/
+.npmrc.local
