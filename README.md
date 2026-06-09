@@ -25,17 +25,34 @@ Unofficial Claude Agent Team compatibility for Codex, packaged as a stdio MCP se
 
 ## Quickstart
 
-Add the MCP server to your Codex configuration:
+Add the MCP server to your Codex configuration with pane mode enabled:
 
 ```json
 {
   "mcpServers": {
     "codex-team": {
       "command": "npx",
-      "args": ["-y", "codex-team-mcp@latest"]
+      "args": ["-y", "codex-team-mcp@latest"],
+      "env": {
+        "CODEX_TEAM_PANE_MODE": "1",
+        "CODEX_TEAM_PANE_BACKEND": "auto",
+        "CODEX_TEAM_PANE_SESSION_PREFIX": "codex-team",
+        "CODEX_TEAM_CODEX_COMMAND": "codex"
+      }
     }
   }
 }
+```
+
+For Codex CLI:
+
+```bash
+codex mcp add codex-team \
+  --env CODEX_TEAM_PANE_MODE=1 \
+  --env CODEX_TEAM_PANE_BACKEND=auto \
+  --env CODEX_TEAM_PANE_SESSION_PREFIX=codex-team \
+  --env CODEX_TEAM_CODEX_COMMAND=codex \
+  -- npx -y codex-team-mcp@latest
 ```
 
 Reload or restart Codex MCP servers, then confirm the tool inventory includes:
@@ -53,6 +70,9 @@ TeamDiagnostics
 ```
 
 If anything looks off, call `TeamDiagnostics` first. It reports package version, registered tools, state root, active bindings, lifecycle status, pane metadata, queued messages, task summaries, and workspace review state.
+
+> [!NOTE]
+> Pane mode is the recommended Agent Team experience because it can attempt visible TeamMate execution through tmux/iTerm2-style panes. If pane support is unavailable, core team tools still work and diagnostics report the degradation reason.
 
 ## Example Workflow
 
@@ -120,26 +140,9 @@ TaskUpdate({
 | `TaskGet` | Reads full task detail and task history. |
 | `TeamDiagnostics` | Reports tool, state, lifecycle, message, task, pane, and workspace summaries. |
 
-## Optional Pane Mode
+## Pane Mode
 
 Pane mode adds backend-dependent tmux/iTerm2-style attach and status metadata. It is useful when you want terminal visibility into TeamMate activity, but it does not change the message path or workspace safety rules.
-
-```json
-{
-  "mcpServers": {
-    "codex-team": {
-      "command": "npx",
-      "args": ["-y", "codex-team-mcp@latest"],
-      "env": {
-        "CODEX_TEAM_PANE_MODE": "1",
-        "CODEX_TEAM_PANE_BACKEND": "auto",
-        "CODEX_TEAM_PANE_SESSION_PREFIX": "codex-team",
-        "CODEX_TEAM_CODEX_COMMAND": "codex"
-      }
-    }
-  }
-}
-```
 
 Supported values:
 
@@ -149,6 +152,23 @@ Supported values:
 | `CODEX_TEAM_PANE_BACKEND` | `auto`, `tmux`, `iterm2` |
 | `CODEX_TEAM_PANE_SESSION_PREFIX` | trusted prefix for generated pane sessions |
 | `CODEX_TEAM_CODEX_COMMAND` | command used by pane-backed Codex runs |
+
+## Minimal Mode
+
+If you only want durable team state, messages, tasks, and diagnostics without attempting pane-backed TeamMate execution, omit the pane environment variables:
+
+```json
+{
+  "mcpServers": {
+    "codex-team": {
+      "command": "npx",
+      "args": ["-y", "codex-team-mcp@latest"]
+    }
+  }
+}
+```
+
+Minimal mode can create teams and TeamMate identities, persist messages, and manage tasks, but TeamMates usually remain scheduled with `backend_unavailable` until a start-capable backend is configured.
 
 ## Runtime State And Safety
 
