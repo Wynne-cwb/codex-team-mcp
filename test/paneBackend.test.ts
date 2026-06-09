@@ -1,0 +1,572 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  createITerm2PaneBackend,
+  createPaneBackendRegistry,
+  createTmuxPaneBackend,
+  sanitizePaneIdentifier,
+  type PaneBackendCommandRunner,
+  type PaneBackendMetadata
+} from "../src/adapters/paneBackend.js";
+import {
+  createTerminalCommandRunner,
+  type TerminalCommandExecutor
+} from "../src/adapters/terminalCommand.js";
+
+interface CommandCall {
+  command: string;
+  args: string[];
+  cwd?: string;
+}
+
+interface CommandResult {
+  stdout: string;
+  stderr?: string;
+  exitCode?: number;
+}
+
+function createFakeCommandRunner(
+  responses: Record<string, CommandResult>
+): PaneBackendCommandRunner & { calls: CommandCall[] } {
+  const calls: CommandCall[] = [];
+  const runner: PaneBackendCommandRunner & { calls: CommandCall[] } = {
+    calls,
+    run(command: string, args: string[], options?: { cwd?: string }) {
+      calls.push({ command, args, cwd: options?.cwd });
+      const key = [command, ...args].join(" ");
+      const result = responses[key] ?? responses[command];
+      if (!result || result.exitCode === 1) {
+        return {
+          ok: false,
+          stdout: result?.stdout ?? "",
+          stderr: result?.stderr ?? "command not found",
+          exit_code: result?.exitCode ?? 127
+        };
+      }
+
+      return {
+        ok: true,
+        stdout: result.stdout,
+        stderr: result.stderr ?? "",
+        exit_code: result.exitCode ?? 0
+      };
+    }
+  };
+
+  return runner;
+}
+
+const paneContext = {
+  run_id: "run:alpha:builder",
+  team_name: "alpha-team",
+  teammate_id: "builder@alpha-team",
+  workspace_root: "/workspace",
+  start_command: ["codex", "exec", "--json", "bootstrap teammate"]
+};
+
+describe("pane terminal command runner", () => {
+  it("runs terminal commands with argument arrays and no shell interpolation", async () => {
+    const calls: Array<{
+      command: string;
+      args: string[];
+      options?: { cwd?: string; shell?: boolean };
+    }> = [];
+    const executor: TerminalCommandExecutor = async (command, args, options) => {
+      calls.push({ command, args, options });
+      return { stdout: "ok", stderr: "", exit_code: 0 };
+    };
+    const runner = createTerminalCommandRunner({ executor });
+    const unsafeSessionName = "codex-team-alpha; rm -rf /";
+
+    await runner.run("tmux", ["new-session", "-d", "-s", unsafeSessionName], {
+      cwd: "/workspace"
+    });
+
+    expect(calls).toEqual([
+      {
+        command: "tmux",
+        args: ["new-session", "-d", "-s", unsafeSessionName],
+        options: expect.objectContaining({
+          cwd: "/workspace",
+          shell: false
+        })
+      }
+    ]);
+    expect(calls[0]?.command).not.toContain(" ");
+    expect(calls[0]?.command).not.toContain(";");
+    expect(calls[0]?.args).toContain(unsafeSessionName);
+  });
+});
+
+describe("pane backend detection and metadata", () => {
+  it("detects tmux before iTerm2", () => {
+    const commandRunner = createFakeCommandRunner({
+      tmux: { stdout: "tmux 3.6a\n" },
+      it2: { stdout: "it2 0.2.3\n" }
+    });
+
+    const registry = createPaneBackendRegistry({
+      preferredBackend: "auto",
+      env: {
+        TERM_PROGRAM: "iTerm.app",
+        ITERM_SESSION_ID: "w0t0p0:session"
+      },
+      commandRunner
+    });
+
+    expect(registry.describeAvailability()).toMatchObject({
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available"
+    });
+    expect(commandRunner.calls[0]).toMatchObject({
+      command: "tmux",
+      args: ["-V"]
+    });
+    expect(commandRunner.calls.map((call) => call.command)).not.toContain("it2");
+  });
+
+  it("creates an external tmux session with a concrete attach command when outside tmux", () => {
+    const commandRunner = createFakeCommandRunner({
+      tmux: { stdout: "tmux 3.6a\n" },
+      "tmux -L codex-team-alpha-team-run-alpha-builder new-session -d -s codex-team-alpha-team -n teammates -P -F #{pane_id}":
+        { stdout: "%12\n" }
+    });
+    const backend = createTmuxPaneBackend({
+      env: {},
+      commandRunner,
+      stableId: "run-alpha-builder"
+    });
+
+    const result = backend.createPane(paneContext);
+
+    expect(result.pane).toMatchObject({
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available",
+      pane_id: "%12",
+      session_name: "codex-team-alpha-team",
+      window_name: "teammates",
+      socket_name: "codex-team-alpha-team-run-alpha-builder",
+      is_native: false
+    } satisfies Partial<PaneBackendMetadata>);
+    expect(result.pane.attach_command).toMatch(
+      /tmux -L 'codex-team-.*' attach-session -t 'codex-team-.*'/
+    );
+    expect(result.pane.attach_command).toContain("tmux -L 'codex-team-");
+    expect(result.pane.attach_command).toContain(
+      "attach-session -t 'codex-team-"
+    );
+    expect(commandRunner.calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          command: "tmux",
+          args: expect.arrayContaining([
+            "-L",
+            "codex-team-alpha-team-run-alpha-builder",
+            "new-session",
+            "-d",
+            "-s",
+            "codex-team-alpha-team"
+          ])
+        })
+      ])
+    );
+  });
+
+  it("claim downgrade keeps tmux attach metadata status-only without executing Codex", () => {
+    const commandRunner = createFakeCommandRunner({
+      tmux: { stdout: "tmux 3.6a\n" },
+      "tmux -L codex-team-alpha-team-run-alpha-builder new-session -d -s codex-team-alpha-team -n teammates -P -F #{pane_id}":
+        { stdout: "%12\n" }
+    });
+    const backend = createTmuxPaneBackend({
+      env: {},
+      commandRunner,
+      stableId: "run-alpha-builder"
+    });
+
+    const result = backend.createPane(paneContext, [
+      "codex",
+      "exec",
+      "--json",
+      "SENTINEL_TMUX"
+    ]);
+
+    expect(result.thread_id).toBeUndefined();
+    expect(result.pane).toMatchObject({
+      backend_type: "tmux",
+      availability_status: "available",
+      pane_id: "%12"
+    } satisfies Partial<PaneBackendMetadata>);
+    expect(commandRunner.calls.some((call) => call.command === "codex")).toBe(
+      false
+    );
+  });
+
+  it("records native tmux pane metadata when TMUX and TMUX_PANE are present", () => {
+    const commandRunner = createFakeCommandRunner({
+      tmux: { stdout: "tmux 3.6a\n" },
+      "tmux display-message -p #{session_name}": { stdout: "leader-session\n" },
+      "tmux display-message -p #{window_name}": { stdout: "leader-window\n" },
+      "tmux split-window -d -P -F #{pane_id}": { stdout: "%42\n" }
+    });
+    const backend = createTmuxPaneBackend({
+      env: {
+        TMUX: "/tmp/tmux-501/default,123,0",
+        TMUX_PANE: "%1"
+      },
+      commandRunner
+    });
+
+    expect(backend.createPane(paneContext).pane).toMatchObject({
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available",
+      pane_id: "%42",
+      session_name: "leader-session",
+      window_name: "leader-window",
+      socket_name: "default",
+      attach_command: "tmux attach-session -t 'leader-session'",
+      is_native: true
+    } satisfies Partial<PaneBackendMetadata>);
+  });
+
+  it("includes native tmux socket name in attach command for non-default sockets", () => {
+    const commandRunner = createFakeCommandRunner({
+      tmux: { stdout: "tmux 3.6a\n" },
+      "tmux display-message -p #{session_name}": { stdout: "leader-session\n" },
+      "tmux display-message -p #{window_name}": { stdout: "leader-window\n" },
+      "tmux split-window -d -P -F #{pane_id}": { stdout: "%42\n" }
+    });
+    const backend = createTmuxPaneBackend({
+      env: {
+        TMUX: "/tmp/tmux-501/custom,123,0",
+        TMUX_PANE: "%1"
+      },
+      commandRunner
+    });
+
+    const result = backend.createPane(paneContext);
+
+    expect(result.pane).toMatchObject({
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available",
+      pane_id: "%42",
+      session_name: "leader-session",
+      window_name: "leader-window",
+      socket_name: "custom",
+      attach_command: "tmux -L 'custom' attach-session -t 'leader-session'",
+      is_native: true
+    } satisfies Partial<PaneBackendMetadata>);
+    expect(
+      commandRunner.calls.some((call) => call.args.includes("attach-session"))
+    ).toBe(false);
+  });
+
+  it("shell-quotes native tmux attach commands and redacts SECRET identifiers case-insensitively", () => {
+    const commandRunner = createFakeCommandRunner({
+      tmux: { stdout: "tmux 3.6a\n" },
+      "tmux display-message -p #{session_name}": {
+        stdout: "work; rm -rf \"$HOME\"\n"
+      },
+      "tmux display-message -p #{window_name}": { stdout: "leader-window\n" },
+      "tmux split-window -d -P -F #{pane_id}": { stdout: "%42\n" }
+    });
+    const backend = createTmuxPaneBackend({
+      env: {
+        TMUX: "/tmp/tmux-501/default,123,0",
+        TMUX_PANE: "%1"
+      },
+      commandRunner
+    });
+
+    const result = backend.createPane(paneContext);
+
+    expect(result.pane.attach_command).toBe(
+      "tmux attach-session -t 'work; rm -rf \"$HOME\"'"
+    );
+    expect(sanitizePaneIdentifier("SECRET_API_TOKEN", "fallback")).toBe(
+      "redacted-secret"
+    );
+    expect(sanitizePaneIdentifier("secret_api_token", "fallback")).toBe(
+      "redacted-secret"
+    );
+  });
+
+  it("marks tmux pane metadata stale when list-panes does not include the pane", () => {
+    const commandRunner = createFakeCommandRunner({
+      tmux: { stdout: "tmux 3.6a\n" },
+      "tmux -L default list-panes -a -F #{pane_id}": { stdout: "%99\n" }
+    });
+    const backend = createTmuxPaneBackend({
+      env: {},
+      commandRunner
+    });
+
+    const result = backend.reconcilePane?.({
+      ...paneContext,
+      metadata: {
+        backend_metadata: {
+          pane: {
+            mode: "pane",
+            backend_type: "tmux",
+            availability_status: "available",
+            pane_id: "%42",
+            socket_name: "default",
+            session_name: "leader-session"
+          }
+        }
+      }
+    });
+
+    expect(result).toMatchObject({
+      status: "stale",
+      deleted: false,
+      pane: {
+        backend_type: "tmux",
+        availability_status: "degraded",
+        degradation_reason: expect.stringContaining("tmux pane not found")
+      }
+    });
+    expect(commandRunner.calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          command: "tmux",
+          args: ["-L", "default", "list-panes", "-a", "-F", "#{pane_id}"]
+        })
+      ])
+    );
+  });
+
+  it("reports iTerm2 as unavailable when TERM_PROGRAM or ITERM_SESSION_ID is missing", () => {
+    const commandRunner = createFakeCommandRunner({
+      it2: { stdout: "it2 0.2.3\n" }
+    });
+    const backend = createITerm2PaneBackend({
+      env: {
+        TERM_PROGRAM: "Apple_Terminal"
+      },
+      commandRunner
+    });
+
+    expect(backend.describeAvailability()).toMatchObject({
+      mode: "pane",
+      backend_type: "iterm2",
+      availability_status: "unavailable",
+      degradation_reason: expect.stringContaining("ITERM_SESSION_ID")
+    } satisfies Partial<PaneBackendMetadata>);
+  });
+
+  it("claim downgrade keeps iTerm2 attach metadata status-only without executing Codex", () => {
+    const commandRunner = createFakeCommandRunner({
+      it2: { stdout: "it2 0.2.3\n" },
+      "it2 split-pane": { stdout: "iterm-pane-1\n" }
+    });
+    const backend = createITerm2PaneBackend({
+      env: {
+        TERM_PROGRAM: "iTerm.app",
+        ITERM_SESSION_ID: "w0t0p0:session"
+      },
+      commandRunner
+    });
+
+    const result = backend.createPane(paneContext, [
+      "codex",
+      "exec",
+      "--json",
+      "SENTINEL_ITERM2"
+    ]);
+
+    expect(result.thread_id).toBeUndefined();
+    expect(result.pane).toMatchObject({
+      backend_type: "iterm2",
+      availability_status: "available",
+      pane_id: "iterm-pane-1"
+    } satisfies Partial<PaneBackendMetadata>);
+    expect(commandRunner.calls.some((call) => call.command === "codex")).toBe(
+      false
+    );
+  });
+
+  it("marks iTerm2 pane metadata stale when session list does not include the pane", () => {
+    const commandRunner = createFakeCommandRunner({
+      it2: { stdout: "it2 0.2.3\n" },
+      "it2 session list": { stdout: "other-session\n" }
+    });
+    const backend = createITerm2PaneBackend({
+      env: {
+        TERM_PROGRAM: "iTerm.app",
+        ITERM_SESSION_ID: "w0t0p0:session"
+      },
+      commandRunner
+    });
+
+    const result = backend.reconcilePane?.({
+      ...paneContext,
+      metadata: {
+        pane: {
+          mode: "pane",
+          backend_type: "iterm2",
+          availability_status: "available",
+          pane_id: "iterm-pane-1",
+          session_name: "w0t0p0:session"
+        }
+      }
+    });
+
+    expect(result).toMatchObject({
+      status: "stale",
+      deleted: false,
+      pane: {
+        backend_type: "iterm2",
+        availability_status: "degraded",
+        degradation_reason: expect.stringContaining("iterm2 pane not found")
+      }
+    });
+    expect(commandRunner.calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          command: "it2",
+          args: ["session", "list"]
+        })
+      ])
+    );
+  });
+
+  it("marks iTerm2 pane metadata stale when live output only contains an overlapping pane ID", () => {
+    const commandRunner = createFakeCommandRunner({
+      it2: { stdout: "it2 0.2.3\n" },
+      "it2 session list": {
+        stdout: "window iterm-pane-10 w0t0p0:session-10\n"
+      }
+    });
+    const backend = createITerm2PaneBackend({
+      env: {
+        TERM_PROGRAM: "iTerm.app",
+        ITERM_SESSION_ID: "w0t0p0:session"
+      },
+      commandRunner
+    });
+
+    const result = backend.reconcilePane?.({
+      ...paneContext,
+      metadata: {
+        pane: {
+          mode: "pane",
+          backend_type: "iterm2",
+          availability_status: "available",
+          pane_id: "iterm-pane-1",
+          session_name: "w0t0p0:session-1"
+        }
+      }
+    });
+
+    expect(result).toMatchObject({
+      status: "stale",
+      deleted: false,
+      pane: {
+        backend_type: "iterm2",
+        availability_status: "degraded",
+        degradation_reason: expect.stringContaining("iterm2 pane not found")
+      }
+    });
+    expect(commandRunner.calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          command: "it2",
+          args: ["session", "list"]
+        })
+      ])
+    );
+  });
+
+  it("keeps iTerm2 pane metadata active when live output contains an exact pane token", () => {
+    const commandRunner = createFakeCommandRunner({
+      it2: { stdout: "it2 0.2.3\n" },
+      "it2 session list": {
+        stdout: "window iterm-pane-1 w0t0p0:session-10\n"
+      }
+    });
+    const backend = createITerm2PaneBackend({
+      env: {
+        TERM_PROGRAM: "iTerm.app",
+        ITERM_SESSION_ID: "w0t0p0:session"
+      },
+      commandRunner
+    });
+
+    const result = backend.reconcilePane?.({
+      ...paneContext,
+      metadata: {
+        pane: {
+          mode: "pane",
+          backend_type: "iterm2",
+          availability_status: "available",
+          pane_id: "iterm-pane-1",
+          session_name: "w0t0p0:session-1"
+        }
+      }
+    });
+
+    expect(result).toMatchObject({
+      status: "active",
+      deleted: false,
+      pane: {
+        backend_type: "iterm2",
+        availability_status: "available"
+      }
+    });
+    expect(commandRunner.calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          command: "it2",
+          args: ["session", "list"]
+        })
+      ])
+    );
+  });
+
+  it("reports pane unavailable with degradation reason when no backend command is found", () => {
+    const commandRunner = createFakeCommandRunner({});
+    const registry = createPaneBackendRegistry({
+      preferredBackend: "tmux",
+      env: {},
+      commandRunner
+    });
+
+    expect(registry.describeAvailability()).toMatchObject({
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "unavailable",
+      degradation_reason: expect.stringContaining("tmux")
+    } satisfies Partial<PaneBackendMetadata>);
+  });
+
+  it("sanitizes attach command display without storing prompt message task or body text", () => {
+    const commandRunner = createFakeCommandRunner({
+      tmux: { stdout: "tmux 3.6a\n" },
+      "tmux -L codex-team-alpha-team-redaction new-session -d -s codex-team-alpha-team -n teammates -P -F #{pane_id}":
+        { stdout: "%9\n" }
+    });
+    const backend = createTmuxPaneBackend({
+      env: {},
+      commandRunner,
+      stableId: "redaction"
+    });
+    const sensitiveText = "SECRET_PANE_PROMPT message task body";
+
+    const result = backend.createPane({
+      ...paneContext,
+      start_command: ["codex", "exec", "--json", sensitiveText]
+    });
+    const serialized = JSON.stringify(result.pane);
+
+    expect(result.pane.attach_command).not.toContain(sensitiveText);
+    expect(serialized).not.toContain("SECRET_PANE_PROMPT");
+    for (const redactedKey of ["prompt", "message", "task", "body"]) {
+      expect(result.pane).not.toHaveProperty(redactedKey);
+    }
+  });
+});

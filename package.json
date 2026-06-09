@@ -1,0 +1,52 @@
+{
+  "name": "codex-team-mcp",
+  "version": "0.1.0",
+  "description": "Unofficial Claude Agent Team compatibility MCP server for Codex.",
+  "type": "module",
+  "bin": {
+    "codex-team-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist/",
+    "docs/",
+    "skills/",
+    "scripts/smoke-list-tools.mjs",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build",
+    "test": "vitest",
+    "smoke:list-tools": "node scripts/smoke-list-tools.mjs",
+    "pack:dry-run": "npm pack --dry-run"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/Wynne-cwb/codex-team-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Wynne-cwb/codex-team-mcp/issues"
+  },
+  "homepage": "https://github.com/Wynne-cwb/codex-team-mcp#readme",
+  "keywords": [
+    "codex",
+    "mcp",
+    "model-context-protocol",
+    "agent-team",
+    "claude-code"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "better-sqlite3": "^12.10.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.19.19",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.8"
+  }
+}
