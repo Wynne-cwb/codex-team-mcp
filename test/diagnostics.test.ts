@@ -1643,4 +1643,80 @@ describe("TeamDiagnostics payload", () => {
       countEventsByType(stateRoot, workspaceRoot, EVENT_TYPES.teammateRunCompleted)
     ).toBe(1);
   });
+
+  it("exposes terminal-context booleans under include_debug matching the injected env (D-02)", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace";
+
+    // Fake it2 probe: ok only for `it2 session list`.
+    const it2RunnerOk = {
+      run: (command: string, args: string[]) => {
+        const ok = command === "it2" && args.join(" ") === "session list";
+        return { ok, stdout: "", stderr: ok ? "" : "no it2", exit_code: ok ? 0 : 1 };
+      }
+    };
+
+    const itermPayload = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      includeDebug: true,
+      terminalEnv: {
+        TERM_PROGRAM: "iTerm.app",
+        ITERM_SESSION_ID: "w0t0p0:session"
+      },
+      terminalCommandRunner: it2RunnerOk,
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+
+    expect(itermPayload.debug?.terminalContext).toEqual({
+      inside_tmux: false,
+      in_iterm2: true,
+      it2_api_ok: true
+    });
+
+    const it2RunnerFail = {
+      run: () => ({ ok: false, stdout: "", stderr: "no it2", exit_code: 1 })
+    };
+
+    const tmuxPayload = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      includeDebug: true,
+      terminalEnv: { TMUX: "/tmp/tmux-501/default,1,0" },
+      terminalCommandRunner: it2RunnerFail,
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+
+    expect(tmuxPayload.debug?.terminalContext).toEqual({
+      inside_tmux: true,
+      in_iterm2: false,
+      it2_api_ok: false
+    });
+
+    // D-02: only the three booleans surface — never raw env values or it2 stdout.
+    const serialized = JSON.stringify({
+      iterm: itermPayload.debug?.terminalContext,
+      tmux: tmuxPayload.debug?.terminalContext
+    });
+    expect(serialized).not.toContain("iTerm.app");
+    expect(serialized).not.toContain("w0t0p0");
+    expect(serialized).not.toContain("/tmp/tmux-501");
+  });
+
+  it("omits the terminal-context block when include_debug is not set", () => {
+    const payload = buildDiagnosticsPayload({
+      stateRoot: createTempStateRoot(),
+      workspaceRoot: "/workspace",
+      terminalEnv: {
+        TERM_PROGRAM: "iTerm.app",
+        ITERM_SESSION_ID: "w0t0p0:session"
+      },
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+
+    expect(payload.debug).toBeUndefined();
+  });
 });

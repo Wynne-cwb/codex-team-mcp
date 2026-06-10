@@ -144,6 +144,102 @@ export function buildTmuxSocketName(teamName: string, runSuffix: string): string
   return `${SOCKET_NAME_PREFIX}${shortHash}`.slice(0, MAX_SOCKET_NAME_LENGTH);
 }
 
+/**
+ * Debug-only terminal-context signal (D-02). Three booleans only — never any env
+ * values or it2 stdout — so it is safe to surface under TeamDiagnostics
+ * include_debug. Lets us confirm whether codex forwards TERM_PROGRAM /
+ * ITERM_SESSION_ID to the MCP server process and whether the it2 API is reachable.
+ */
+export interface TerminalContext {
+  inside_tmux: boolean;
+  in_iterm2: boolean;
+  it2_api_ok: boolean;
+}
+
+export interface TerminalContextOptions {
+  env?: NodeJS.ProcessEnv;
+  commandRunner?: PaneBackendCommandRunner;
+}
+
+/**
+ * Inside tmux iff the TMUX env var is set. We ONLY check TMUX — never `tmux -V`
+ * or `tmux display-message`, which succeed merely because tmux is installed or a
+ * server exists, not because THIS process runs inside tmux.
+ */
+export function isInsideTmuxEnv(env: NodeJS.ProcessEnv): boolean {
+  return Boolean(env.TMUX && env.TMUX.trim());
+}
+
+/**
+ * In iTerm2 iff TERM_PROGRAM === 'iTerm.app' OR ITERM_SESSION_ID is set, matching
+ * restored-src detection.ts `isInITerm2`.
+ */
+export function isInITerm2Env(env: NodeJS.ProcessEnv): boolean {
+  return (
+    env.TERM_PROGRAM === "iTerm.app" || Boolean(env.ITERM_SESSION_ID?.trim())
+  );
+}
+
+/**
+ * it2 API reachable iff `it2 session list` exits 0 — verifies the it2 CLI AND
+ * the iTerm2 Python API, unlike `it2 --version` which passes with the API off.
+ */
+export function isIt2ApiAvailable(commandRunner: PaneBackendCommandRunner): boolean {
+  return commandRunner.run("it2", ["session", "list"]).ok;
+}
+
+export function describeTerminalContext(
+  options: TerminalContextOptions = {}
+): TerminalContext {
+  const env = options.env ?? process.env;
+  const commandRunner = options.commandRunner ?? createTerminalContextCommandRunner();
+  return {
+    inside_tmux: isInsideTmuxEnv(env),
+    in_iterm2: isInITerm2Env(env),
+    it2_api_ok: isIt2ApiAvailable(commandRunner)
+  };
+}
+
+/**
+ * Parses the new session id from `it2 session split` output
+ * ("Created new pane: <session-id>"), mirroring ITermBackend.ts parseSplitOutput.
+ * Returns "" when the line is absent so callers can fall back.
+ */
+export function parseITerm2SplitOutput(output: string): string {
+  const match = output.match(/Created new pane:\s*(.+)/);
+  return match && match[1] ? match[1].trim() : "";
+}
+
+/**
+ * Extracts the leader session UUID from ITERM_SESSION_ID ("wXtYpZ:UUID").
+ * Returns null when not in iTerm2 / the env var is missing or malformed.
+ */
+function iterm2LeaderSessionId(env: NodeJS.ProcessEnv): string | null {
+  const sessionId = env.ITERM_SESSION_ID;
+  if (!sessionId) {
+    return null;
+  }
+  const colonIndex = sessionId.indexOf(":");
+  if (colonIndex === -1) {
+    return null;
+  }
+  const uuid = sessionId.slice(colonIndex + 1).trim();
+  return uuid.length > 0 ? uuid : null;
+}
+
+/**
+ * Builds the `it2 session split` args. Uses `-v` (vertical split) and targets the
+ * leader session with `-s <sessionId>` when it can be derived, else splits the
+ * active session. Passed to execFile as an argv array (no shell), so the raw
+ * session id is safe and must stay un-mangled for `-s` targeting to work.
+ */
+function buildITerm2SplitArgs(env: NodeJS.ProcessEnv): string[] {
+  const leaderSessionId = iterm2LeaderSessionId(env);
+  return leaderSessionId
+    ? ["session", "split", "-v", "-s", leaderSessionId]
+    : ["session", "split", "-v"];
+}
+
 export function createDefaultPaneBackendRegistry(
   options: PaneBackendRegistryOptions = {}
 ): PaneBackendRegistry {
@@ -154,9 +250,15 @@ export function createPaneBackendRegistry(
   options: PaneBackendRegistryOptions = {}
 ): PaneBackendRegistry {
   const preferredBackend = options.preferredBackend ?? "auto";
+  const env = options.env ?? process.env;
   const tmux = createTmuxPaneBackend(options);
   const iterm2 = createITerm2PaneBackend(options);
 
+  // Auto-selection mirrors restored-src swarm backend detection: pick the
+  // backend matching the ACTUAL terminal context the MCP server runs in, NOT
+  // merely what is INSTALLED. The previous logic gated on `tmux -V` (installed)
+  // and so always picked tmux on any machine with tmux on PATH — even in a plain
+  // iTerm2 window where the native split should go to iTerm2.
   function selectBackend(): PaneBackend {
     if (preferredBackend === "tmux") {
       return tmux;
@@ -165,16 +267,29 @@ export function createPaneBackendRegistry(
       return iterm2;
     }
 
-    const tmuxAvailability = tmux.describeAvailability();
-    if (tmuxAvailability.availability_status === "available") {
+    // 1. Inside tmux (TMUX env var set) -> tmux backend. createPane does the
+    //    native split when env.TMUX && env.TMUX_PANE are present.
+    if (isInsideTmuxEnv(env)) {
       return tmux;
     }
 
-    const iterm2Availability = iterm2.describeAvailability();
-    if (iterm2Availability.availability_status === "available") {
+    // 2. In an iTerm2 window AND the it2 Python API is reachable
+    //    (`it2 session list` exits 0) -> iTerm2 backend. The context check
+    //    short-circuits so we never probe it2 outside iTerm2.
+    if (
+      isInITerm2Env(env) &&
+      iterm2.describeAvailability().availability_status === "available"
+    ) {
       return iterm2;
     }
 
+    // 3. tmux is INSTALLED (`tmux -V` ok) -> external detached tmux session.
+    //    Nothing auto-opens here, so this surfaces as attach-only / degraded UX.
+    if (tmux.describeAvailability().availability_status === "available") {
+      return tmux;
+    }
+
+    // 4. Nothing available -> tmux backend returns its `unavailable` metadata.
     return tmux;
   }
 
@@ -277,20 +392,24 @@ export function createITerm2PaneBackend(
   const env = options.env ?? process.env;
 
   function describeAvailability(): PaneBackendMetadata {
-    const version = commandRunner.run("it2", ["--version"]);
-    if (!version.ok) {
+    // Require the iTerm2 env context first so we never probe it2 outside iTerm2.
+    if (!isInITerm2Env(env)) {
       return unavailablePaneMetadata(
         "iterm2",
-        `it2 command unavailable: ${sanitizePaneText(
-          version.stderr || "it2 command not found"
-        )}`
+        "iterm2_session_unavailable: TERM_PROGRAM=iTerm.app or ITERM_SESSION_ID is required"
       );
     }
 
-    if (env.TERM_PROGRAM !== "iTerm.app" || !env.ITERM_SESSION_ID?.trim()) {
+    // `it2 session list` (exit 0) verifies BOTH the it2 CLI is present AND the
+    // iTerm2 Python API is reachable. `it2 --version` passes even when the API
+    // is disabled, which makes `it2 session split` fail later with no fallback.
+    const sessionList = commandRunner.run("it2", ["session", "list"]);
+    if (!sessionList.ok) {
       return unavailablePaneMetadata(
         "iterm2",
-        "iterm2_session_unavailable: TERM_PROGRAM=iTerm.app and ITERM_SESSION_ID are required"
+        `it2 session list unavailable: ${sanitizePaneText(
+          sessionList.stderr || "it2 CLI or iTerm2 Python API not reachable"
+        )}`
       );
     }
 
@@ -316,7 +435,14 @@ export function createITerm2PaneBackend(
         options.stableId ?? context.run_id,
         "run"
       );
-      const result = commandRunner.run("it2", ["split-pane"], {
+      // Mirror restored-src ITermBackend.ts: split with `it2 session split` and a
+      // vertical (`-v`) split. Target the leader session via `-s <sessionId>`
+      // (parsed from ITERM_SESSION_ID) when available so the new pane lands in the
+      // same window and its returned UUID is valid; otherwise split the active
+      // session. NOTE (v1): teammate sessions are not tracked here, so every
+      // teammate splits from the leader rather than stacking off the prior
+      // teammate — acceptable per the backend's best-effort, non-gating contract.
+      const result = commandRunner.run("it2", buildITerm2SplitArgs(env), {
         cwd: context.workspace_path ?? context.workspace_root
       });
       if (!result.ok) {
@@ -329,7 +455,9 @@ export function createITerm2PaneBackend(
         };
       }
 
-      const paneId = sanitizePaneText(result.stdout.trim() || runSuffix);
+      const paneId = sanitizePaneText(
+        parseITerm2SplitOutput(result.stdout) || result.stdout.trim() || runSuffix
+      );
       return {
         ok: true,
         pane: {
@@ -637,6 +765,46 @@ function outputContainsExactToken(stdout: string, expected: string): boolean {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .some((line) => line === expected || line.split(/\s+/).includes(expected));
+}
+
+// Debug-only terminal-context probe runner. Bounds `it2 session list` with a
+// short timeout so a hung iTerm2 Python API can never stall a diagnostics call;
+// a timeout/spawn error is caught and reported as ok:false (it2_api_ok = false).
+const TERMINAL_CONTEXT_PROBE_TIMEOUT_MS = 3000;
+
+function createTerminalContextCommandRunner(): PaneBackendCommandRunner {
+  return {
+    run(command, args, options) {
+      try {
+        const result = runTerminalCommand(command, args, {
+          ...options,
+          timeoutMs: TERMINAL_CONTEXT_PROBE_TIMEOUT_MS
+        });
+        return {
+          ok: true,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          exit_code: result.exitCode
+        };
+      } catch (error) {
+        if (error instanceof TerminalCommandError) {
+          return {
+            ok: false,
+            stdout: error.stdout,
+            stderr: error.stderr || error.message,
+            exit_code: error.exitCode
+          };
+        }
+
+        return {
+          ok: false,
+          stdout: "",
+          stderr: sanitizePaneText(error instanceof Error ? error.message : String(error)),
+          exit_code: 1
+        };
+      }
+    }
+  };
 }
 
 function createCommandRunner(): PaneBackendCommandRunner {

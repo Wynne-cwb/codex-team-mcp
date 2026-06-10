@@ -101,10 +101,114 @@ describe("pane terminal command runner", () => {
 });
 
 describe("pane backend detection and metadata", () => {
-  it("detects tmux before iTerm2", () => {
+  it("auto-selects native tmux when inside tmux (TMUX set), without probing it2", () => {
     const commandRunner = createFakeCommandRunner({
       tmux: { stdout: "tmux 3.6a\n" },
       it2: { stdout: "it2 0.2.3\n" }
+    });
+
+    const registry = createPaneBackendRegistry({
+      preferredBackend: "auto",
+      env: { TMUX: "/tmp/tmux-501/default,123,0" },
+      commandRunner
+    });
+
+    expect(registry.describeAvailability()).toMatchObject({
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available"
+    });
+    // Inside tmux is decided purely from env.TMUX — it2 is never probed.
+    expect(commandRunner.calls.map((call) => call.command)).not.toContain("it2");
+  });
+
+  it("auto-selects iTerm2 when in an iTerm2 window and `it2 session list` succeeds", () => {
+    const commandRunner = createFakeCommandRunner({
+      tmux: { stdout: "tmux 3.6a\n" },
+      "it2 session list": { stdout: "iTerm2 Sessions\n" },
+      "it2 session split -v -s session": {
+        stdout: "Created new pane: iterm-pane-7\n"
+      }
+    });
+
+    const registry = createPaneBackendRegistry({
+      preferredBackend: "auto",
+      env: {
+        TERM_PROGRAM: "iTerm.app",
+        ITERM_SESSION_ID: "w0t0p0:session"
+      },
+      commandRunner
+    });
+
+    expect(registry.describeAvailability()).toMatchObject({
+      mode: "pane",
+      backend_type: "iterm2",
+      availability_status: "available"
+    });
+
+    const result = registry.createPane(paneContext);
+
+    expect(result.ok).toBe(true);
+    expect(result.pane).toMatchObject({
+      backend_type: "iterm2",
+      availability_status: "available",
+      pane_id: "iterm-pane-7"
+    } satisfies Partial<PaneBackendMetadata>);
+    // Splits with `it2 session split -v` targeting the leader session — never the
+    // non-existent `it2 split-pane` subcommand.
+    const splitCall = commandRunner.calls.find(
+      (call) =>
+        call.command === "it2" &&
+        call.args[0] === "session" &&
+        call.args[1] === "split"
+    );
+    expect(splitCall?.args).toEqual(["session", "split", "-v", "-s", "session"]);
+    expect(
+      commandRunner.calls.some(
+        (call) => call.command === "it2" && call.args.includes("split-pane")
+      )
+    ).toBe(false);
+  });
+
+  it("auto-falls back to external detached tmux when neither inside tmux nor in iTerm2", () => {
+    const socketName = buildTmuxSocketName("alpha-team", "run-alpha-builder");
+    const commandRunner = createFakeCommandRunner({
+      tmux: { stdout: "tmux 3.6a\n" },
+      it2: { stdout: "it2 0.2.3\n" },
+      [`tmux -L ${socketName} new-session -d -s codex-team-alpha-team -n teammates -P -F #{pane_id}`]:
+        { stdout: "%5\n" }
+    });
+
+    const registry = createPaneBackendRegistry({
+      preferredBackend: "auto",
+      env: {},
+      commandRunner,
+      stableId: "run-alpha-builder"
+    });
+
+    expect(registry.describeAvailability()).toMatchObject({
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available"
+    });
+
+    const result = registry.createPane(paneContext);
+
+    expect(result.pane).toMatchObject({
+      backend_type: "tmux",
+      availability_status: "available",
+      pane_id: "%5",
+      is_native: false
+    } satisfies Partial<PaneBackendMetadata>);
+    expect(result.pane.attach_command).toContain("attach-session");
+    // Outside an iTerm2 window, it2 is never probed.
+    expect(commandRunner.calls.map((call) => call.command)).not.toContain("it2");
+  });
+
+  it("does not pick iTerm2 when in iTerm2 but `it2 session list` fails — falls back to installed tmux and never calls it2 split", () => {
+    const commandRunner = createFakeCommandRunner({
+      tmux: { stdout: "tmux 3.6a\n" },
+      "it2 session list": { exitCode: 1, stderr: "iTerm2 API not reachable" }
     });
 
     const registry = createPaneBackendRegistry({
@@ -121,11 +225,44 @@ describe("pane backend detection and metadata", () => {
       backend_type: "tmux",
       availability_status: "available"
     });
-    expect(commandRunner.calls[0]).toMatchObject({
-      command: "tmux",
-      args: ["-V"]
+    // it2 was probed via `session list` only; a failed API never triggers a split.
+    expect(
+      commandRunner.calls.some(
+        (call) =>
+          call.command === "it2" &&
+          (call.args.includes("split-pane") ||
+            (call.args[0] === "session" && call.args[1] === "split"))
+      )
+    ).toBe(false);
+  });
+
+  it("iTerm2 describeAvailability probes `it2 session list`, never `it2 --version`", () => {
+    const commandRunner = createFakeCommandRunner({
+      "it2 session list": { stdout: "iTerm2 Sessions\n" }
     });
-    expect(commandRunner.calls.map((call) => call.command)).not.toContain("it2");
+    const backend = createITerm2PaneBackend({
+      env: {
+        TERM_PROGRAM: "iTerm.app",
+        ITERM_SESSION_ID: "w0t0p0:session"
+      },
+      commandRunner
+    });
+
+    expect(backend.describeAvailability()).toMatchObject({
+      mode: "pane",
+      backend_type: "iterm2",
+      availability_status: "available"
+    });
+    expect(commandRunner.calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ command: "it2", args: ["session", "list"] })
+      ])
+    );
+    expect(
+      commandRunner.calls.some(
+        (call) => call.command === "it2" && call.args.includes("--version")
+      )
+    ).toBe(false);
   });
 
   it("creates an external tmux session with a concrete attach command when outside tmux", () => {
@@ -365,8 +502,10 @@ describe("pane backend detection and metadata", () => {
 
   it("claim downgrade keeps iTerm2 attach metadata status-only without executing Codex", () => {
     const commandRunner = createFakeCommandRunner({
-      it2: { stdout: "it2 0.2.3\n" },
-      "it2 split-pane": { stdout: "iterm-pane-1\n" }
+      "it2 session list": { stdout: "iTerm2 Sessions\n" },
+      "it2 session split -v -s session": {
+        stdout: "Created new pane: iterm-pane-1\n"
+      }
     });
     const backend = createITerm2PaneBackend({
       env: {

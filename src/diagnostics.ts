@@ -10,6 +10,11 @@ import {
   extractPaneMetadata
 } from "./adapters/paneExecutionBackend.js";
 import {
+  describeTerminalContext,
+  type PaneBackendCommandRunner,
+  type TerminalContext
+} from "./adapters/paneBackend.js";
+import {
   DurableStateAdapter,
   type DurableStateRootDescription,
   type StateRootDescription
@@ -43,6 +48,11 @@ export interface DiagnosticsPayloadOptions extends CodexTeamServerOptions {
   includeDebug?: boolean;
   targetClaudeTools?: readonly string[];
   registeredTools?: readonly ToolMapping[];
+  // Debug-only terminal-context probe (D-02): injectable for deterministic tests.
+  // Defaults to process.env + the real bounded it2 command runner, the same env
+  // source the pane backend uses, so production reflects the live MCP process.
+  terminalEnv?: NodeJS.ProcessEnv;
+  terminalCommandRunner?: PaneBackendCommandRunner;
 }
 
 interface DiagnosticsActiveBinding {
@@ -221,6 +231,8 @@ export interface DiagnosticsPayload {
   debug?: {
     callerMetadataType: string;
     runs: DiagnosticsRunDebugRow[];
+    // D-02: terminal-context booleans only (no env values, no it2 stdout).
+    terminalContext: TerminalContext;
   };
 }
 
@@ -315,7 +327,11 @@ export function buildDiagnosticsPayload(options: DiagnosticsPayloadOptions = {})
         ? {
             debug: {
               callerMetadataType: typeof options.callerMetadata,
-              runs: readRunDebugRows(db, state.workspaceRoot)
+              runs: readRunDebugRows(db, state.workspaceRoot),
+              terminalContext: describeTerminalContext({
+                env: options.terminalEnv,
+                commandRunner: options.terminalCommandRunner
+              })
             }
           }
         : {})
