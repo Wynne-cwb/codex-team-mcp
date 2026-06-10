@@ -23,6 +23,13 @@ Phase 7 pane-mode verification adds these commands:
 - `npm test -- --run`
 - `npm run smoke:list-tools`
 
+Phase 12 file-modifying acceptance (worktree isolation + TL merge) adds these commands:
+
+- `npm test -- --run test/worktreeMergeService.test.ts test/lifecycleMerge.test.ts test/workspaceSafetyEnforcement.test.ts`
+- `npm test -- --run test/mergeMcp.test.ts test/executionAcceptanceWalkthrough.test.ts test/isolationEnforcement.test.ts`
+
+These run with a fake execution backend + a real temp git worktree/merge, so they are deterministic and do not require real `codex`/`tmux`.
+
 ## Coverage
 
 - `TeamCreate` creates durable team state, leader identity, initialized storage, and active binding.
@@ -35,6 +42,12 @@ Phase 7 pane-mode verification adds these commands:
 - `test/paneBackend.test.ts` covers tmux/iTerm2 detection, external tmux attach metadata, command failure, and unavailable degradation.
 - `test/paneExecutionBackend.test.ts` covers pane-backed `ExecutionBackend` start/resume/reconcile behavior and durable lifecycle metadata integration.
 - `test/paneDiagnostics.test.ts` and `test/paneMcp.test.ts` cover pane attach/status output, redaction, `SendMessage` routing, and workspace review visibility.
+
+## Phase 12 File-Modifying Acceptance (D-02)
+
+File-modifying TeamMate work is delivered in this version through an isolated git worktree and merged back into the leader by the TL Agent (`TeamMerge`, see [tool-mapping.md](tool-mapping.md) Merge model). The automated walkthrough [test/executionAcceptanceWalkthrough.test.ts](../test/executionAcceptanceWalkthrough.test.ts) covers the full chain (worktree start → real file write → durable metadata → `SendMessage` resume → `TeamDiagnostics` → TL `TeamMerge` review/merge + O-2 cleanup → conflict path → human-escalation path → unavailable-with-remediation → pane fallback) with a fake backend + real temp git, and [test/isolationEnforcement.test.ts](../test/isolationEnforcement.test.ts) pins ISOL-01/ISOL-02.
+
+**Maintainer real UAT (D-02 proof-first) — required for milestone acceptance, NOT replaced by the automated walkthrough:** on the maintainer machine, run one full file-modifying worktree-isolation path end-to-end with **real `codex`** (`CODEX_TEAM_EXECUTION=1`) + **real git worktree**: `TeamCreate` → `Agent` starts in an isolated worktree → **really write files in the worktree** → capture durable backend metadata → `SendMessage` resume → real `TeamDiagnostics` → **TL reviews the branch diff and really merges back into the leader** (including a conflict the TL resolves autonomously and, where it cannot, escalates to a human). The documented unavailable-with-remediation and pane-fallback paths must also be exercised but do not substitute for this real worktree file-modifying run.
 
 ## Manual Checks
 

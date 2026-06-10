@@ -3,6 +3,8 @@ import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 
 import type { ExecutionBackend } from "../adapters/execution.js";
+import type { PaneBackendRegistry } from "../adapters/paneBackend.js";
+import type { PaneModeOptions } from "../types.js";
 import type { WorkspaceScopedCallerIdentity } from "./callerIdentity.js";
 import { ContextResolver } from "./contextResolver.js";
 import {
@@ -26,6 +28,11 @@ export interface MessageServiceOptions {
   db: Database.Database;
   statePath: string;
   executionBackend?: ExecutionBackend;
+  // PANE-01 / D-01: forwarded to LifecycleService so a resume (SendMessage) can
+  // refresh/attach the visible pane when pane mode is enabled. paneBackend is an
+  // injection seam for deterministic tests (CI has no real tmux/iTerm2).
+  paneMode?: PaneModeOptions;
+  paneBackend?: PaneBackendRegistry;
 }
 
 export interface SendMessageInput {
@@ -67,6 +74,10 @@ export interface PersistedMessageResult {
   persisted: true;
   delivery_status: MessageDeliveryStatus;
   row_status: typeof MESSAGE_ROW_STATUSES.queued;
+  // Phase 10: surfaced when a SendMessage-triggered resume ran a one-shot turn
+  // to completion (member finalized to idle).
+  turn_completed?: boolean;
+  final_status?: "idle";
   backend: LifecycleBackendResult;
   lifecycle: LifecycleMetadataResult;
   debug: {
@@ -287,6 +298,8 @@ export class MessageService {
     );
 
     const persisted = tx(input);
+    // D10-3 recursion guard: a system lifecycle notice never re-triggers resume.
+    const inboundIsSystemNotice = isSystemLifecycleNotice(input.metadata);
     const lifecycleDelivery =
       this.createLifecycleService().attemptDeliveryAfterPersistence({
         message_id: persisted.messageId,
@@ -299,8 +312,48 @@ export class MessageService {
         summary: input.summary,
         task_id: taskIdFromMetadata(input.metadata),
         trigger_kind: triggerKindFromMetadata(input.metadata),
+        suppress_resume: inboundIsSystemNotice,
         identity: input.identity
       });
+
+    // D10-3: proactively notify the original sender of an idle/stopped resume
+    // failure (sanitized, best-effort, recursion-guarded). Merged/debounced
+    // messages have backend_action "not_attempted" and never notify, so a burst
+    // yields at most one notice (D10-3 × D10-4 alignment).
+    const isResumeFailure =
+      (input.recipient.status === MEMBER_STATUSES.idle ||
+        input.recipient.status === MEMBER_STATUSES.stopped) &&
+      lifecycleDelivery.debug.backend_action === "resume_attempted" &&
+      (lifecycleDelivery.delivery_status ===
+        MESSAGE_DELIVERY_STATUSES.backendUnavailable ||
+        lifecycleDelivery.delivery_status ===
+          MESSAGE_DELIVERY_STATUSES.backendFailed);
+
+    if (
+      isResumeFailure &&
+      !inboundIsSystemNotice &&
+      input.sender.member_id !== input.recipient.member_id
+    ) {
+      this.notifySenderOfResumeFailure({
+        teamName: input.teamName,
+        failedRecipient: input.recipient,
+        originalSender: input.sender,
+        errorCode: lifecycleDelivery.error_code ?? lifecycleDelivery.delivery_status,
+        identity: input.identity
+      });
+    }
+
+    // D10-3: notify the lead when a SendMessage-triggered resume ran a one-shot
+    // turn to completion (mirrors the create-path D-03 completion notification;
+    // distinct trigger source, so no duplication with AgentService).
+    if (lifecycleDelivery.turn_completed === true && !inboundIsSystemNotice) {
+      this.notifyLeadOfResumeCompletion({
+        teamName: input.teamName,
+        resumedTeammate: input.recipient,
+        runId: lifecycleDelivery.debug.run_id,
+        identity: input.identity
+      });
+    }
 
     return {
       status: lifecycleDelivery.delivery_status,
@@ -312,6 +365,8 @@ export class MessageService {
       persisted: true,
       delivery_status: lifecycleDelivery.delivery_status,
       row_status: lifecycleDelivery.message_row_status,
+      turn_completed: lifecycleDelivery.turn_completed,
+      final_status: lifecycleDelivery.final_status,
       backend: lifecycleDelivery.backend,
       lifecycle: lifecycleDelivery.lifecycle,
       debug: {
@@ -324,8 +379,75 @@ export class MessageService {
     return new LifecycleService({
       db: this.options.db,
       statePath: this.options.statePath,
-      executionBackend: this.options.executionBackend
+      executionBackend: this.options.executionBackend,
+      paneMode: this.options.paneMode,
+      paneBackend: this.options.paneBackend
     });
+  }
+
+  // D10-3 resume-failure notice. The failed recipient sends a SANITIZED system
+  // message back to the original sender: only teammate_id + error_code + a
+  // constant remediation template — NEVER the original prompt/message body. The
+  // notice carries message_type "resume_failure_notice", so the recursion gate
+  // (LifecycleService.attemptDeliveryAfterPersistence + suppress_resume) ensures
+  // it only queues and never re-triggers resume. Best-effort: a notify failure
+  // must never corrupt the already-persisted message/state.
+  private notifySenderOfResumeFailure(input: {
+    teamName: string;
+    failedRecipient: ResolvedMember;
+    originalSender: ResolvedMember;
+    errorCode: string;
+    identity: WorkspaceScopedCallerIdentity;
+  }): void {
+    try {
+      this.sendMessage({
+        teamName: input.teamName,
+        from: input.failedRecipient.public_id,
+        to: input.originalSender.public_id,
+        message: buildResumeFailureBody(
+          input.failedRecipient.public_id,
+          input.errorCode
+        ),
+        summary: `resume failed for ${input.failedRecipient.public_id}`,
+        metadata: {
+          message_type: "resume_failure_notice",
+          teammate_id: input.failedRecipient.public_id,
+          error_code: input.errorCode
+        },
+        identity: input.identity
+      });
+    } catch {
+      // Best-effort only.
+    }
+  }
+
+  // D10-3: SendMessage-triggered resume completion -> notify the lead, mirroring
+  // the create-path D-03 completion notification (constant sanitized body,
+  // best-effort). The notice is a system lifecycle_completion, so the recursion
+  // gate keeps it queue-only.
+  private notifyLeadOfResumeCompletion(input: {
+    teamName: string;
+    resumedTeammate: ResolvedMember;
+    runId?: string;
+    identity: WorkspaceScopedCallerIdentity;
+  }): void {
+    try {
+      this.sendMessage({
+        teamName: input.teamName,
+        from: input.resumedTeammate.public_id,
+        to: `team-lead@${input.teamName}`,
+        message: `TeamMate ${input.resumedTeammate.public_id} completed its turn.`,
+        summary: `${input.resumedTeammate.public_id} completed its turn`,
+        metadata: {
+          message_type: "lifecycle_completion",
+          teammate_id: input.resumedTeammate.public_id,
+          run_id: input.runId
+        },
+        identity: input.identity
+      });
+    } catch {
+      // Best-effort only.
+    }
   }
 
   private failSend(input: {
@@ -500,6 +622,32 @@ function triggerKindFromMetadata(
   return metadata?.message_type === "task_assignment"
     ? "task_assignment"
     : "message";
+}
+
+// System lifecycle notices (Phase 10): these are MessageService-generated and
+// must never trigger a backend resume (recursion guard, D10-3).
+function isSystemLifecycleNotice(
+  metadata: Record<string, unknown> | undefined
+): boolean {
+  const messageType = metadata?.message_type;
+  return (
+    messageType === "resume_failure_notice" ||
+    messageType === "lifecycle_completion"
+  );
+}
+
+// Constant sanitized remediation template (D10-3). Interpolates ONLY the
+// teammate_id (identifier) and error_code (honest-set enum) — never the original
+// prompt / message body / any secret. Remediation wording mirrors
+// agentService EXECUTION_BACKEND_UNAVAILABLE_MESSAGE.
+function buildResumeFailureBody(teammateId: string, errorCode: string): string {
+  return (
+    `Resume failed for TeamMate ${teammateId} (error_code: ${errorCode}). ` +
+    "Your message is preserved in the inbox (still queued) and will be delivered " +
+    "when the run next starts. Remediation: ensure CODEX_TEAM_EXECUTION=1, make " +
+    "sure `codex` is on PATH (codex exec --help should exit 0), and confirm durable " +
+    "resume metadata (backend_run_id / thread_id / process_id) exists for the run."
+  );
 }
 
 function memberToParticipant(member: ResolvedMember): MessageParticipant {

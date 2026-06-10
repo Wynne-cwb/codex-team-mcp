@@ -93,7 +93,13 @@ export const RUN_REVIEW_STATUSES = {
   pendingReview: "pending_review",
   needsReview: "needs_review",
   merged: "merged",
-  preserved: "preserved"
+  preserved: "preserved",
+  // Phase 12 (D-04): TL-driven merge outcomes. `merge_conflict` records a
+  // fail-closed conflict (worktree preserved, leader rolled back clean);
+  // `escalated_to_human` records an explicit hand-off when the TL Agent cannot
+  // resolve a merge autonomously (worktree preserved, no destructive action).
+  mergeConflict: "merge_conflict",
+  escalated: "escalated_to_human"
 } as const;
 
 export type RunReviewStatus =
@@ -157,8 +163,17 @@ export const EVENT_TYPES = {
   teammateBackendFailed: "teammate_backend_failed",
   teammateReconciled: "teammate_reconciled",
   teammateMarkedStale: "teammate_marked_stale",
+  teammateRunCompleted: "teammate_run_completed",
   workspaceIsolationCreated: "workspace_isolation_created",
-  workspaceReviewRequired: "workspace_review_required"
+  workspaceReviewRequired: "workspace_review_required",
+  // Phase 12 (D-04): auditable TL-driven worktree merge lifecycle. Merge and
+  // escalate are explicit TL actions (NOT silent auto-merge); each appends an
+  // auditable event. `workspaceWorktreeCleaned` records O-2 cleanup outcome.
+  workspaceMergeRequested: "workspace_merge_requested",
+  workspaceMergeCompleted: "workspace_merge_completed",
+  workspaceMergeConflict: "workspace_merge_conflict",
+  workspaceMergeEscalated: "workspace_merge_escalated",
+  workspaceWorktreeCleaned: "workspace_worktree_cleaned"
 } as const;
 
 export type EventType = (typeof EVENT_TYPES)[keyof typeof EVENT_TYPES];

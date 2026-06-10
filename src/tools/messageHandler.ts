@@ -39,7 +39,8 @@ export function createSendMessageHandler(
       const service = new MessageService({
         db: adapter.getDatabase(),
         statePath: state.stateRoot,
-        executionBackend: createExecutionBackendFromOptions(options)
+        executionBackend: createExecutionBackendFromOptions(options),
+        paneMode: options.paneMode
       });
       const result = service.sendMessage({
         teamName: input.team_name,

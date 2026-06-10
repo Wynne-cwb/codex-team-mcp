@@ -27,6 +27,12 @@ import { COMPATIBILITY_TOOLS, TARGET_CLAUDE_TOOLS } from "../src/tools/registry.
 
 const tempRoots: string[] = [];
 const SECRET_PHASE5_DIAGNOSTICS_PROMPT = "SECRET_PHASE5_DIAGNOSTICS_PROMPT";
+const SECRET_OBS01_TEAMMATE_PROMPT = "SECRET_OBS01_TEAMMATE_PROMPT";
+
+interface ScheduledAgentLike {
+  run_id: string;
+  debug: { internal_member_id: string };
+}
 
 function createTempStateRoot(): string {
   const stateRoot = mkdtempSync(path.join(tmpdir(), "codex-team-diagnostics-"));
@@ -296,6 +302,107 @@ function createLifecycleStateForDiagnostics(input: {
   }
 }
 
+function createTeammatesWithRealStatusForDiagnostics(input: {
+  stateRoot: string;
+  workspaceRoot: string;
+  callerMetadata: unknown;
+}): void {
+  const caller = normalizeCallerMetadata(input.callerMetadata);
+  const identity = buildWorkspaceScopedCallerIdentity({
+    workspaceRoot: input.workspaceRoot,
+    caller
+  });
+  const adapter = new DurableStateAdapter({
+    stateRoot: input.stateRoot,
+    workspaceRoot: input.workspaceRoot
+  });
+
+  try {
+    const db = adapter.getDatabase();
+    const statePath = adapter.describeStateRoot().stateRoot;
+    new TeamService({ db, statePath }).createTeam({
+      teamName: "Alpha Team",
+      description: "OBS-01 per-teammate status team",
+      identity
+    });
+    const agentService = new AgentService({ db, statePath });
+    const create = (name: string): ScheduledAgentLike =>
+      agentService.createAgent({
+        name,
+        teamName: "alpha-team",
+        prompt: SECRET_OBS01_TEAMMATE_PROMPT,
+        description: `Create OBS-01 ${name}`,
+        identity
+      }) as unknown as ScheduledAgentLike;
+
+    const runner = create("Runner");
+    const reviewer = create("Reviewer");
+    const staley = create("Staley");
+    const blocked = create("Blocked");
+    const attachy = create("Attachy");
+
+    const setMemberStatus = (memberId: string, status: string): void => {
+      db.prepare(
+        `UPDATE ${TABLE_NAMES.members} SET status = ? WHERE member_id = ?`
+      ).run(status, memberId);
+    };
+    const setRun = (runId: string, columns: Record<string, string>): void => {
+      const assignments = Object.keys(columns)
+        .map((column) => `${column} = ?`)
+        .join(", ");
+      db.prepare(
+        `UPDATE ${TABLE_NAMES.runs} SET ${assignments} WHERE run_id = ?`
+      ).run(...Object.values(columns), runId);
+    };
+
+    // Runner: running.
+    setMemberStatus(runner.debug.internal_member_id, MEMBER_STATUSES.running);
+    setRun(runner.run_id, {
+      backend_status: RUN_BACKEND_STATUSES.running,
+      review_status: RUN_REVIEW_STATUSES.none
+    });
+
+    // Reviewer: idle + needs_review derived flag.
+    setMemberStatus(reviewer.debug.internal_member_id, MEMBER_STATUSES.idle);
+    setRun(reviewer.run_id, {
+      backend_status: RUN_BACKEND_STATUSES.idle,
+      review_status: RUN_REVIEW_STATUSES.needsReview
+    });
+
+    // Staley: stale.
+    setMemberStatus(staley.debug.internal_member_id, MEMBER_STATUSES.stale);
+
+    // Blocked: scheduled run whose backend never started ->
+    // codex_session_metadata_unavailable maps to OBS-01 `unavailable`.
+    setRun(blocked.run_id, {
+      backend_status: RUN_BACKEND_STATUSES.notStarted,
+      last_error: "codex_session_metadata_unavailable",
+      review_status: RUN_REVIEW_STATUSES.none
+    });
+
+    // Attachy: running with a persisted available pane -> attached:true.
+    setMemberStatus(attachy.debug.internal_member_id, MEMBER_STATUSES.running);
+    setRun(attachy.run_id, {
+      backend_status: RUN_BACKEND_STATUSES.running,
+      review_status: RUN_REVIEW_STATUSES.none,
+      metadata_json: JSON.stringify({
+        prompt: SECRET_OBS01_TEAMMATE_PROMPT,
+        backend_metadata: {
+          pane: {
+            mode: "pane",
+            backend_type: "tmux",
+            availability_status: "available",
+            pane_id: "%21",
+            session_name: "codex-team-alpha-team"
+          }
+        }
+      })
+    });
+  } finally {
+    adapter.close();
+  }
+}
+
 afterEach(() => {
   for (const stateRoot of tempRoots.splice(0)) {
     rmSync(stateRoot, { recursive: true, force: true });
@@ -329,12 +436,12 @@ describe("TeamDiagnostics payload", () => {
       warnings: [],
       migrationStatus: {
         status: "up_to_date",
-        latestVersion: 4,
-        targetVersion: 4,
+        latestVersion: 6,
+        targetVersion: 6,
         pendingMigrations: []
       },
       tableCounts: {
-        schema_migrations: 4,
+        schema_migrations: 6,
         teams: 0,
         members: 0,
         active_bindings: 0,
@@ -372,7 +479,10 @@ describe("TeamDiagnostics payload", () => {
     expect(payload.workspaceReviewSummary).toEqual({
       pending_review: 0,
       needs_review: 0,
-      with_workspace_path: 0
+      with_workspace_path: 0,
+      merged: 0,
+      merge_conflict: 0,
+      escalated: 0
     });
     expect(payload.reconciliationSummary).toMatchObject({
       teams: 0,
@@ -658,6 +768,117 @@ describe("TeamDiagnostics payload", () => {
     expect(debugSerialized).not.toContain("\"description\"");
   });
 
+  it("reports merge/conflict/escalated counts plus debug branch and merge commit", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace/merge-diag";
+    const callerMetadata = { sessionId: "merge-diag", clientName: "codex" };
+    const identity = buildWorkspaceScopedCallerIdentity({
+      workspaceRoot,
+      caller: normalizeCallerMetadata(callerMetadata)
+    });
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    const db = adapter.getDatabase();
+    const statePath = adapter.describeStateRoot().stateRoot;
+    new TeamService({ db, statePath }).createTeam({
+      teamName: "Alpha Team",
+      description: "Merge diagnostics team",
+      identity
+    });
+    const agentService = new AgentService({ db, statePath });
+    const mk = (name: string): ScheduledAgentLike =>
+      agentService.createAgent({
+        name,
+        teamName: "alpha-team",
+        prompt: SECRET_PHASE5_DIAGNOSTICS_PROMPT,
+        description: `Create merge diagnostics ${name}`,
+        identity
+      }) as unknown as ScheduledAgentLike;
+
+    const merged = mk("Merged");
+    const conflicted = mk("Conflicted");
+    const escalated = mk("Escalated");
+    // A non-merge run (left at its scaffold review_status) proves merge_status is
+    // null for runs whose review_status is not merge-related.
+    mk("Pending");
+
+    const setRun = (runId: string, columns: Record<string, string>): void => {
+      const assignments = Object.keys(columns)
+        .map((column) => `${column} = ?`)
+        .join(", ");
+      db.prepare(
+        `UPDATE ${TABLE_NAMES.runs} SET ${assignments} WHERE run_id = ?`
+      ).run(...Object.values(columns), runId);
+    };
+
+    setRun(merged.run_id, {
+      isolation_kind: "git_worktree",
+      review_status: RUN_REVIEW_STATUSES.merged,
+      workspace_path: "/tmp/wt-merged",
+      base_revision: "base-merged",
+      worktree_branch: "codex-team/alpha-team/merged/r1",
+      merge_commit: "abc1234def"
+    });
+    setRun(conflicted.run_id, {
+      isolation_kind: "git_worktree",
+      review_status: RUN_REVIEW_STATUSES.mergeConflict,
+      workspace_path: "/tmp/wt-conflicted",
+      base_revision: "base-conflicted",
+      worktree_branch: "codex-team/alpha-team/conflicted/r2",
+      merge_conflict_files_json: JSON.stringify(["tracked.txt"])
+    });
+    setRun(escalated.run_id, {
+      isolation_kind: "git_worktree",
+      review_status: RUN_REVIEW_STATUSES.escalated,
+      workspace_path: "/tmp/wt-escalated",
+      base_revision: "base-escalated",
+      worktree_branch: "codex-team/alpha-team/escalated/r3"
+    });
+    adapter.close();
+
+    const payload = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata,
+      includeDebug: true,
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+
+    expect(payload.workspaceReviewSummary).toMatchObject({
+      merged: 1,
+      merge_conflict: 1,
+      escalated: 1
+    });
+
+    const debugRuns = payload.debug?.runs ?? [];
+    const mergedRow = debugRuns.find(
+      (row) => row.review_status === RUN_REVIEW_STATUSES.merged
+    );
+    expect(mergedRow).toMatchObject({
+      merge_status: RUN_REVIEW_STATUSES.merged,
+      worktree_branch: "codex-team/alpha-team/merged/r1",
+      merge_commit: "abc1234def"
+    });
+    const conflictRow = debugRuns.find(
+      (row) => row.review_status === RUN_REVIEW_STATUSES.mergeConflict
+    );
+    expect(conflictRow?.merge_status).toBe(RUN_REVIEW_STATUSES.mergeConflict);
+    const escalatedRow = debugRuns.find(
+      (row) => row.review_status === RUN_REVIEW_STATUSES.escalated
+    );
+    expect(escalatedRow?.merge_status).toBe(RUN_REVIEW_STATUSES.escalated);
+    // A non-merge run reports merge_status null (review_status is not merge-related).
+    const pendingRow = debugRuns.find(
+      (row) => row.merge_status === null
+    );
+    expect(pendingRow).toBeDefined();
+
+    // Redaction: no secret/prompt/diff content surfaced.
+    const serialized = JSON.stringify(payload);
+    expect(serialized).not.toContain(SECRET_PHASE5_DIAGNOSTICS_PROMPT);
+    expect(serialized).not.toContain("\"prompt\"");
+  });
+
   it("scopes recent events to the diagnostics workspace for shared state roots", () => {
     const stateRoot = createTempStateRoot();
     const firstWorkspace = "/workspace/one";
@@ -830,5 +1051,101 @@ describe("TeamDiagnostics payload", () => {
     expect(serialized).not.toContain("codex-team:requestId:req-1");
     expect(serialized).not.toContain("codex-team:requestId:req-2");
     expect(serialized).not.toContain("codex-team:clientName:codex");
+  });
+
+  it("reports per-teammate real backend status (OBS-01)", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace";
+    const callerMetadata = { sessionId: "session-1", clientName: "codex" };
+
+    createTeammatesWithRealStatusForDiagnostics({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata
+    });
+
+    const payload = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata,
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+    const byTeammateId = Object.fromEntries(
+      payload.teammates.map((teammate) => [teammate.teammate_id, teammate])
+    );
+    const serialized = JSON.stringify(payload.teammates);
+
+    // Lead (role:leader) is excluded; only the five teammates appear.
+    expect(payload.teammates).toHaveLength(5);
+
+    expect(byTeammateId["runner@alpha-team"]).toMatchObject({
+      display_name: "Runner",
+      status: MEMBER_STATUSES.running,
+      attached: false,
+      needs_review: false
+    });
+    expect(byTeammateId["reviewer@alpha-team"]).toMatchObject({
+      status: MEMBER_STATUSES.idle,
+      needs_review: true
+    });
+    expect(byTeammateId["staley@alpha-team"]).toMatchObject({
+      status: MEMBER_STATUSES.stale
+    });
+    expect(byTeammateId["blocked@alpha-team"]).toMatchObject({
+      // scheduled run whose backend never started -> unavailable.
+      status: "unavailable"
+    });
+    expect(byTeammateId["attachy@alpha-team"]).toMatchObject({
+      status: MEMBER_STATUSES.running,
+      // Persisted available pane metadata derives the attached flag.
+      attached: true
+    });
+
+    // Every row carries member_id + a concise status; no raw prompt leaks.
+    for (const teammate of payload.teammates) {
+      expect(typeof teammate.member_id).toBe("string");
+      expect(typeof teammate.status).toBe("string");
+    }
+    expect(serialized).not.toContain(SECRET_OBS01_TEAMMATE_PROMPT);
+  });
+
+  it("keeps per-teammate rows free of raw prompt and unsanitized metadata (OBS-01 / D-02)", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace";
+    const callerMetadata = { sessionId: "session-1", clientName: "codex" };
+
+    createTeammatesWithRealStatusForDiagnostics({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata
+    });
+
+    const payload = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata,
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+    const serialized = JSON.stringify(payload.teammates);
+
+    expect(serialized).not.toContain(SECRET_OBS01_TEAMMATE_PROMPT);
+    for (const rawKey of [
+      "\"prompt\"",
+      "\"message\"",
+      "\"body\"",
+      "\"description\"",
+      "\"notes\"",
+      "payload_json",
+      "transcript"
+    ]) {
+      expect(serialized).not.toContain(rawKey);
+    }
+    for (const teammate of payload.teammates) {
+      expect(teammate).not.toHaveProperty("prompt");
+      expect(teammate).not.toHaveProperty("metadata_json");
+      expect(teammate).not.toHaveProperty("description");
+    }
   });
 });

@@ -39,6 +39,9 @@ export interface PaneStatusRow {
   window_name?: string;
   socket_name?: string;
   attach_command?: string;
+  // D-03: in the default (non-debug) summary the full attach_command is withheld
+  // and this hint marks panes that have a legitimate attach command available.
+  attach_hint?: boolean;
   is_native?: boolean;
 }
 
@@ -115,9 +118,18 @@ export function readPaneStatusSummary(
     )
     .all(workspaceRoot) as RunPaneRow[];
 
-  const panes = rows
+  const allPanes = rows
     .map(toPaneStatusRow)
     .filter((row): row is PaneStatusRow => row !== null);
+  // D-03: "attachable" stays defined by whether a legitimate (safety-filtered)
+  // attach_command exists — computed BEFORE the default-mode split withholds it.
+  const attachable = allPanes.filter((row) => Boolean(row.attach_command)).length;
+  // Default output keeps only an attach hint + session/backend labels; the full,
+  // copy-pasteable attach_command moves behind include_debug.
+  const panes =
+    options.includeDebug === true
+      ? allPanes
+      : allPanes.map(withDefaultAttachHint);
   const recent = panes.slice(0, 10);
   const byBackendType = countBy(panes, (row) => row.backend_type);
   const byAvailabilityStatus = countBy(panes, (row) => row.availability_status);
@@ -125,7 +137,7 @@ export function readPaneStatusSummary(
   return {
     enabled: options.paneModeEnabled === true || panes.length > 0,
     total: panes.length,
-    attachable: panes.filter((row) => Boolean(row.attach_command)).length,
+    attachable,
     available: byAvailabilityStatus.available ?? 0,
     unavailable: byAvailabilityStatus.unavailable ?? 0,
     degraded: byAvailabilityStatus.degraded ?? 0,
@@ -133,6 +145,24 @@ export function readPaneStatusSummary(
     by_availability_status: byAvailabilityStatus,
     recent,
     panes: recent
+  };
+}
+
+// D-03 default/debug split: strip the full attach_command (top-level field and
+// the nested `pane` object) and replace it with an attach_hint flag, keeping the
+// backend/session labels. Applied only in the default (non-debug) summary.
+function withDefaultAttachHint(row: PaneStatusRow): PaneStatusRow {
+  if (!row.attach_command) {
+    return row;
+  }
+
+  const { attach_command: _omitRow, ...rest } = row;
+  const { attach_command: _omitPane, ...paneRest } = row.pane;
+
+  return {
+    ...rest,
+    pane: paneRest,
+    attach_hint: true
   };
 }
 

@@ -1,5 +1,8 @@
-import type { ExecutionBackendDescription } from "./adapters/execution.js";
-import { createExecutionBackendFromOptions } from "./adapters/paneExecutionBackend.js";
+import type { ExecutionBackend, ExecutionBackendDescription } from "./adapters/execution.js";
+import {
+  createExecutionBackendFromOptions,
+  extractPaneMetadata
+} from "./adapters/paneExecutionBackend.js";
 import {
   DurableStateAdapter,
   type DurableStateRootDescription,
@@ -20,6 +23,7 @@ import {
   ACTIVE_BINDING_STATUSES,
   MEMBER_STATUSES,
   MESSAGE_ROW_STATUSES,
+  RUN_BACKEND_STATUSES,
   RUN_REVIEW_STATUSES,
   TABLE_NAMES,
   TASK_STATUSES,
@@ -94,12 +98,37 @@ interface DiagnosticsWorkspaceReviewSummary {
   pending_review: number;
   needs_review: number;
   with_workspace_path: number;
+  // Phase 12 (D-04): TL-driven merge outcome counts.
+  merged: number;
+  merge_conflict: number;
+  escalated: number;
 }
 
 interface DiagnosticsPaneSummary extends PaneStatusSummary {
   messageSummary: DiagnosticsMessageSummary;
   taskSummary: DiagnosticsTaskSummary;
   workspaceReviewSummary: DiagnosticsWorkspaceReviewSummary;
+}
+
+// OBS-01 / D-02: one row per TeamMate with its real, durable backend status.
+// Names + status + concise flags only — NEVER raw prompt / message / task text /
+// unsanitized metadata (the per-run detail stays behind include_debug).
+interface DiagnosticsTeammateStatus {
+  teammate_id?: string;
+  member_id: string;
+  display_name: string;
+  status: string;
+  attached: boolean;
+  needs_review: boolean;
+}
+
+// OBS-02: enriched, sanitized metadata diagnostics surfaced only under
+// include_debug when a run reported codex_session_metadata_unavailable.
+interface DiagnosticsMetadataDiagnostics {
+  missing_metadata_source: string;
+  observed_keys: string[];
+  selected_backend: string;
+  remediation: string[];
 }
 
 interface DiagnosticsRunDebugRow {
@@ -114,8 +143,19 @@ interface DiagnosticsRunDebugRow {
   base_revision: string | null;
   review_status: string | null;
   changed_files: string[];
+  // Phase 12 (D-04): worktree branch + merge audit (debug-only, sanitized).
+  // merge_status is the review_status when it is a merge-related value, else null.
+  worktree_branch: string | null;
+  merge_status: string | null;
+  merge_commit: string | null;
   last_error: string | null;
 }
+
+const MERGE_RELATED_REVIEW_STATUSES = new Set<string>([
+  RUN_REVIEW_STATUSES.merged,
+  RUN_REVIEW_STATUSES.mergeConflict,
+  RUN_REVIEW_STATUSES.escalated
+]);
 
 type DurableDiagnosticsState = Omit<DurableStateRootDescription, "recentEvents"> & {
   activeBinding: DiagnosticsActiveBinding | null;
@@ -147,6 +187,7 @@ export interface DiagnosticsPayload {
   };
   state: DiagnosticsStateDescription;
   execution: ExecutionBackendDescription;
+  teammates: DiagnosticsTeammateStatus[];
   lifecycleSummary: DiagnosticsLifecycleSummary;
   runSummary: DiagnosticsRunSummary;
   workspaceReviewSummary: DiagnosticsWorkspaceReviewSummary;
@@ -157,6 +198,7 @@ export interface DiagnosticsPayload {
   phase:
     | "05-lifecycle-isolation-and-status"
     | "07-pane-style-teammate-ui-and-terminal-backends";
+  metadataDiagnostics?: DiagnosticsMetadataDiagnostics;
   debug?: {
     callerMetadataType: string;
     runs: DiagnosticsRunDebugRow[];
@@ -195,6 +237,11 @@ export function buildDiagnosticsPayload(options: DiagnosticsPayloadOptions = {})
       actorCallerKey: caller.callerKey,
       mode: "report"
     });
+    const teammates = readTeammateStatuses(db, state.workspaceRoot);
+    const metadataDiagnostics =
+      options.includeDebug === true
+        ? buildMetadataDiagnostics(db, state.workspaceRoot, executionBackend)
+        : null;
 
     return {
       package: {
@@ -214,6 +261,7 @@ export function buildDiagnosticsPayload(options: DiagnosticsPayloadOptions = {})
       },
       state,
       execution: executionBackend.describeBackend(),
+      teammates,
       lifecycleSummary,
       runSummary,
       workspaceReviewSummary,
@@ -230,6 +278,7 @@ export function buildDiagnosticsPayload(options: DiagnosticsPayloadOptions = {})
         options.paneMode?.enabled === true
           ? "07-pane-style-teammate-ui-and-terminal-backends"
           : "05-lifecycle-isolation-and-status",
+      ...(metadataDiagnostics ? { metadataDiagnostics } : {}),
       ...(options.includeDebug
         ? {
             debug: {
@@ -291,7 +340,10 @@ function readWorkspaceReviewSummary(
         SELECT
           COALESCE(SUM(CASE WHEN runs.review_status = ? THEN 1 ELSE 0 END), 0) AS pending_review,
           COALESCE(SUM(CASE WHEN runs.review_status = ? THEN 1 ELSE 0 END), 0) AS needs_review,
-          COALESCE(SUM(CASE WHEN runs.workspace_path IS NOT NULL THEN 1 ELSE 0 END), 0) AS with_workspace_path
+          COALESCE(SUM(CASE WHEN runs.workspace_path IS NOT NULL THEN 1 ELSE 0 END), 0) AS with_workspace_path,
+          COALESCE(SUM(CASE WHEN runs.review_status = ? THEN 1 ELSE 0 END), 0) AS merged,
+          COALESCE(SUM(CASE WHEN runs.review_status = ? THEN 1 ELSE 0 END), 0) AS merge_conflict,
+          COALESCE(SUM(CASE WHEN runs.review_status = ? THEN 1 ELSE 0 END), 0) AS escalated
         FROM ${TABLE_NAMES.runs} AS runs
         JOIN ${TABLE_NAMES.teams} AS teams
           ON teams.team_id = runs.team_id
@@ -301,13 +353,19 @@ function readWorkspaceReviewSummary(
     .get(
       RUN_REVIEW_STATUSES.pendingReview,
       RUN_REVIEW_STATUSES.needsReview,
+      RUN_REVIEW_STATUSES.merged,
+      RUN_REVIEW_STATUSES.mergeConflict,
+      RUN_REVIEW_STATUSES.escalated,
       workspaceRoot
     ) as DiagnosticsWorkspaceReviewSummary | undefined;
 
   return {
     pending_review: row?.pending_review ?? 0,
     needs_review: row?.needs_review ?? 0,
-    with_workspace_path: row?.with_workspace_path ?? 0
+    with_workspace_path: row?.with_workspace_path ?? 0,
+    merged: row?.merged ?? 0,
+    merge_conflict: row?.merge_conflict ?? 0,
+    escalated: row?.escalated ?? 0
   };
 }
 
@@ -378,6 +436,8 @@ function readRunDebugRows(
           runs.base_revision,
           runs.review_status,
           runs.changed_files_json,
+          runs.worktree_branch,
+          runs.merge_commit,
           runs.last_error
         FROM ${TABLE_NAMES.runs} AS runs
         JOIN ${TABLE_NAMES.teams} AS teams
@@ -387,7 +447,10 @@ function readRunDebugRows(
       `
     )
     .all(workspaceRoot) as Array<
-    Omit<DiagnosticsRunDebugRow, "changed_files" | "last_error"> & {
+    Omit<
+      DiagnosticsRunDebugRow,
+      "changed_files" | "last_error" | "merge_status"
+    > & {
       changed_files_json: string | null;
       last_error: string | null;
     }
@@ -405,8 +468,265 @@ function readRunDebugRows(
     base_revision: row.base_revision,
     review_status: row.review_status,
     changed_files: parseChangedFiles(row.changed_files_json),
+    worktree_branch: sanitizeDebugText(row.worktree_branch),
+    merge_status:
+      row.review_status && MERGE_RELATED_REVIEW_STATUSES.has(row.review_status)
+        ? row.review_status
+        : null,
+    merge_commit: sanitizeDebugText(row.merge_commit),
     last_error: sanitizeDebugText(row.last_error)
   }));
+}
+
+const CODEX_SESSION_METADATA_UNAVAILABLE = "codex_session_metadata_unavailable";
+
+// Durable last_error signals that mean the backend never started (OBS-01
+// `unavailable`). pane_backend_unavailable carries a `:reason` suffix, so it is
+// matched as a prefix.
+const UNAVAILABLE_LAST_ERROR_SIGNALS = new Set<string>([
+  CODEX_SESSION_METADATA_UNAVAILABLE,
+  "execution_backend_unavailable",
+  "backend_unavailable"
+]);
+
+const REMEDIATION_STEPS: readonly string[] = [
+  "Enable real execution: set CODEX_TEAM_EXECUTION=1 so the codex backend captures a durable thread_id.",
+  "Ensure `codex` is on PATH (codex exec --help exits 0).",
+  "Provide an isolated worktree (--cd) for file-modifying work."
+];
+
+interface TeammateStatusRow {
+  member_id: string;
+  display_name: string;
+  member_status: string;
+  member_metadata_json: string | null;
+  run_backend_status: string | null;
+  run_review_status: string | null;
+  run_metadata_json: string | null;
+  run_last_error: string | null;
+}
+
+interface MetadataDiagnosticsRunRow {
+  backend: string | null;
+  backend_status: string | null;
+  backend_run_id: string | null;
+  backend_thread_id: string | null;
+  backend_process_id: string | null;
+  workspace_path: string | null;
+  review_status: string | null;
+  last_error: string | null;
+  metadata_json: string | null;
+}
+
+// OBS-01 / D-02: per-TeamMate real backend status from durable columns
+// (members.status ∪ runs.backend_status ∪ derived). Reads durable state only —
+// never live backend — so CI without tmux/codex stays deterministic.
+function readTeammateStatuses(
+  db: ReturnType<DurableStateAdapter["getDatabase"]>,
+  workspaceRoot: string
+): DiagnosticsTeammateStatus[] {
+  const rows = db
+    .prepare(
+      `
+        SELECT
+          members.member_id,
+          members.display_name,
+          members.status AS member_status,
+          members.metadata_json AS member_metadata_json,
+          runs.backend_status AS run_backend_status,
+          runs.review_status AS run_review_status,
+          runs.metadata_json AS run_metadata_json,
+          runs.last_error AS run_last_error
+        FROM ${TABLE_NAMES.members} AS members
+        JOIN ${TABLE_NAMES.teams} AS teams
+          ON teams.team_id = members.team_id
+        LEFT JOIN ${TABLE_NAMES.runs} AS runs
+          ON runs.member_id = members.member_id
+        WHERE teams.workspace_root = ?
+          AND members.role = 'teammate'
+          AND members.status != ?
+        ORDER BY members.joined_at ASC, runs.updated_at DESC, runs.run_id DESC
+      `
+    )
+    .all(workspaceRoot, MEMBER_STATUSES.archived) as TeammateStatusRow[];
+
+  const seen = new Set<string>();
+  const teammates: DiagnosticsTeammateStatus[] = [];
+
+  for (const row of rows) {
+    // The LEFT JOIN can emit multiple rows when a member has several runs;
+    // ordering puts the most recent run first, so keep the first occurrence.
+    if (seen.has(row.member_id)) {
+      continue;
+    }
+    seen.add(row.member_id);
+
+    const runMetadata = parseJsonObject(row.run_metadata_json);
+    const pane = extractPaneMetadata(runMetadata);
+    const attached =
+      pane !== null &&
+      pane.availability_status === "available" &&
+      Boolean(pane.pane_id ?? pane.session_name);
+    const needsReview =
+      row.run_review_status === RUN_REVIEW_STATUSES.needsReview ||
+      row.run_review_status === RUN_REVIEW_STATUSES.pendingReview;
+    const memberMetadata = parseJsonObject(row.member_metadata_json);
+    const teammateId = optionalText(memberMetadata.publicTeammateId);
+
+    teammates.push({
+      ...(teammateId ? { teammate_id: teammateId } : {}),
+      member_id: row.member_id,
+      display_name: sanitizeDebugText(row.display_name) ?? "",
+      status: mapMemberToObsStatus(
+        row.member_status,
+        row.run_backend_status,
+        row.run_last_error
+      ),
+      attached,
+      needs_review: needsReview
+    });
+  }
+
+  return teammates;
+}
+
+function mapMemberToObsStatus(
+  memberStatus: string,
+  backendStatus: string | null,
+  lastError: string | null
+): string {
+  switch (memberStatus) {
+    case MEMBER_STATUSES.running:
+    case MEMBER_STATUSES.idle:
+    case MEMBER_STATUSES.stopped:
+    case MEMBER_STATUSES.failed:
+    case MEMBER_STATUSES.stale:
+      return memberStatus;
+    case MEMBER_STATUSES.scheduled:
+      if (isUnavailableSignal(lastError)) {
+        return "unavailable";
+      }
+      if (backendStatus === RUN_BACKEND_STATUSES.starting) {
+        return "starting";
+      }
+      // A scheduled run that never started a real backend is unavailable.
+      return "unavailable";
+    default:
+      return mapBackendStatusToObs(backendStatus);
+  }
+}
+
+function mapBackendStatusToObs(backendStatus: string | null): string {
+  switch (backendStatus) {
+    case RUN_BACKEND_STATUSES.starting:
+      return "starting";
+    case RUN_BACKEND_STATUSES.running:
+      return "running";
+    case RUN_BACKEND_STATUSES.idle:
+      return "idle";
+    case RUN_BACKEND_STATUSES.stopped:
+      return "stopped";
+    case RUN_BACKEND_STATUSES.failed:
+      return "failed";
+    case RUN_BACKEND_STATUSES.stale:
+      return "stale";
+    case RUN_BACKEND_STATUSES.notStarted:
+      return "unavailable";
+    default:
+      return backendStatus ?? "unavailable";
+  }
+}
+
+function isUnavailableSignal(lastError: string | null): boolean {
+  if (!lastError) {
+    return false;
+  }
+  if (UNAVAILABLE_LAST_ERROR_SIGNALS.has(lastError)) {
+    return true;
+  }
+  return lastError.startsWith("pane_backend_unavailable");
+}
+
+// OBS-02: build the enriched (sanitized) metadata diagnostics block when a run
+// surfaced codex_session_metadata_unavailable. Returns null when no run matches,
+// preserving the existing payload shape for unaffected workspaces.
+function buildMetadataDiagnostics(
+  db: ReturnType<DurableStateAdapter["getDatabase"]>,
+  workspaceRoot: string,
+  executionBackend: ExecutionBackend
+): DiagnosticsMetadataDiagnostics | null {
+  const rows = db
+    .prepare(
+      `
+        SELECT
+          runs.backend,
+          runs.backend_status,
+          runs.backend_run_id,
+          runs.backend_thread_id,
+          runs.backend_process_id,
+          runs.workspace_path,
+          runs.review_status,
+          runs.last_error,
+          runs.metadata_json
+        FROM ${TABLE_NAMES.runs} AS runs
+        JOIN ${TABLE_NAMES.teams} AS teams
+          ON teams.team_id = runs.team_id
+        WHERE teams.workspace_root = ?
+        ORDER BY runs.updated_at DESC, runs.run_id DESC
+      `
+    )
+    .all(workspaceRoot) as MetadataDiagnosticsRunRow[];
+
+  const match = rows.find((row) => {
+    if (row.last_error === CODEX_SESSION_METADATA_UNAVAILABLE) {
+      return true;
+    }
+    const pane = extractPaneMetadata(parseJsonObject(row.metadata_json));
+    return Boolean(
+      pane?.degradation_reason?.includes(CODEX_SESSION_METADATA_UNAVAILABLE)
+    );
+  });
+
+  if (!match) {
+    return null;
+  }
+
+  // Only static, sanitized backend column NAMES that are non-empty for this run
+  // (never their values). backend/backend_status are always present on this path.
+  const observedKeys = (
+    [
+      ["backend", match.backend],
+      ["backend_status", match.backend_status],
+      ["backend_run_id", match.backend_run_id],
+      ["backend_thread_id", match.backend_thread_id],
+      ["backend_process_id", match.backend_process_id],
+      ["workspace_path", match.workspace_path],
+      ["review_status", match.review_status]
+    ] as Array<[string, string | null]>
+  )
+    .filter(([, value]) => typeof value === "string" && value.length > 0)
+    .map(([key]) => key);
+
+  if (observedKeys.length === 0) {
+    observedKeys.push("backend", "backend_status");
+  }
+
+  return {
+    missing_metadata_source:
+      "durable codex thread/session id (backend_thread_id) was not captured for this run",
+    observed_keys: observedKeys,
+    selected_backend:
+      optionalText(match.backend) ?? executionBackend.describeBackend().backend,
+    remediation: [...REMEDIATION_STEPS]
+  };
+}
+
+function optionalText(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 function buildDiagnosticsState(

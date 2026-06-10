@@ -17,9 +17,11 @@ import {
   taskListSchema,
   taskUpdateSchema,
   teamCreateSchema,
-  teamDeleteSchema
+  teamDeleteSchema,
+  teamMergeSchema
 } from "./schemas.js";
 import { createAgentHandler } from "./agentHandler.js";
+import { createTeamMergeHandler } from "./mergeHandler.js";
 import { createSendMessageHandler } from "./messageHandler.js";
 import { createScaffoldToolHandler } from "./scaffoldHandlers.js";
 import {
@@ -121,6 +123,9 @@ function createTargetToolDefinition(
 const diagnosticsDescription =
   "Diagnostics for the Codex Team compatibility equivalent of Claude Agent Team tools. Reports Phase 5 lifecycle, run, message, task, stale reconciliation, workspace review, and backend-dependent status summaries. Phase 7 adds backend-dependent pane attach/status and workspace review visibility as summary-only diagnostics.";
 
+const teamMergeDescription =
+  "codex-team extension (NOT a native Claude tool): TL-driven review/merge/escalate of an isolated worktree branch back into the leader working tree. Auditable and explicit — never a silent background auto-merge. On conflict the leader is rolled back clean and the worktree is preserved; unresolved conflicts can be escalated to a human.";
+
 export const COMPATIBILITY_TOOLS: readonly CompatibilityToolDefinition[] = [
   ...TARGET_CLAUDE_TOOLS.map(createTargetToolDefinition),
   {
@@ -131,6 +136,15 @@ export const COMPATIBILITY_TOOLS: readonly CompatibilityToolDefinition[] = [
     status: "implemented",
     nextPhase: "Phase 5",
     inputSchema: diagnosticsSchema
+  },
+  {
+    claudeToolName: "TeamMerge",
+    codexToolName: "TeamMerge",
+    title: "TeamMerge",
+    description: teamMergeDescription,
+    status: "implemented",
+    nextPhase: "Phase 12",
+    inputSchema: teamMergeSchema
   }
 ];
 
@@ -168,6 +182,7 @@ export function registerCompatibilityTools(
     let handler:
       | ReturnType<typeof createDiagnosticsToolHandler>
       | ReturnType<typeof createAgentHandler>
+      | ReturnType<typeof createTeamMergeHandler>
       | ReturnType<typeof createSendMessageHandler>
       | ReturnType<typeof createTaskCreateHandler>
       | ReturnType<typeof createTaskUpdateHandler>
@@ -195,6 +210,8 @@ export function registerCompatibilityTools(
       handler = createTaskGetHandler(options);
     } else if (tool.codexToolName === "TeamDiagnostics") {
       handler = createDiagnosticsToolHandler(options);
+    } else if (tool.codexToolName === "TeamMerge") {
+      handler = createTeamMergeHandler(options);
     } else {
       handler = createScaffoldToolHandler(tool, options);
     }

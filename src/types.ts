@@ -17,7 +17,10 @@ export type CompatibilityToolName =
   | "TaskUpdate"
   | "TaskList"
   | "TaskGet"
-  | "TeamDiagnostics";
+  | "TeamDiagnostics"
+  // Phase 12 (D-04): codex-team extension tool (NOT a native Claude tool, same
+  // precedent as TeamDiagnostics). The 8 Claude target tools are unchanged.
+  | "TeamMerge";
 
 export interface ToolMapping {
   claudeToolName: CompatibilityToolName;
@@ -36,9 +39,15 @@ export interface PaneModeOptions {
   codexCommand?: string;
 }
 
+export interface ExecutionOptions {
+  enabled?: boolean;
+  backend?: string;
+}
+
 export interface CodexTeamServerOptions {
   stateRoot?: string;
   workspaceRoot?: string;
   executionBackend?: ExecutionBackend;
+  execution?: ExecutionOptions;
   paneMode?: PaneModeOptions;
 }

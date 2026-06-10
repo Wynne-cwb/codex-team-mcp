@@ -113,3 +113,14 @@ export const taskGetSchema = {
 export const diagnosticsSchema = {
   include_debug: z.boolean().optional()
 };
+
+// Phase 12 (D-04): codex-team extension tool. TL-driven review / merge / escalate
+// of an isolated worktree branch. Target run is resolved by run_id, else by
+// teammate_id / member_id (most recent worktree run).
+export const teamMergeSchema = {
+  action: z.enum(["review", "merge", "escalate"]),
+  teammate_id: z.string().optional(),
+  member_id: z.string().optional(),
+  run_id: z.string().optional(),
+  team_name: z.string().optional()
+};

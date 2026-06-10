@@ -2,7 +2,11 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
 import { createCodexTeamServer } from "./server.js";
-import type { PaneBackendPreference, PaneModeOptions } from "./types.js";
+import type {
+  ExecutionOptions,
+  PaneBackendPreference,
+  PaneModeOptions
+} from "./types.js";
 
 function parsePaneModeOptions(env: NodeJS.ProcessEnv): PaneModeOptions {
   return {
@@ -14,12 +18,19 @@ function parsePaneModeOptions(env: NodeJS.ProcessEnv): PaneModeOptions {
 }
 
 function parsePaneModeEnabled(value: string | undefined): boolean {
-  const normalized = value?.toLowerCase();
+  const normalized = value?.trim().toLowerCase();
   return (
     normalized === "1" ||
     normalized === "true" ||
     normalized === "enabled"
   );
+}
+
+function parseExecutionOptions(env: NodeJS.ProcessEnv): ExecutionOptions {
+  return {
+    enabled: parsePaneModeEnabled(env.CODEX_TEAM_EXECUTION),
+    backend: optionalEnvValue(env.CODEX_TEAM_EXECUTION_BACKEND) ?? "auto"
+  };
 }
 
 function parsePaneBackendPreference(
@@ -46,6 +57,7 @@ try {
   const server = createCodexTeamServer({
     stateRoot: process.env.CODEX_TEAM_STATE_ROOT,
     workspaceRoot: process.env.CODEX_TEAM_WORKSPACE_ROOT,
+    execution: parseExecutionOptions(process.env),
     paneMode: parsePaneModeOptions(process.env)
   });
   await server.connect(new StdioServerTransport());

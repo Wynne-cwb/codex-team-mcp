@@ -389,6 +389,39 @@ export const MIGRATIONS: readonly MigrationDefinition[] = [
           ON ${TABLE_NAMES.runs}(team_id, review_status);
       `);
     }
+  },
+  {
+    version: 5,
+    name: "add resume debounce timestamp",
+    up(db) {
+      // Phase 10 (D10-4): per-burst resume debounce. The last resume attempt
+      // timestamp persists on the run row (sibling of last_reconciled_at, v4)
+      // so the debounce window survives MCP process restarts. Idempotent add via
+      // addColumnIfMissing — same pattern as the v4 lifecycle time columns.
+      addColumnIfMissing(db, TABLE_NAMES.runs, "last_resume_attempt_at", "TEXT");
+    }
+  },
+  {
+    version: 6,
+    name: "add worktree merge audit metadata",
+    up(db) {
+      // Phase 12 (D-04 / ISOL-02): auditable TL-driven worktree merge metadata.
+      // Idempotent adds (addColumnIfMissing, same pattern as v4/v5) — the
+      // review_status column is free TEXT (no CHECK, see v4) so the new
+      // merge_conflict/escalated_to_human enum values need no constraint change.
+      // Redaction (P5 D-19): only file path names + commit SHA + caller key are
+      // stored here — never diff content / prompt / body.
+      addColumnIfMissing(db, TABLE_NAMES.runs, "worktree_branch", "TEXT");
+      addColumnIfMissing(db, TABLE_NAMES.runs, "merge_commit", "TEXT");
+      addColumnIfMissing(db, TABLE_NAMES.runs, "merged_at", "TEXT");
+      addColumnIfMissing(db, TABLE_NAMES.runs, "merged_by_caller_key", "TEXT");
+      addColumnIfMissing(
+        db,
+        TABLE_NAMES.runs,
+        "merge_conflict_files_json",
+        "TEXT"
+      );
+    }
   }
 ];
 

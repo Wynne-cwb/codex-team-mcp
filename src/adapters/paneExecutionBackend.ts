@@ -7,6 +7,8 @@ import {
   type ExecutionTrigger,
   ScaffoldExecutionBackend
 } from "./execution.js";
+import { createCapabilityRankedBackendChain } from "./capabilityRankedBackendChain.js";
+import { CodexCliExecutionBackend } from "./codexCliExecutionBackend.js";
 import {
   createDefaultPaneBackendRegistry,
   type PaneBackendMetadata,
@@ -317,11 +319,34 @@ export function createExecutionBackendFromOptions(
     return options.executionBackend;
   }
 
+  // Explicit CODEX_TEAM_EXECUTION opt-in -> the capability-ranked chain over the
+  // real backend candidates. Never silently auto-enabled; the default stays the
+  // unsupported ScaffoldExecutionBackend.
+  if (options.execution?.enabled === true) {
+    return createCapabilityRankedBackendChain(
+      buildExecutionCandidates(options.execution.backend)
+    );
+  }
+
   if (options.paneMode?.enabled === true) {
     return new PaneExecutionBackend(options.paneMode);
   }
 
   return new ScaffoldExecutionBackend();
+}
+
+function buildExecutionCandidates(backend?: string): ExecutionBackend[] {
+  const normalized = backend?.trim().toLowerCase();
+
+  // The codex CLI exec/resume backend is the only Phase-8-qualifying surface
+  // (rank 1). "auto" ranks the candidate list; a specific selector pins it.
+  // Unknown selectors still fall back to the codex candidate so the chain
+  // reports an honest unavailable/escalate result rather than vanishing.
+  if (!normalized || normalized === "auto" || normalized === "codex_cli_exec") {
+    return [new CodexCliExecutionBackend()];
+  }
+
+  return [new CodexCliExecutionBackend()];
 }
 
 export function extractPaneMetadata(

@@ -10,7 +10,7 @@ import { buildWorkspaceScopedCallerIdentity } from "../src/services/callerIdenti
 import { TaskService } from "../src/services/taskService.js";
 import { openTeamDatabase } from "../src/state/database.js";
 import { DurableStateAdapter } from "../src/state/durableState.js";
-import { MIGRATIONS, runMigrations } from "../src/state/migrations.js";
+import { getMigrationStatus, MIGRATIONS, runMigrations } from "../src/state/migrations.js";
 import {
   COMPONENT_NAMES,
   ERROR_EVENT_TYPES,
@@ -50,12 +50,22 @@ const expectedRunLifecycleColumns = [
   "started_at",
   "ended_at",
   "last_reconciled_at",
+  "last_resume_attempt_at",
   "work_classification",
   "isolation_kind",
   "base_revision",
   "review_status",
   "changed_files_json",
   "diff_summary"
+];
+
+// Phase 12 (D-04 / migration v6): TL-driven worktree merge audit columns.
+const expectedMergeAuditColumns = [
+  "worktree_branch",
+  "merge_commit",
+  "merged_at",
+  "merged_by_caller_key",
+  "merge_conflict_files_json"
 ];
 
 const tempRoots: string[] = [];
@@ -393,7 +403,9 @@ describe("SQLite durable store", () => {
       1,
       2,
       3,
-      4
+      4,
+      5,
+      6
     ]);
     expect(tableNames(db)).toEqual(expect.arrayContaining(requiredTables));
     expect(tableNames(db)).toEqual(expect.arrayContaining(["task_edges", "task_events"]));
@@ -413,6 +425,41 @@ describe("SQLite durable store", () => {
     ).toMatchObject({
       name: expect.stringContaining("add lifecycle and isolation metadata")
     });
+    expect(
+      db.prepare("SELECT name FROM schema_migrations WHERE version = 6").get()
+    ).toMatchObject({
+      name: expect.stringContaining("add worktree merge audit metadata")
+    });
+    expect(tableColumns(db, TABLE_NAMES.runs)).toEqual(
+      expect.arrayContaining(expectedMergeAuditColumns)
+    );
+
+    db.close();
+  });
+
+  it("adds version 6 worktree merge audit metadata idempotently", () => {
+    expect(MIGRATIONS.map((migration) => migration.version)).toContain(6);
+
+    const stateRoot = createTempStateRoot();
+    const databasePath = path.join(stateRoot, STATE_DB_FILENAME);
+    const db = openTeamDatabase(databasePath);
+    runMigrations(db);
+
+    expect(getMigrationStatus(db)).toMatchObject({
+      status: "up_to_date",
+      targetVersion: 6,
+      latestVersion: 6
+    });
+    expect(tableColumns(db, TABLE_NAMES.runs)).toEqual(
+      expect.arrayContaining(expectedMergeAuditColumns)
+    );
+
+    // Idempotent: a second migration run applies nothing and never throws.
+    const secondRun = runMigrations(db);
+    expect(secondRun.appliedMigrations).toEqual([]);
+    expect(tableColumns(db, TABLE_NAMES.runs)).toEqual(
+      expect.arrayContaining(expectedMergeAuditColumns)
+    );
 
     db.close();
   });
@@ -469,7 +516,9 @@ describe("SQLite durable store", () => {
     expect(result.appliedMigrations.map((migration) => migration.version)).toEqual([
       2,
       3,
-      4
+      4,
+      5,
+      6
     ]);
     expect(uniqueIndexes(db, "teams")).toContain(
       "idx_teams_workspace_canonical_name"
@@ -489,7 +538,9 @@ describe("SQLite durable store", () => {
 
     expect(result.appliedMigrations.map((migration) => migration.version)).toEqual([
       3,
-      4
+      4,
+      5,
+      6
     ]);
     expect(result.appliedMigrations[0]?.name).toContain(
       "expand message and task coordination state"
@@ -678,7 +729,7 @@ describe("SQLite durable store", () => {
     ).toMatchObject({ canonical_name: "persisted" });
     expect(
       reopened.db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()
-    ).toMatchObject({ count: 4 });
+    ).toMatchObject({ count: 6 });
 
     reopened.db.close();
   });
@@ -725,8 +776,8 @@ describe("DurableStateAdapter", () => {
     expect(description.databasePath).toBe(path.join(stateRoot, STATE_DB_FILENAME));
     expect(description.migrationStatus).toMatchObject({
       status: "up_to_date",
-      latestVersion: 4,
-      targetVersion: 4,
+      latestVersion: 6,
+      targetVersion: 6,
       pendingMigrations: []
     });
     expect(description.tableCounts).toMatchObject({
@@ -772,7 +823,7 @@ describe("DurableStateAdapter", () => {
 
     expect(description.migrationStatus.status).toBe("up_to_date");
     expect(description.tableCounts.teams).toBe(1);
-    expect(description.tableCounts.schema_migrations).toBe(4);
+    expect(description.tableCounts.schema_migrations).toBe(6);
     expect(description.tableCounts.task_edges).toBe(0);
     expect(description.tableCounts.task_events).toBe(0);
 

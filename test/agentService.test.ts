@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -1252,6 +1253,217 @@ describe("AgentService.createAgent", () => {
         })
       ])
     );
+
+    adapter.close();
+  });
+});
+
+// A real-execution-named backend that is unavailable at start (canStart=false).
+// Mirrors the opted-in capability-ranked chain when codex is missing.
+class FakeUnavailableExecutionBackend implements ExecutionBackend {
+  describeBackend(): ExecutionBackendDescription {
+    return {
+      status: "unavailable",
+      teammateExecutionImplemented: false,
+      backend: "codex_cli_exec",
+      backend_status: "not_started",
+      capabilities: {
+        canStart: false,
+        canResume: false,
+        canReconcile: false,
+        supportsWorkspaces: false
+      },
+      limitation: "codex_cli_exec backend unavailable: enable CODEX_TEAM_EXECUTION"
+    };
+  }
+
+  startRun() {
+    return {
+      status: "unsupported" as const,
+      delivery_status: "backend_unavailable" as const,
+      backend: "codex_cli_exec",
+      backend_status: "not_started" as const,
+      last_error: "codex_cli_exec backend unavailable"
+    };
+  }
+
+  resumeRun() {
+    return {
+      status: "unsupported" as const,
+      delivery_status: "backend_unavailable" as const,
+      backend: "codex_cli_exec",
+      backend_status: "not_started" as const
+    };
+  }
+
+  reconcileRun() {
+    return {
+      status: "unsupported" as const,
+      backend: "codex_cli_exec",
+      backend_status: "not_started" as const
+    };
+  }
+}
+
+function execGit(cwd: string, args: string[]): string {
+  return execFileSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+}
+
+function createTempGitLeader(): string {
+  const leaderRoot = mkdtempSync(path.join(tmpdir(), "codex-team-agent-leader-"));
+  tempRoots.push(leaderRoot);
+  execGit(leaderRoot, ["init"]);
+  execGit(leaderRoot, ["config", "user.email", "test@example.com"]);
+  execGit(leaderRoot, ["config", "user.name", "Codex Test"]);
+  writeFileSync(path.join(leaderRoot, "tracked.txt"), "base\n");
+  execGit(leaderRoot, ["add", "tracked.txt"]);
+  execGit(leaderRoot, ["commit", "-m", "base"]);
+  return leaderRoot;
+}
+
+describe("AgentService.createAgent — Phase 9 opt-in execution behavior", () => {
+  it("returns an explicit execution_backend_unavailable error with rows persisted (D-04)", () => {
+    const identity = createIdentity("/workspace/project");
+    const adapter = new DurableStateAdapter({
+      stateRoot: createTempStateRoot(),
+      workspaceRoot: identity.workspaceRoot
+    });
+    createAlphaTeam(adapter, identity);
+
+    const result = createAgentService(
+      adapter,
+      new FakeUnavailableExecutionBackend()
+    ).createAgent({
+      name: "Researcher",
+      teamName: "alpha-team",
+      mode: "read",
+      prompt: "Research current status",
+      description: "read-only status check",
+      identity
+    });
+
+    expect(result).toMatchObject({
+      status: "error",
+      error_code: "execution_backend_unavailable",
+      team_name: "alpha-team",
+      teammate_id: "researcher@alpha-team"
+    });
+    expect((result as { message: string }).message).toContain("CODEX_TEAM_EXECUTION");
+
+    // Persist-before-backend: team/member/run rows still exist; success not faked.
+    expect(nonLeaderMemberCount(adapter.getDatabase())).toBe(1);
+    expect(runCount(adapter.getDatabase())).toBe(1);
+    const run = readRuns(adapter.getDatabase())[0];
+    expect(run).toMatchObject({
+      status: MEMBER_STATUSES.scheduled,
+      backend: "codex_cli_exec",
+      backend_status: "not_started"
+    });
+
+    adapter.close();
+  });
+
+  it("auto-creates an isolated worktree for file-modifying work and passes workspace_path", () => {
+    const leaderRoot = createTempGitLeader();
+    const identity = createIdentity(leaderRoot);
+    const adapter = new DurableStateAdapter({
+      stateRoot: createTempStateRoot(),
+      workspaceRoot: identity.workspaceRoot
+    });
+    createAlphaTeam(adapter, identity);
+    const backend = new FakeStartBackend({ supportsWorkspaces: true });
+
+    const result = createAgentService(adapter, backend).createAgent({
+      name: "Builder",
+      teamName: "alpha-team",
+      mode: "implementation",
+      prompt: "implement the feature",
+      description: "code implementation without caller-supplied isolation",
+      identity
+    });
+
+    expect(result.status).toBe("running");
+    expect(backend.startCalls).toHaveLength(1);
+
+    const workspacePath = backend.startCalls[0]?.workspace_path;
+    expect(typeof workspacePath).toBe("string");
+    // Worktree is OUTSIDE the leader tree.
+    const relativeToLeader = path.relative(leaderRoot, String(workspacePath));
+    expect(
+      relativeToLeader.startsWith("..") || path.isAbsolute(relativeToLeader)
+    ).toBe(true);
+    expect(existsSync(String(workspacePath))).toBe(true);
+    expect(backend.startCalls[0]).toMatchObject({
+      work_classification: "code_implementation",
+      isolation_kind: "git_worktree"
+    });
+
+    // A sanitized workspace_isolation_created event was appended.
+    const isolationEvent = eventRows(adapter.getDatabase()).find(
+      (row) => row.event_type === EVENT_TYPES.workspaceIsolationCreated
+    );
+    expect(isolationEvent).toBeDefined();
+    const isolationPayload = JSON.parse(isolationEvent?.payload_json ?? "{}");
+    expect(isolationPayload).toMatchObject({
+      isolation_kind: "git_worktree",
+      run_id: result.run_id
+    });
+    expect(typeof isolationPayload.branch).toBe("string");
+
+    const run = readRuns(adapter.getDatabase())[0];
+    expect(run).toMatchObject({
+      isolation_kind: "git_worktree",
+      review_status: "pending_review"
+    });
+    expect(run?.workspace_path).toBe(path.resolve(String(workspacePath)));
+
+    adapter.close();
+  });
+
+  it("blocks file-modifying work when an isolated worktree cannot be created (non-git leader)", () => {
+    const identity = createIdentity("/workspace/not-a-git-repo");
+    const adapter = new DurableStateAdapter({
+      stateRoot: createTempStateRoot(),
+      workspaceRoot: identity.workspaceRoot
+    });
+    createAlphaTeam(adapter, identity);
+    const backend = new FakeStartBackend({ supportsWorkspaces: true });
+
+    const result = createAgentService(adapter, backend).createAgent({
+      name: "Builder",
+      teamName: "alpha-team",
+      mode: "implementation",
+      prompt: "implement the feature",
+      description: "code implementation against a non-git leader",
+      identity
+    });
+
+    expect(backend.startCalls).toHaveLength(0);
+    expect(result).toMatchObject({
+      status: "scheduled",
+      delivery_status: "backend_unavailable",
+      error_code: "workspace_isolation_required",
+      lifecycle: {
+        work_classification: "code_implementation",
+        review_status: "needs_review"
+      }
+    });
+    const run = readRuns(adapter.getDatabase())[0];
+    expect(run).toMatchObject({
+      status: MEMBER_STATUSES.scheduled,
+      workspace_path: null,
+      last_error: "workspace_isolation_required"
+    });
+    // No worktree-created event when isolation is impossible.
+    expect(
+      eventRows(adapter.getDatabase()).some(
+        (row) => row.event_type === EVENT_TYPES.workspaceIsolationCreated
+      )
+    ).toBe(false);
 
     adapter.close();
   });

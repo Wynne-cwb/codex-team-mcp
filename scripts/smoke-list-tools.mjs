@@ -15,7 +15,8 @@ const expectedTools = [
   "TaskUpdate",
   "TaskList",
   "TaskGet",
-  "TeamDiagnostics"
+  "TeamDiagnostics",
+  "TeamMerge"
 ];
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));

@@ -10,6 +10,10 @@ export interface ExecutionBackendCapabilities {
   canResume: boolean;
   canReconcile: boolean;
   supportsWorkspaces: boolean;
+  // Optional, additive (Phase 9): OS sandbox is a ranking BONUS only — never an
+  // eligibility gate (docs/backend-decision.md). Absent/false on backends that
+  // do not support an OS sandbox; the capability-ranked chain reads it defensively.
+  supportsOsSandbox?: boolean;
 }
 
 export interface ExecutionBackendDescription {
@@ -71,6 +75,12 @@ export interface ExecutionBackendActionResult {
   ended_at?: string;
   last_error?: string;
   metadata?: Record<string, unknown>;
+  // Optional, additive (Phase 9): a synchronous one-shot backend (e.g. codex
+  // exec) runs the turn to completion and exits at startRun/resumeRun return.
+  // turn_completed === true signals the orchestrator to finalize the member to
+  // final_backend_status (default idle) instead of leaving it running.
+  turn_completed?: boolean;
+  final_backend_status?: RunBackendStatus;
 }
 
 export type ExecutionBackendReconcileStatus =

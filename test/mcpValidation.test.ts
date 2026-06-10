@@ -76,6 +76,37 @@ describe("MCP boundary validation", () => {
     expect(serializedMessageSchema).toContain("plan_approval_response");
   });
 
+  it("advertises the TeamMerge codex-team extension with an action schema while keeping 8 Claude tools", async () => {
+    const tools = await client.listTools();
+    const toolNames = tools.tools.map((tool) => tool.name);
+
+    // codex-team extensions are present alongside the 8 Claude target tools.
+    expect(toolNames).toContain("TeamMerge");
+    expect(toolNames).toContain("TeamDiagnostics");
+    for (const claudeTool of [
+      "TeamCreate",
+      "TeamDelete",
+      "Agent",
+      "SendMessage",
+      "TaskCreate",
+      "TaskUpdate",
+      "TaskList",
+      "TaskGet"
+    ]) {
+      expect(toolNames).toContain(claudeTool);
+    }
+
+    const teamMergeSchema = await listToolSchema("TeamMerge");
+    expect(teamMergeSchema.properties).toMatchObject({
+      action: expect.any(Object),
+      teammate_id: expect.any(Object),
+      member_id: expect.any(Object),
+      run_id: expect.any(Object)
+    });
+    expect(JSON.stringify(teamMergeSchema)).toContain("review");
+    expect(JSON.stringify(teamMergeSchema)).toContain("escalate");
+  });
+
   it("advertises compatible TeamCreate and Agent parameters", async () => {
     const tools = await client.listTools();
     const toolByName = new Map(tools.tools.map((tool) => [tool.name, tool]));

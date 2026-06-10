@@ -209,7 +209,33 @@ describe("pane MCP routing", () => {
 
     const diagnostics = await callTool("TeamDiagnostics", {});
 
+    // D-03 intentional contract change: the default (non-debug) diagnostics keep
+    // an attach hint + pane/backend labels, NOT the full attach_command.
     expect(diagnostics).toMatchObject({
+      paneSummary: {
+        total: 1,
+        panes: [
+          expect.objectContaining({
+            backend_type: "tmux",
+            pane_id: "%12",
+            attach_hint: true
+          })
+        ]
+      }
+    });
+    const firstDefaultPane = (
+      (diagnostics.paneSummary as { panes?: Array<Record<string, unknown>> })
+        .panes ?? []
+    )[0];
+    expect(firstDefaultPane).not.toHaveProperty("attach_command");
+
+    // D-03: the full, copy-pasteable attach_command is only exposed under
+    // include_debug.
+    const debugDiagnostics = await callTool("TeamDiagnostics", {
+      include_debug: true
+    });
+
+    expect(debugDiagnostics).toMatchObject({
       paneSummary: {
         total: 1,
         panes: [
@@ -265,7 +291,14 @@ describe("pane MCP routing", () => {
       "TaskList",
       "TaskGet"
     ]);
-    expect(toolNames).toEqual([...TARGET_CLAUDE_TOOLS, "TeamDiagnostics"]);
+    // Phase 12 adds the TeamMerge codex-team extension (same precedent as
+    // TeamDiagnostics); the 8 Claude target tools are unchanged and there are
+    // still no kill/terminate controls.
+    expect(toolNames).toEqual([
+      ...TARGET_CLAUDE_TOOLS,
+      "TeamDiagnostics",
+      "TeamMerge"
+    ]);
     expect(toolNames).not.toEqual(
       expect.arrayContaining([
         "TeamPaneKill",

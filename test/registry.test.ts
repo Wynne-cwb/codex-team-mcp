@@ -22,7 +22,8 @@ const expectedToolStatuses = {
   TaskUpdate: "implemented",
   TaskList: "implemented",
   TaskGet: "implemented",
-  TeamDiagnostics: "implemented"
+  TeamDiagnostics: "implemented",
+  TeamMerge: "implemented"
 };
 
 describe("compatibility tool registry", () => {
@@ -30,10 +31,31 @@ describe("compatibility tool registry", () => {
     expect([...TARGET_CLAUDE_TOOLS]).toEqual(expectedTargetTools);
   });
 
-  it("registers all target tools plus TeamDiagnostics", () => {
+  it("registers all target tools plus TeamDiagnostics and TeamMerge", () => {
     const names = COMPATIBILITY_TOOLS.map((tool) => tool.codexToolName);
 
-    expect(names).toEqual([...expectedTargetTools, "TeamDiagnostics"]);
+    expect(names).toEqual([...expectedTargetTools, "TeamDiagnostics", "TeamMerge"]);
+  });
+
+  it("keeps the 8 Claude target tools unchanged when codex-team extensions are added", () => {
+    // TeamDiagnostics + TeamMerge are codex-team extensions, NOT Claude target
+    // tools — the Claude compatibility mapping must stay exactly 8.
+    expect(TARGET_CLAUDE_TOOLS).toHaveLength(8);
+    expect([...TARGET_CLAUDE_TOOLS]).not.toContain("TeamMerge");
+    expect([...TARGET_CLAUDE_TOOLS]).not.toContain("TeamDiagnostics");
+  });
+
+  it("reports TeamMerge as an implemented codex-team extension (not a native Claude tool)", () => {
+    const teamMerge = COMPATIBILITY_TOOLS.find(
+      (tool) => tool.codexToolName === "TeamMerge"
+    );
+
+    expect(teamMerge).toMatchObject({
+      status: "implemented",
+      nextPhase: "Phase 12"
+    });
+    expect(teamMerge?.description).toContain("codex-team extension");
+    expect(teamMerge?.description).toContain("never a silent background auto-merge");
   });
 
   it("maps every target tool with a Claude compatibility description", () => {

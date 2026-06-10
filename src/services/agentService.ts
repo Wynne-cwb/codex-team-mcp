@@ -6,6 +6,8 @@ import {
   type ExecutionBackend,
   ScaffoldExecutionBackend
 } from "../adapters/execution.js";
+import type { PaneBackendRegistry } from "../adapters/paneBackend.js";
+import type { PaneModeOptions } from "../types.js";
 import type {
   LifecycleActionResult,
   LifecycleBackendResult,
@@ -13,6 +15,7 @@ import type {
   LifecycleMetadataResult
 } from "./lifecycleService.js";
 import { LifecycleService } from "./lifecycleService.js";
+import { MessageService } from "./messageService.js";
 import type { WorkspaceScopedCallerIdentity } from "./callerIdentity.js";
 import { ContextResolver, type TeamContextResolution } from "./contextResolver.js";
 import {
@@ -42,11 +45,30 @@ const TEAMMATE_CREATION_REJECTED_EVENT_TYPE =
 const BACKEND_STATUS_NOT_STARTED = "not_started";
 const BACKEND_NAME = "none";
 const NESTED_CREATION_UNPROVEN = "caller_not_proven_teammate";
+const EXECUTION_BACKEND_UNAVAILABLE_ERROR_CODE = "execution_backend_unavailable";
+const BACKEND_UNAVAILABLE_ERROR_CODE = "backend_unavailable";
+// Real execution surfaces selected by the Phase-8 capability-ranked chain. D-04
+// fires its loud error ONLY for these (the opted-in real backend). The default
+// scaffold ("none") and Phase-7 pane transports ("tmux"/"iterm2") keep their
+// quiet scheduled + backend_unavailable behavior.
+const REAL_EXECUTION_BACKEND_NAMES = new Set<string>(["codex_cli_exec"]);
+// D-04 explicit, actionable error: loud failure so the leader knows no real run
+// started. Carries remediation; never leaks prompt/output (sanitized constant).
+const EXECUTION_BACKEND_UNAVAILABLE_MESSAGE =
+  "No real run started: the opted-in execution backend is unavailable on this machine. " +
+  "The TeamMate team/member/run records are persisted, but no backend run was launched. " +
+  "Remediation: ensure CODEX_TEAM_EXECUTION=1, make sure `codex` is on PATH (codex exec --help should exit 0), " +
+  "and provide a worktree for file-modifying work so the backend can run with --cd.";
 
 export interface AgentServiceOptions {
   db: Database.Database;
   statePath: string;
   executionBackend?: ExecutionBackend;
+  // PANE-01 / D-01: forwarded to LifecycleService so a real Agent start can
+  // overlay a visible pane when pane mode is enabled. paneBackend is an
+  // injection seam for deterministic tests (CI has no real tmux/iTerm2).
+  paneMode?: PaneModeOptions;
+  paneBackend?: PaneBackendRegistry;
 }
 
 export interface AgentCreateInput {
@@ -264,7 +286,32 @@ export class AgentService {
         identity: input.identity
       });
 
-      return this.mergeLifecycleResult(scheduledResult, lifecycleResult);
+      const merged = this.mergeLifecycleResult(scheduledResult, lifecycleResult);
+
+      // D-03: a one-shot turn completed -> the member is idle; notify the lead
+      // (sanitized, best-effort) so the next message/task can resume it (Phase 10).
+      if (lifecycleResult.turn_completed === true) {
+        this.notifyLeadOfCompletion(creation);
+      }
+
+      // D-04: an opted-in real backend was unavailable at start (records already
+      // persisted) -> return a loud, actionable error. The default scaffold
+      // ("none") and Phase-7 pane transports keep the quiet scheduled result
+      // (Phase 5/7 baseline).
+      if (
+        lifecycleResult.error_code === BACKEND_UNAVAILABLE_ERROR_CODE &&
+        REAL_EXECUTION_BACKEND_NAMES.has(lifecycleResult.backend.backend)
+      ) {
+        return {
+          status: "error",
+          error_code: EXECUTION_BACKEND_UNAVAILABLE_ERROR_CODE,
+          message: EXECUTION_BACKEND_UNAVAILABLE_MESSAGE,
+          team_name: creation.teamName,
+          teammate_id: creation.publicTeammateId
+        };
+      }
+
+      return merged;
     } catch (error) {
       if (!isUniqueMemberIdError(error)) {
         throw error;
@@ -432,8 +479,42 @@ export class AgentService {
       db: this.options.db,
       statePath: this.options.statePath,
       executionBackend:
-        this.options.executionBackend ?? new ScaffoldExecutionBackend()
+        this.options.executionBackend ?? new ScaffoldExecutionBackend(),
+      paneMode: this.options.paneMode,
+      paneBackend: this.options.paneBackend
     });
+  }
+
+  // D-03 completion notification. The teammate sends a SANITIZED lifecycle
+  // message to the team-lead (no prompt/output/task text). The lead is
+  // role:"leader"/status:"active", so the message simply queues — there is NO
+  // resume feedback loop. Best-effort: a notify failure never corrupts the
+  // already-persisted idle state.
+  private notifyLeadOfCompletion(creation: ResolvedCreationInput): void {
+    try {
+      const messageService = new MessageService({
+        db: this.options.db,
+        statePath: this.options.statePath,
+        executionBackend: this.options.executionBackend
+      });
+
+      messageService.sendMessage({
+        teamName: creation.teamName,
+        from: creation.publicTeammateId,
+        to: `team-lead@${creation.teamName}`,
+        message: `TeamMate ${creation.displayName} completed its turn.`,
+        summary: `${creation.displayName} completed its turn`,
+        metadata: {
+          message_type: "lifecycle_completion",
+          teammate_id: creation.publicTeammateId,
+          run_id: creation.runId
+        },
+        identity: creation.input.identity
+      });
+    } catch {
+      // Best-effort only: the durable idle state + completion event are already
+      // persisted by LifecycleService and must not be corrupted by notify errors.
+    }
   }
 
   private mergeLifecycleResult(

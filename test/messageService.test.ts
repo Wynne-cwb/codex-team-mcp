@@ -44,6 +44,8 @@ interface MessageRow {
   status: string;
   delivery_status: string;
   body_json: string;
+  summary: string | null;
+  metadata_json: string;
 }
 
 interface RunRow {
@@ -293,10 +295,45 @@ function setResumableRunBackendIds(input: {
     );
 }
 
+function setLastResumeAttemptAt(
+  db: Database.Database,
+  memberId: string,
+  isoTime: string | null
+): void {
+  db.prepare(
+    `UPDATE ${TABLE_NAMES.runs} SET last_resume_attempt_at = ? WHERE member_id = ?`
+  ).run(isoTime, memberId);
+}
+
+function readLastResumeAttemptAt(
+  db: Database.Database,
+  memberId: string
+): string | null {
+  const row = db
+    .prepare(
+      `SELECT last_resume_attempt_at AS ts FROM ${TABLE_NAMES.runs} WHERE member_id = ? LIMIT 1`
+    )
+    .get(memberId) as { ts: string | null } | undefined;
+  return row?.ts ?? null;
+}
+
 function messages(db: Database.Database): MessageRow[] {
   return db
     .prepare(`SELECT * FROM ${TABLE_NAMES.messages} ORDER BY created_at, message_id`)
     .all() as MessageRow[];
+}
+
+function messagesByType(db: Database.Database, messageType: string): MessageRow[] {
+  return messages(db).filter((row) => {
+    try {
+      return (
+        (JSON.parse(row.metadata_json) as { message_type?: string }).message_type ===
+        messageType
+      );
+    } catch {
+      return false;
+    }
+  });
 }
 
 function events(db: Database.Database): EventRow[] {
@@ -327,6 +364,13 @@ function readMemberMetadata(
   return JSON.parse(row.metadata_json) as Record<string, unknown>;
 }
 
+function readMemberStatus(db: Database.Database, memberId: string): string {
+  const row = db
+    .prepare(`SELECT status FROM ${TABLE_NAMES.members} WHERE member_id = ?`)
+    .get(memberId) as { status: string };
+  return row.status;
+}
+
 function expectSanitizedFailureEvents(rows: EventRow[]): void {
   const serialized = JSON.stringify(rows.map((row) => JSON.parse(row.payload_json)));
 
@@ -355,9 +399,12 @@ class FakeResumeBackend implements ExecutionBackend {
 
   constructor(
     private readonly input: {
-      action?: "resumed" | "backend_failed";
+      action?: "resumed" | "backend_failed" | "backend_unavailable";
       onResume?: () => void;
       throwOnResume?: boolean;
+      // Phase 10: when true, the resume turn runs to completion synchronously
+      // (mirrors codex exec resume one-shot exit) — turn_completed + idle final.
+      turnCompleted?: boolean;
     } = {}
   ) {}
 
@@ -404,6 +451,32 @@ class FakeResumeBackend implements ExecutionBackend {
         backend: "fake-backend",
         backend_status: RUN_BACKEND_STATUSES.failed,
         last_error: "fake backend resume failed"
+      };
+    }
+
+    if (this.input.action === "backend_unavailable") {
+      return {
+        status: "not_resumable",
+        delivery_status: MESSAGE_DELIVERY_STATUSES.backendUnavailable,
+        backend: "fake-backend",
+        backend_status: RUN_BACKEND_STATUSES.stopped,
+        last_error: "fake backend resume unavailable"
+      };
+    }
+
+    if (this.input.turnCompleted === true) {
+      return {
+        status: "resumed",
+        delivery_status: MESSAGE_DELIVERY_STATUSES.backendResumeAttempted,
+        backend: "fake-backend",
+        backend_status: RUN_BACKEND_STATUSES.idle,
+        backend_run_id: "backend-run-resumed",
+        thread_id: "thread-resumed",
+        process_id: "process-resumed",
+        started_at: "2026-06-05T00:00:00.000Z",
+        ended_at: "2026-06-05T00:00:01.000Z",
+        turn_completed: true,
+        final_backend_status: RUN_BACKEND_STATUSES.idle
       };
     }
 
@@ -621,14 +694,18 @@ describe("MessageService.sendMessage", () => {
         last_error: "fake backend resume failed"
       }
     });
-    expect(messages(context.adapter.getDatabase())).toEqual([
-      expect.objectContaining({
-        message_id: result.message_id,
-        recipient_member_id: recipientMemberId,
-        status: "queued",
-        delivery_status: "queued_while_idle"
-      })
-    ]);
+    // RESUME-03: the original inbound row is preserved and stays queued. (A D10-3
+    // resume-failure notice to the sender is now also present, hence arrayContaining.)
+    expect(messages(context.adapter.getDatabase())).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          message_id: result.message_id,
+          recipient_member_id: recipientMemberId,
+          status: "queued",
+          delivery_status: "queued_while_idle"
+        })
+      ])
+    );
     expect(events(context.adapter.getDatabase())).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -701,14 +778,18 @@ describe("MessageService.sendMessage", () => {
         last_error: expect.any(String)
       }
     });
-    expect(messages(context.adapter.getDatabase())).toEqual([
-      expect.objectContaining({
-        message_id: result.message_id,
-        recipient_member_id: recipientMemberId,
-        status: "queued",
-        delivery_status: "queued_while_idle"
-      })
-    ]);
+    // RESUME-03: the original inbound row is preserved and stays queued. (A D10-3
+    // resume-failure notice to the sender is now also present, hence arrayContaining.)
+    expect(messages(context.adapter.getDatabase())).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          message_id: result.message_id,
+          recipient_member_id: recipientMemberId,
+          status: "queued",
+          delivery_status: "queued_while_idle"
+        })
+      ])
+    );
     const run = readRunByMember(context.adapter.getDatabase(), recipientMemberId);
     expect(run).toMatchObject({
       status: MEMBER_STATUSES.failed,
@@ -1121,6 +1202,420 @@ describe("MessageService.sendMessage", () => {
       }
     });
     expectNoFakeBackendFields(result as Record<string, unknown>);
+
+    context.adapter.close();
+  });
+});
+
+// Phase 10 Wave 1 (10-01): resume completion finalize + per-burst resume debounce.
+describe("MessageService resume completion + debounce (Phase 10 Wave 1)", () => {
+  it("resumes only once for a burst of messages to the same idle TeamMate", () => {
+    const context = createTeam();
+    const recipientMemberId = createTeammate({ context, name: "Builder" });
+    setResumableRun({
+      db: context.adapter.getDatabase(),
+      memberId: recipientMemberId,
+      status: MEMBER_STATUSES.idle
+    });
+    // turn_completed backend: each resume runs a one-shot turn and the member
+    // returns to idle, so the burst's remaining messages stay on the idle branch
+    // and exercise the debounce window (not the running branch).
+    const backend = new FakeResumeBackend({ turnCompleted: true });
+    const service = createMessageService(context.adapter, backend);
+
+    const first = service.sendMessage({
+      teamName: "alpha-team",
+      to: "Builder",
+      message: "Burst message 1",
+      summary: "burst 1",
+      identity: context.identity
+    });
+    const second = service.sendMessage({
+      teamName: "alpha-team",
+      to: "Builder",
+      message: "Burst message 2",
+      summary: "burst 2",
+      identity: context.identity
+    });
+    const third = service.sendMessage({
+      teamName: "alpha-team",
+      to: "Builder",
+      message: "Burst message 3",
+      summary: "burst 3",
+      identity: context.identity
+    });
+
+    expect(backend.resumeCalls).toHaveLength(1);
+    expect(first.delivery_status).toBe(MESSAGE_DELIVERY_STATUSES.backendResumeAttempted);
+    expect(second.delivery_status).toBe(MESSAGE_DELIVERY_STATUSES.queuedWhileIdle);
+    expect(third.delivery_status).toBe(MESSAGE_DELIVERY_STATUSES.queuedWhileIdle);
+
+    // All three inbound message rows are persisted and remain queued.
+    const burstRows = messages(context.adapter.getDatabase()).filter(
+      (row) => row.recipient_member_id === recipientMemberId
+    );
+    expect(burstRows).toHaveLength(3);
+    for (const row of burstRows) {
+      expect(row.status).toBe("queued");
+    }
+
+    context.adapter.close();
+  });
+
+  it("re-resumes once the debounce window has elapsed and persists the stamp across restarts", () => {
+    const context = createTeam();
+    const recipientMemberId = createTeammate({ context, name: "Builder" });
+    setResumableRun({
+      db: context.adapter.getDatabase(),
+      memberId: recipientMemberId,
+      status: MEMBER_STATUSES.stopped
+    });
+    const backend = new FakeResumeBackend();
+    const service = createMessageService(context.adapter, backend);
+
+    // A timestamp INSIDE the window (simulating a persisted prior resume that
+    // survived a process restart) suppresses resume.
+    setLastResumeAttemptAt(
+      context.adapter.getDatabase(),
+      recipientMemberId,
+      new Date().toISOString()
+    );
+    const withinWindow = service.sendMessage({
+      teamName: "alpha-team",
+      to: "Builder",
+      message: "Within debounce window",
+      identity: context.identity
+    });
+    expect(backend.resumeCalls).toHaveLength(0);
+    expect(withinWindow.delivery_status).toBe(
+      MESSAGE_DELIVERY_STATUSES.queuedWhileIdle
+    );
+
+    // A timestamp OLDER than the window lets the next inbound message resume.
+    setLastResumeAttemptAt(
+      context.adapter.getDatabase(),
+      recipientMemberId,
+      new Date(Date.now() - 60_000).toISOString()
+    );
+    const afterWindow = service.sendMessage({
+      teamName: "alpha-team",
+      to: "Builder",
+      message: "After debounce window",
+      identity: context.identity
+    });
+    expect(backend.resumeCalls).toHaveLength(1);
+    expect(afterWindow.delivery_status).toBe(
+      MESSAGE_DELIVERY_STATUSES.backendResumeAttempted
+    );
+    // The stamp was refreshed after the resume turn ended.
+    expect(readLastResumeAttemptAt(context.adapter.getDatabase(), recipientMemberId)).not.toBeNull();
+
+    context.adapter.close();
+  });
+
+  it("finalizes a completed resume turn to idle with a sanitized completion event", () => {
+    const context = createTeam();
+    const recipientMemberId = createTeammate({ context, name: "Builder" });
+    setResumableRun({
+      db: context.adapter.getDatabase(),
+      memberId: recipientMemberId,
+      status: MEMBER_STATUSES.stopped
+    });
+    const backend = new FakeResumeBackend({ turnCompleted: true });
+
+    const result = createMessageService(context.adapter, backend).sendMessage({
+      teamName: "alpha-team",
+      to: "Builder",
+      message: "Resume and complete a one-shot turn",
+      summary: "resume completion",
+      identity: context.identity
+    });
+
+    expect(result.delivery_status).toBe(
+      MESSAGE_DELIVERY_STATUSES.backendResumeAttempted
+    );
+    expect(result.turn_completed).toBe(true);
+    expect(result.final_status).toBe("idle");
+
+    const run = readRunByMember(context.adapter.getDatabase(), recipientMemberId);
+    expect(run).toMatchObject({
+      status: MEMBER_STATUSES.idle,
+      backend_status: RUN_BACKEND_STATUSES.idle
+    });
+    expect(readMemberStatus(context.adapter.getDatabase(), recipientMemberId)).toBe(
+      MEMBER_STATUSES.idle
+    );
+
+    const eventTypes = events(context.adapter.getDatabase()).map(
+      (row) => row.event_type
+    );
+    expect(eventTypes).toContain("teammate_run_completed");
+    const transitionToIdle = events(context.adapter.getDatabase()).find(
+      (row) =>
+        row.event_type === "teammate_lifecycle_transition" &&
+        JSON.parse(row.payload_json).to_status === MEMBER_STATUSES.idle
+    );
+    expect(transitionToIdle).toBeDefined();
+
+    context.adapter.close();
+  });
+
+  it("does not leak secrets into the resume completion event", () => {
+    const context = createTeam();
+    const recipientMemberId = createTeammate({ context, name: "Builder" });
+    setResumableRun({
+      db: context.adapter.getDatabase(),
+      memberId: recipientMemberId,
+      status: MEMBER_STATUSES.stopped
+    });
+    const backend = new FakeResumeBackend({ turnCompleted: true });
+
+    createMessageService(context.adapter, backend).sendMessage({
+      teamName: "alpha-team",
+      to: "Builder",
+      message: SECRET_PHASE5_MESSAGE,
+      summary: SECRET_PHASE5_MESSAGE,
+      identity: context.identity
+    });
+
+    const allEvents = events(context.adapter.getDatabase());
+    const completion = allEvents.find(
+      (row) => row.event_type === "teammate_run_completed"
+    );
+    expect(completion).toBeDefined();
+    const completionPayload = JSON.parse(completion?.payload_json ?? "{}");
+    expect(completionPayload).not.toHaveProperty("prompt");
+    expect(completionPayload).not.toHaveProperty("body");
+    expect(completionPayload).not.toHaveProperty("summary");
+    expect(JSON.stringify(allEvents)).not.toContain(SECRET_PHASE5_MESSAGE);
+
+    context.adapter.close();
+  });
+});
+
+// Phase 10 Wave 2 (10-02): sanitized resume-failure sender notice + recursion
+// guard + completion-notify lead.
+describe("MessageService resume-failure notice + recursion guard (Phase 10 Wave 2)", () => {
+  it("writes a sanitized resume-failure notice to the sender inbox", () => {
+    const context = createTeam();
+    const senderMemberId = createTeammate({
+      context,
+      name: "Sender",
+      status: MEMBER_STATUSES.running
+    });
+    const recipientMemberId = createTeammate({ context, name: "Builder" });
+    setResumableRun({
+      db: context.adapter.getDatabase(),
+      memberId: recipientMemberId,
+      status: MEMBER_STATUSES.idle
+    });
+    const backend = new FakeResumeBackend({ action: "backend_failed" });
+
+    createMessageService(context.adapter, backend).sendMessage({
+      teamName: "alpha-team",
+      from: "Sender",
+      to: "Builder",
+      message: SECRET_PHASE5_MESSAGE,
+      summary: SECRET_PHASE5_MESSAGE,
+      identity: context.identity
+    });
+
+    const db = context.adapter.getDatabase();
+
+    // The original inbound message row is preserved and still queued (RESUME-03).
+    const inbound = messages(db).filter(
+      (row) =>
+        row.recipient_member_id === recipientMemberId &&
+        row.sender_member_id === senderMemberId
+    );
+    expect(inbound).toHaveLength(1);
+    expect(inbound[0]?.status).toBe("queued");
+
+    // Exactly one resume_failure_notice, from B to A, queued for A's next turn.
+    const notices = messagesByType(db, "resume_failure_notice");
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({
+      sender_member_id: recipientMemberId,
+      recipient_member_id: senderMemberId,
+      status: "queued",
+      delivery_status: "queued_for_next_turn"
+    });
+    // Body carries the teammate_id + error_code, never the original body/secret.
+    expect(notices[0]?.body_json).toContain("builder@alpha-team");
+    expect(notices[0]?.body_json).toContain("backend_failed");
+    expect(notices[0]?.body_json).not.toContain(SECRET_PHASE5_MESSAGE);
+    const noticeMetadata = JSON.parse(notices[0]?.metadata_json ?? "{}");
+    expect(noticeMetadata).toMatchObject({
+      message_type: "resume_failure_notice",
+      teammate_id: "builder@alpha-team",
+      error_code: "backend_failed"
+    });
+    expect(JSON.stringify(notices)).not.toContain(SECRET_PHASE5_MESSAGE);
+
+    context.adapter.close();
+  });
+
+  it("does not recurse when the sender is itself idle with durable metadata", () => {
+    const context = createTeam();
+    const senderMemberId = createTeammate({ context, name: "Sender" });
+    const recipientMemberId = createTeammate({ context, name: "Builder" });
+    // Both A (sender) and B (recipient) are idle with durable resume metadata.
+    setResumableRun({
+      db: context.adapter.getDatabase(),
+      memberId: senderMemberId,
+      status: MEMBER_STATUSES.idle
+    });
+    setResumableRun({
+      db: context.adapter.getDatabase(),
+      memberId: recipientMemberId,
+      status: MEMBER_STATUSES.idle
+    });
+    const backend = new FakeResumeBackend({ action: "backend_failed" });
+
+    createMessageService(context.adapter, backend).sendMessage({
+      teamName: "alpha-team",
+      from: "Sender",
+      to: "Builder",
+      message: "Trigger a resume failure",
+      summary: "recursion guard",
+      identity: context.identity
+    });
+
+    const db = context.adapter.getDatabase();
+
+    // Exactly ONE notice (to A) — the notice never triggers a second notice.
+    const notices = messagesByType(db, "resume_failure_notice");
+    expect(notices).toHaveLength(1);
+    expect(notices[0]?.recipient_member_id).toBe(senderMemberId);
+
+    // The backend resumed ONLY B (the recipient). The notice to idle-A did NOT
+    // resume A — the recursion gate (suppress_resume) blocked it.
+    expect(backend.resumeCalls).toHaveLength(1);
+    expect(backend.resumeCalls[0]?.context.member_id).toBe(recipientMemberId);
+
+    context.adapter.close();
+  });
+
+  it("emits at most one resume-failure notice per burst", () => {
+    const context = createTeam();
+    createTeammate({
+      context,
+      name: "Sender",
+      status: MEMBER_STATUSES.running
+    });
+    const recipientMemberId = createTeammate({ context, name: "Builder" });
+    setResumableRun({
+      db: context.adapter.getDatabase(),
+      memberId: recipientMemberId,
+      status: MEMBER_STATUSES.idle
+    });
+    const backend = new FakeResumeBackend({ action: "backend_unavailable" });
+    const service = createMessageService(context.adapter, backend);
+
+    const results = [1, 2, 3].map((n) =>
+      service.sendMessage({
+        teamName: "alpha-team",
+        from: "Sender",
+        to: "Builder",
+        message: `Burst failure ${n}`,
+        identity: context.identity
+      })
+    );
+
+    const db = context.adapter.getDatabase();
+
+    // Debounce -> a single resume attempt -> a single failure -> one notice.
+    expect(backend.resumeCalls).toHaveLength(1);
+    expect(messagesByType(db, "resume_failure_notice")).toHaveLength(1);
+
+    // All three original inbound rows are preserved and queued; the 2nd and 3rd
+    // are merged (queued_while_idle).
+    const inbound = messages(db).filter(
+      (row) => row.recipient_member_id === recipientMemberId
+    );
+    expect(inbound).toHaveLength(3);
+    for (const row of inbound) {
+      expect(row.status).toBe("queued");
+    }
+    expect(results[1]?.delivery_status).toBe(
+      MESSAGE_DELIVERY_STATUSES.queuedWhileIdle
+    );
+    expect(results[2]?.delivery_status).toBe(
+      MESSAGE_DELIVERY_STATUSES.queuedWhileIdle
+    );
+
+    context.adapter.close();
+  });
+
+  it("does not notify for running or scheduled recipients", () => {
+    const context = createTeam();
+    createTeammate({
+      context,
+      name: "Runner",
+      status: MEMBER_STATUSES.running
+    });
+    createTeammate({ context, name: "Scheduled" });
+    const backend = new FakeResumeBackend();
+    const service = createMessageService(context.adapter, backend);
+
+    const running = service.sendMessage({
+      teamName: "alpha-team",
+      to: "Runner",
+      message: "Running recipient queues for next turn",
+      identity: context.identity
+    });
+    const scheduled = service.sendMessage({
+      teamName: "alpha-team",
+      to: "Scheduled",
+      message: "Scheduled recipient cannot start",
+      identity: context.identity
+    });
+
+    expect(running.delivery_status).toBe(
+      MESSAGE_DELIVERY_STATUSES.queuedForNextTurn
+    );
+    expect(scheduled.delivery_status).toBe(
+      MESSAGE_DELIVERY_STATUSES.backendUnavailable
+    );
+    expect(backend.resumeCalls).toHaveLength(0);
+    expect(
+      messagesByType(context.adapter.getDatabase(), "resume_failure_notice")
+    ).toHaveLength(0);
+
+    context.adapter.close();
+  });
+
+  it("notifies the lead when a SendMessage-triggered resume completes its turn", () => {
+    const context = createTeam();
+    const recipientMemberId = createTeammate({ context, name: "Builder" });
+    setResumableRun({
+      db: context.adapter.getDatabase(),
+      memberId: recipientMemberId,
+      status: MEMBER_STATUSES.stopped
+    });
+    const backend = new FakeResumeBackend({ turnCompleted: true });
+
+    const result = createMessageService(context.adapter, backend).sendMessage({
+      teamName: "alpha-team",
+      to: "Builder",
+      message: "Resume to completion and notify the lead",
+      summary: "completion notify",
+      identity: context.identity
+    });
+
+    expect(result.turn_completed).toBe(true);
+
+    const db = context.adapter.getDatabase();
+    const leaderMemberId = `leader:${context.teamId}`;
+    const completionNotices = messagesByType(db, "lifecycle_completion").filter(
+      (row) => row.recipient_member_id === leaderMemberId
+    );
+    expect(completionNotices).toHaveLength(1);
+    expect(completionNotices[0]?.sender_member_id).toBe(recipientMemberId);
+
+    // Resume completed -> B is idle; no failure notice was produced.
+    expect(readMemberStatus(db, recipientMemberId)).toBe(MEMBER_STATUSES.idle);
+    expect(messagesByType(db, "resume_failure_notice")).toHaveLength(0);
 
     context.adapter.close();
   });

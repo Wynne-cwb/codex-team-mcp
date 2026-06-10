@@ -16,6 +16,10 @@ export interface WorkspaceBackendCapabilities {
   canStart?: boolean;
   supportsWorkspaces?: boolean;
   supportsReviewDiff?: boolean;
+  // Phase 12 (D-01): OS sandbox is an OPTIONAL, best-effort overlay on TOP of the
+  // git worktree — never a gate. When true, the worktree isolation records
+  // sandbox_overlay:true; absent/false leaves the worktree path unaffected.
+  supportsOsSandbox?: boolean;
 }
 
 export interface WorkspaceSafetyInput {
@@ -27,6 +31,9 @@ export interface WorkspaceSafetyInput {
   review_diff_artifact_path?: string | null;
   declared_output_path?: string | null;
   base_revision?: string | null;
+  // Phase 12 (D-01): optional sandbox mode passthrough recorded alongside the
+  // sandbox_overlay flag when the backend supports an OS sandbox.
+  sandbox_mode?: string | null;
 }
 
 export type WorkspaceSafetyResult =
@@ -69,6 +76,11 @@ export interface WorkspaceSafetyReadyResult {
   review_diff_artifact_path?: string;
   declared_output_path?: string;
   base_revision?: string;
+  // Phase 12 (D-01): optional sandbox overlay metadata recorded on TOP of a git
+  // worktree when the backend supports an OS sandbox. isolation_kind stays
+  // git_worktree — the sandbox is an additive, non-gating layer.
+  sandbox_overlay?: boolean;
+  sandbox_mode?: string;
 }
 
 export interface WorkspaceSafetyBlockedResult {
@@ -225,18 +237,34 @@ export class WorkspaceSafetyService {
       return null;
     }
 
+    // D-01: OS sandbox is an optional overlay ON TOP of the worktree — recorded
+    // as additive metadata, never replacing isolation_kind and never gating.
+    const sandboxOverlay = input.backendCapabilities.supportsOsSandbox === true;
+    const sandboxMode = normalizeConcreteText(input.sandbox_mode);
+
     return {
       status: "ready",
       isolation_kind: ISOLATION_KINDS.gitWorktree,
       workspace_path: workspacePath,
       base_revision: baseRevision,
-      review_status: RUN_REVIEW_STATUSES.pendingReview
+      review_status: RUN_REVIEW_STATUSES.pendingReview,
+      ...(sandboxOverlay ? { sandbox_overlay: true } : {}),
+      ...(sandboxOverlay && sandboxMode ? { sandbox_mode: sandboxMode } : {})
     };
   }
 
   private prepareReviewDiff(
     input: WorkspaceSafetyInput
   ): WorkspaceSafetyReadyResult | null {
+    // D-01: review-diff is no longer an independent main isolation for
+    // worktree-capable backends — for those, the git worktree is the required
+    // primary isolation and review-diff is downgraded to a pre-merge review
+    // step (D-04). It remains a valid main isolation ONLY for
+    // non-worktree-capable backends that declare supportsReviewDiff.
+    if (input.backendCapabilities.supportsWorkspaces === true) {
+      return null;
+    }
+
     const reviewDiffArtifactPath = normalizeConcretePath(
       input.review_diff_artifact_path
     );

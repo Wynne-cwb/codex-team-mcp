@@ -208,7 +208,7 @@ afterEach(() => {
 });
 
 describe("pane diagnostics", () => {
-  it("reports paneSummary attach lifecycle message task and workspace review state", () => {
+  it("reports paneSummary attach lifecycle message task and workspace review state (D-03 default hides full attach command)", () => {
     const stateRoot = createTempRoot("codex-team-pane-diagnostics-state-");
     const workspaceRoot = "/workspace";
     const callerMetadata = { sessionId: "session-pane", clientName: "codex" };
@@ -222,7 +222,10 @@ describe("pane diagnostics", () => {
       targetClaudeTools: TARGET_CLAUDE_TOOLS,
       registeredTools: COMPATIBILITY_TOOLS
     }) as ReturnType<typeof buildDiagnosticsPayload> & {
-      paneSummary?: Record<string, unknown>;
+      paneSummary?: {
+        panes?: Array<Record<string, unknown>>;
+        [key: string]: unknown;
+      };
     };
 
     expect(payload.paneSummary).toMatchObject({
@@ -233,6 +236,8 @@ describe("pane diagnostics", () => {
       by_availability_status: {
         available: 1
       },
+      // D-03: attachable still counts panes that HAVE a legitimate attach
+      // command, even though the default output withholds the full command.
       attachable: 1,
       messageSummary: {
         total: 1,
@@ -264,12 +269,50 @@ describe("pane diagnostics", () => {
           session_name: "codex-team-alpha-team",
           window_name: "teammates",
           socket_name: "codex-team-alpha-team-run-alpha-builder",
-          attach_command:
-            "tmux -L codex-team-alpha-team-run-alpha-builder attach-session -t codex-team-alpha-team",
+          // D-03 intentional contract change: the default (non-debug) summary
+          // keeps an attach hint + session/backend labels, NOT the full,
+          // copy-pasteable attach_command.
+          attach_hint: true,
           review_status: RUN_REVIEW_STATUSES.pendingReview,
           workspace_path: expect.stringContaining("codex-team-pane-workspace-")
         })
       ]
+    });
+
+    // D-03: the full attach_command must NOT appear in the default output
+    // (neither at the row top-level nor inside the nested pane object).
+    const firstPane = payload.paneSummary?.panes?.[0] as
+      | (Record<string, unknown> & { pane?: Record<string, unknown> })
+      | undefined;
+    expect(firstPane).not.toHaveProperty("attach_command");
+    expect(firstPane?.pane).not.toHaveProperty("attach_command");
+    expect(JSON.stringify(payload.paneSummary)).not.toContain("attach-session");
+  });
+
+  it("exposes the full attach command only under include_debug (D-03)", () => {
+    const stateRoot = createTempRoot("codex-team-pane-diagnostics-state-");
+    const workspaceRoot = "/workspace";
+    const callerMetadata = { sessionId: "session-pane", clientName: "codex" };
+
+    createPaneDiagnosticsState({ stateRoot, workspaceRoot, callerMetadata });
+
+    const payload = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata,
+      includeDebug: true,
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    }) as ReturnType<typeof buildDiagnosticsPayload> & {
+      paneSummary?: {
+        panes?: Array<Record<string, unknown>>;
+      };
+    };
+    const firstPane = payload.paneSummary?.panes?.[0];
+
+    expect(firstPane).toMatchObject({
+      attach_command:
+        "tmux -L codex-team-alpha-team-run-alpha-builder attach-session -t codex-team-alpha-team"
     });
   });
 

@@ -73,7 +73,8 @@ export function createAgentHandler(
       const service = new AgentService({
         db: adapter.getDatabase(),
         statePath: state.stateRoot,
-        executionBackend: createExecutionBackendFromOptions(options)
+        executionBackend: createExecutionBackendFromOptions(options),
+        paneMode: options.paneMode
       });
       const result = service.createAgent({
         name: input.name,

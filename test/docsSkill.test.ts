@@ -25,11 +25,30 @@ const expectedCompatibilityStatuses = new Map<string, CompatibilityStatus>([
   ["Task create/update/list/get over SQLite task state", "Supported"],
   ["Restart persistence for active bindings, messages, and tasks", "Supported"],
   ["`TeamDiagnostics` status summaries", "Supported"],
+  ["Per-TeamMate real backend status (OBS-01)", "Supported"],
+  ["Enriched, sanitized backend diagnostics (OBS-02)", "Supported"],
   ["Workspace review safety and `needs_review`", "Supported"],
+  ["Read-only / review-only execution (no file writes)", "Supported"],
+  ["File-modifying execution via an isolated git worktree (D-01/D-03)", "Backend-dependent"],
+  [
+    "OS sandbox overlay on top of the worktree (optional, non-gating)",
+    "Backend-dependent"
+  ],
+  [
+    "TL-driven auditable worktree merge / escalate (`TeamMerge`, D-04)",
+    "Backend-dependent"
+  ],
+  [
+    "Fail-closed block of file-modifying work without an isolated worktree (ISOL-01)",
+    "Supported"
+  ],
   ["Running-recipient turn-boundary queueing", "Approximated"],
   ["Default backend execution with no configured runner", "Backend-dependent"],
   ["Backend start/resume with durable metadata", "Backend-dependent"],
   ["Pane-style terminal UI", "Backend-dependent"],
+  ["Auto pane create/attach over a real run (PANE-01 / D-01)", "Backend-dependent"],
+  ["Pane fallback without breaking durable state (PANE-02)", "Supported"],
+  ["Idle/stopped panes stay open (D-04 / I-05)", "Backend-dependent"],
   ['Broadcast delivery through `to: "*"`', "Unsupported"],
   ["Cross-session bridge delivery", "Unsupported"],
   ["Exact Claude tmux/iTerm2 pane parity", "Unsupported"],
@@ -263,5 +282,40 @@ describe("docs and compatibility skill", () => {
       "docs/compatibility.md` and `docs/validation.md` for Phase 7 support labels"
     );
     expect(skill).not.toContain("Phase 6 support labels");
+  });
+
+  it("documents the Phase 12 worktree merge model, TeamMerge tool, and four execution categories", async () => {
+    const compatibility = await readPackageFile("docs/compatibility.md");
+    const mapping = await readPackageFile("docs/tool-mapping.md");
+    const startup = await readPackageFile("docs/startup.md");
+    const validation = await readPackageFile("docs/validation.md");
+
+    // Compatibility matrix distinguishes the four execution categories.
+    expect(compatibility).toContain("Read-only / review-only execution (no file writes)");
+    expect(compatibility).toContain(
+      "File-modifying execution via an isolated git worktree (D-01/D-03)"
+    );
+    expect(compatibility).toContain(
+      "OS sandbox overlay on top of the worktree (optional, non-gating)"
+    );
+    expect(compatibility).toContain(
+      "Fail-closed block of file-modifying work without an isolated worktree (ISOL-01)"
+    );
+    expect(compatibility).toContain("TeamMerge");
+
+    // TeamMerge is an honestly-labeled codex-team extension + the merge model is documented.
+    expect(mapping).toContain("TeamMerge");
+    expect(mapping).toContain("codex-team extension");
+    expect(mapping).toContain("TL autonomous merge + human fallback");
+    expect(mapping).toContain("never a silent background auto-merge");
+    expect(mapping).toContain("overrides Phase 5 D-15");
+
+    // Startup + validation document the TL merge flow and the maintainer real UAT.
+    expect(startup).toContain("TeamMerge");
+    expect(startup).toContain("TL autonomous merge + human fallback");
+    expect(startup).toContain("Maintainer real UAT");
+    expect(validation).toContain("test/executionAcceptanceWalkthrough.test.ts");
+    expect(validation).toContain("test/isolationEnforcement.test.ts");
+    expect(validation).toContain("Maintainer real UAT");
   });
 });
