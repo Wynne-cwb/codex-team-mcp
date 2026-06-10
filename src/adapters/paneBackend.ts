@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type {
   ExecutionBackendReconcileStatus,
   ExecutionRunContext,
@@ -114,6 +116,33 @@ const DEFAULT_SESSION_PREFIX = "codex-team";
 const SOCKET_NAME_PREFIX = "codex-team-";
 const DEFAULT_WINDOW_NAME = "teammates";
 const SECRET_TOKEN_PATTERN = /SECRET_[A-Z0-9_]+/gi;
+
+// tmux is launched with `-L <socketName>`, which places the socket at
+// `/private/tmp/tmux-<uid>/<socketName>`. macOS caps the Unix-domain-socket
+// path (`sun_path`) at 104 bytes, so a long team name + run id can overflow it
+// and make pane attach fail with "File name too long". We hash the stable key
+// into a short, fixed-width name. With the 11-char prefix + 16 hex chars the
+// name is ~27 chars (full path ~49 bytes) — comfortably under the limit. The
+// hard cap below is purely defensive so a future prefix change can never
+// regress past the limit.
+const MAX_SOCKET_NAME_LENGTH = 50;
+const SOCKET_HASH_LENGTH = 16;
+
+/**
+ * Builds a short, deterministic, collision-resistant tmux socket name for a
+ * given (team, run/stableId) pair. The same inputs always produce the same name
+ * so attach/reconcile resolve the same socket. The recognizable
+ * `codex-team-` prefix is preserved and the result is hard-capped well under the
+ * macOS 104-byte `sun_path` limit.
+ */
+export function buildTmuxSocketName(teamName: string, runSuffix: string): string {
+  const stableKey = `${teamName}:${runSuffix}`;
+  const shortHash = createHash("sha256")
+    .update(stableKey)
+    .digest("hex")
+    .slice(0, SOCKET_HASH_LENGTH);
+  return `${SOCKET_NAME_PREFIX}${shortHash}`.slice(0, MAX_SOCKET_NAME_LENGTH);
+}
 
 export function createDefaultPaneBackendRegistry(
   options: PaneBackendRegistryOptions = {}
@@ -375,7 +404,7 @@ function createExternalTmuxPane(
     options.stableId ?? context.run_id,
     "run"
   );
-  const socketName = `${SOCKET_NAME_PREFIX}${teamName}-${runSuffix}`;
+  const socketName = buildTmuxSocketName(teamName, runSuffix);
   const sessionName = `${options.sessionPrefix}-${teamName}`;
   const windowName = DEFAULT_WINDOW_NAME;
   const result = commandRunner.run(

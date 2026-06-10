@@ -133,6 +133,32 @@ The execution backend is opt-in. When `CODEX_TEAM_EXECUTION=1` and the Codex CLI
 
 When the opt-in is set but no backend qualifies (for example the `codex` CLI is missing from `PATH`), `Agent` still persists the team/member/run records and then returns a clear `execution_backend_unavailable` error with remediation — it never reports a fabricated success.
 
+### Model provider authentication (proxy / custom `env_key`)
+
+The `codex_cli_exec` backend runs `codex exec` as a **subprocess that inherits the MCP server's environment**. With Codex's default OpenAI sign-in, nothing extra is needed. But if your `~/.codex/config.toml` selects a custom or proxy `model_provider` that authenticates through an environment variable (its `env_key`), that variable must also reach the codex-team MCP server — otherwise the nested `codex exec` fails and the TeamMate run shows `backend_failed` with the real reason `Missing environment variable: <KEY>` (surfaced in `TeamDiagnostics` `last_error`).
+
+```toml
+# Top-level: a custom/proxy provider authenticated via an env var
+model_provider = "proxy"
+
+[model_providers.proxy]
+base_url = "https://your-proxy.example.com/v1"
+env_key = "AM_API_KEY"             # ← Codex reads auth from this env var
+
+# The execution backend spawns `codex exec`, which needs the SAME auth var:
+[mcp_servers.codex-team]
+command = "npx"
+args = ["-y", "codex-team-mcp@latest"]
+env_vars = ["AM_API_KEY"]          # forward it from Codex's own env (recommended — no secret in the file)
+
+[mcp_servers.codex-team.env]
+CODEX_TEAM_EXECUTION = "1"
+CODEX_TEAM_EXECUTION_BACKEND = "auto"
+```
+
+> [!IMPORTANT]
+> `env_vars` forwards the value from Codex's own environment, so no secret is written into the config file. Codex does **not** expand `${VAR}` inside `config.toml`. If the variable name matches Codex's default secret-exclusion patterns (names containing `KEY`, `TOKEN`, `SECRET`, …) it can be filtered out even when listed in `env_vars`; if `TeamDiagnostics` still reports the variable missing after restarting Codex, either set `shell_environment_policy.ignore_default_excludes = true`, or set the value literally under `[mcp_servers.codex-team.env]` (e.g. `AM_API_KEY = "<value>"`).
+
 ### Worktree-isolated file-modifying work
 
 File-modifying TeamMate work is delivered in this version, but only through an **isolated git worktree** on an independent branch:
@@ -140,6 +166,9 @@ File-modifying TeamMate work is delivered in this version, but only through an *
 - Every file-modifying run must run in a required, isolated worktree (recorded base revision); read-only and review-only work needs no isolation.
 - A file-modifying run with no concrete isolated worktree is **blocked** and never redirected to the leader tree (`ISOL-01`, fail-closed).
 - An OS sandbox, when the backend supports it, is recorded as an optional `sandbox_overlay` on top of the worktree — best-effort and non-gating; its absence never blocks a run.
+
+> [!NOTE]
+> Worktree isolation uses real `git worktree`, so the leader workspace **must be a Git repository**. If it is not, an isolated worktree cannot be created and file-modifying runs are blocked (fail-closed) — read-only/review-only work is unaffected. Run codex-team from inside a Git repo (`git init` an empty one if you are just trying it out).
 
 ### TL-reviewed merge with `TeamMerge`
 

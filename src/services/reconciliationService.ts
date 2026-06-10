@@ -34,7 +34,16 @@ export interface ReconciliationServiceOptions {
 export interface ReconcileWorkspaceInput {
   workspaceRoot: string;
   actorCallerKey?: string | null;
-  mode?: "apply" | "report";
+  // - "apply"    : full reconcile (default) — finalize terminal runs, mark stale,
+  //                inspect + mutate workspaces, append per-run reconciled events.
+  // - "report"   : read-only — observe + count, never mutate (inspection still runs
+  //                read-only for the review counts).
+  // - "finalize" : finalize-on-poll (TeamDiagnostics live trigger) — ONLY promote a
+  //                running detached run that reconciled to a terminal state
+  //                (idle/failed) via markRunTerminal + its single completion event.
+  //                Otherwise read-only with NO side effects: no markRunStale, no
+  //                workspace-inspection mutation loop, no generic reconciled event.
+  mode?: "apply" | "report" | "finalize";
 }
 
 export interface ReconciliationSummary {
@@ -90,6 +99,10 @@ interface CountRow {
 
 const SYSTEM_RECONCILIATION_CALLER = "system:reconciliation";
 const STALE_RECONCILE_STATUSES = new Set(["stale", "unsupported", "unknown"]);
+// Terminal reconcile outcomes from an async (detached) backend: the background
+// run finished (idle) or failed (turn.failed / crash). Distinct from the stale
+// set so they finalize the member to a real terminal status rather than `stale`.
+const TERMINAL_RECONCILE_STATUSES = new Set(["idle", "failed"]);
 const TEAMMATE_MARKED_STALE_EVENT_TYPE =
   EVENT_TYPES.teammateMarkedStale satisfies "teammate_marked_stale";
 
@@ -108,7 +121,13 @@ export class ReconciliationService {
     const workspaceRoot = normalizeRequiredText(input.workspaceRoot);
     const actorCallerKey =
       normalizeOptionalText(input.actorCallerKey) ?? SYSTEM_RECONCILIATION_CALLER;
-    const applyChanges = input.mode !== "report";
+    const mode = input.mode ?? "apply";
+    // Full-apply mutations (markRunStale, the workspace-inspection mutation loop, and
+    // per-run reconciled events) run ONLY in "apply". "report" and "finalize" do not.
+    const applyChanges = mode === "apply";
+    // "finalize" additionally promotes terminal running runs (see markRunTerminal gate
+    // below) and skips the workspace-inspection loop entirely.
+    const finalizeOnly = mode === "finalize";
     const teams = this.readTeams(workspaceRoot);
     const reviewNeededRunIds = new Set(this.readReviewNeededRunIds(workspaceRoot));
     const runningRuns = this.readRunningRuns(workspaceRoot);
@@ -146,10 +165,30 @@ export class ReconciliationService {
           });
           eventsAppended += 1;
         }
+      } else if (TERMINAL_RECONCILE_STATUSES.has(reconcileResult.status)) {
+        // Async-execution completion (codex_cli_exec detached run): the backend
+        // confirmed from the log + process liveness that a background run reached
+        // a terminal state. Promote the run + member out of `running` to idle
+        // (turn.completed) or failed (turn.failed / crash). `active` keeps the
+        // Phase-5 running baseline; `stopped` is left untouched (no transition).
+        // This is the ONLY mutation "finalize" mode performs (finalize-on-poll).
+        if (applyChanges || finalizeOnly) {
+          this.markRunTerminal({
+            run,
+            result: reconcileResult,
+            actorCallerKey,
+            createdAt: new Date().toISOString()
+          });
+          eventsAppended += 1;
+        }
       }
     }
 
-    for (const run of this.readRunsWithWorkspacePath(workspaceRoot)) {
+    // The workspace-inspection loop (read + mutate review_status / changed_files) is
+    // skipped entirely in "finalize" mode: it must not run git inspection on every
+    // diagnostics poll and must not clobber already-resolved review statuses
+    // (merged/merge_conflict/escalated) for runs whose worktree was cleaned up.
+    for (const run of finalizeOnly ? [] : this.readRunsWithWorkspacePath(workspaceRoot)) {
       inspectedWorkspaces += 1;
       const inspection = this.workspaceSafetyService.inspectWorkspace({
         workspace_path: run.workspace_path,
@@ -413,6 +452,94 @@ export class ReconciliationService {
         backend: input.result.backend,
         backend_status: input.result.backend_status,
         last_error: redactRunSensitiveText(input.result.last_error, input.run)
+      },
+      createdAt: input.createdAt
+    });
+  }
+
+  // Finalize a background run that the backend confirmed reached a terminal state
+  // (idle = turn.completed, failed = turn.failed / crash). Mirrors markRunStale's
+  // targeted-column UPDATE pattern (never rewrites metadata_json), so the durable
+  // backend ids / pane metadata are preserved. Captures a thread_id discovered in
+  // the log (COALESCE — never clobbers an existing one, never fabricates).
+  private markRunTerminal(input: {
+    run: ReconciliationRunRow;
+    result: ExecutionBackendReconcileResult;
+    actorCallerKey: string;
+    createdAt: string;
+  }): void {
+    const now = input.createdAt;
+    const isFailure = input.result.status === "failed";
+    const runStatus = isFailure ? MEMBER_STATUSES.failed : MEMBER_STATUSES.idle;
+    const backendStatus = isFailure
+      ? RUN_BACKEND_STATUSES.failed
+      : RUN_BACKEND_STATUSES.idle;
+    const lastError = isFailure
+      ? redactRunSensitiveText(input.result.last_error, input.run)
+      : null;
+
+    this.options.db
+      .prepare(
+        `
+          UPDATE ${TABLE_NAMES.runs}
+          SET status = ?,
+              backend = COALESCE(?, backend),
+              backend_status = ?,
+              backend_run_id = COALESCE(?, backend_run_id),
+              backend_thread_id = COALESCE(?, backend_thread_id),
+              backend_process_id = COALESCE(?, backend_process_id),
+              workspace_path = COALESCE(?, workspace_path),
+              ended_at = COALESCE(?, ended_at),
+              last_error = ?,
+              last_reconciled_at = ?,
+              updated_at = ?
+          WHERE run_id = ?
+        `
+      )
+      .run(
+        runStatus,
+        normalizeOptionalText(input.result.backend),
+        backendStatus,
+        normalizeOptionalText(input.result.backend_run_id),
+        normalizeOptionalText(input.result.thread_id),
+        normalizeOptionalText(input.result.process_id),
+        normalizeOptionalText(input.result.workspace_path),
+        normalizeOptionalText(input.result.ended_at),
+        lastError,
+        now,
+        now,
+        input.run.run_id
+      );
+
+    if (input.run.member_id) {
+      this.options.db
+        .prepare(
+          `
+            UPDATE ${TABLE_NAMES.members}
+            SET status = ?
+            WHERE member_id = ?
+          `
+        )
+        .run(runStatus, input.run.member_id);
+    }
+
+    this.appendEvent({
+      teamId: input.run.team_id,
+      actorMemberId: input.run.member_id,
+      workspaceRoot: input.run.workspace_root,
+      actorCallerKey: input.actorCallerKey,
+      eventType: isFailure
+        ? EVENT_TYPES.teammateBackendFailed
+        : EVENT_TYPES.teammateRunCompleted,
+      payload: {
+        run_id: input.run.run_id,
+        member_id: input.run.member_id,
+        previous_status: input.run.status,
+        status: runStatus,
+        reconcile_status: input.result.status,
+        backend: input.result.backend,
+        backend_status: backendStatus,
+        last_error: lastError
       },
       createdAt: input.createdAt
     });

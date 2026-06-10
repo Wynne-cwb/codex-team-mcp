@@ -1,5 +1,13 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -30,6 +38,7 @@ interface MergeRunRow {
   merged_at: string | null;
   merged_by_caller_key: string | null;
   worktree_branch: string | null;
+  worktree_repo_root: string | null;
   merge_conflict_files_json: string | null;
   workspace_path: string | null;
   base_revision: string | null;
@@ -367,6 +376,98 @@ describe("LifecycleService.mergeWorktree (D-04, real temp git)", () => {
 
     expect(outcome.status).toBe("error");
     expect(outcome.error_code).toBe("merge_target_not_isolated");
+
+    adapter.close();
+  });
+});
+
+describe("LifecycleService.mergeWorktree — multi-repo container (cwd → child repo)", () => {
+  it("creates the worktree from the cwd child repo and merges back into THAT repo, never the container", () => {
+    // Coordination root is a PLAIN container directory (NOT a git repo); the
+    // real repo is a CHILD of it. The TeamMate's cwd points into the child repo.
+    const container = createTempRoot("codex-team-lcmerge-container-");
+    const childRepo = path.join(container, "admin-sms");
+    mkdirSync(childRepo, { recursive: true });
+    execGit(childRepo, ["init"]);
+    execGit(childRepo, ["config", "user.email", "test@example.com"]);
+    execGit(childRepo, ["config", "user.name", "Codex Test"]);
+    writeFileSync(path.join(childRepo, "tracked.txt"), "base\n");
+    execGit(childRepo, ["add", "tracked.txt"]);
+    execGit(childRepo, ["commit", "-m", "base"]);
+    const childHead = execGit(childRepo, ["rev-parse", "HEAD"]).trim();
+
+    const identity = createIdentity(container);
+    const adapter = new DurableStateAdapter({
+      stateRoot: createTempRoot("codex-team-lcmerge-state-"),
+      workspaceRoot: identity.workspaceRoot
+    });
+    const statePath = adapter.describeStateRoot().stateRoot;
+    const db = adapter.getDatabase();
+    new TeamService({ db, statePath }).createTeam({
+      teamName: "Alpha Team",
+      description: "Multi-repo container team",
+      identity
+    });
+
+    const created = new AgentService({
+      db,
+      statePath,
+      executionBackend: new FakeWorkspaceBackend()
+    }).createAgent({
+      name: "builder",
+      teamName: "alpha-team",
+      mode: "code",
+      prompt: `implement feature ${SECRET_MERGE_PROMPT}`,
+      description: "code implementation",
+      // The repo HINT: resolves the TARGET repo to the CHILD repo (the container
+      // itself is not a repo). cwd is NOT a direct unisolated workspace path.
+      cwd: childRepo,
+      identity
+    });
+
+    const run = readRun(db);
+    // The worktree was branched off the CHILD repo HEAD and the resolved target
+    // repo is persisted on the run (migration v7).
+    expect(run.review_status).toBe("pending_review");
+    expect(run.workspace_path).toBeTruthy();
+    expect(run.base_revision).toBe(childHead);
+    expect(run.worktree_repo_root).toBeTruthy();
+    // Compare realpaths — git resolves symlinks like /tmp → /private/tmp.
+    expect(realpathSync(String(run.worktree_repo_root))).toBe(
+      realpathSync(childRepo)
+    );
+    // BOUNDARY: the worktree lives OUTSIDE the child repo tree.
+    const relativeToChild = path.relative(childRepo, String(run.workspace_path));
+    expect(
+      relativeToChild.startsWith("..") || path.isAbsolute(relativeToChild)
+    ).toBe(true);
+
+    // Teammate writes a NEW file in the isolated worktree.
+    writeFileSync(
+      path.join(String(run.workspace_path), "feature.txt"),
+      "implemented by teammate\n"
+    );
+
+    const lifecycle = new LifecycleService({ db, statePath });
+    const outcome = lifecycle.mergeWorktree({
+      run_id: created.run_id,
+      identity,
+      teammate_id: "builder@alpha-team",
+      team_name: "alpha-team"
+    });
+
+    expect(outcome.status).toBe("merged");
+    expect(outcome.cleanup).toBe("removed");
+
+    // The teammate's change landed in the CHILD repo — NEVER in the container,
+    // which never became a git repo.
+    expect(existsSync(path.join(childRepo, "feature.txt"))).toBe(true);
+    expect(existsSync(path.join(container, "feature.txt"))).toBe(false);
+    expect(existsSync(path.join(container, ".git"))).toBe(false);
+
+    const merged = readRun(db);
+    expect(merged.review_status).toBe("merged");
+    expect(merged.merge_commit).toBe(outcome.merge_commit);
 
     adapter.close();
   });

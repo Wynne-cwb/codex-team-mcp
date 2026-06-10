@@ -422,6 +422,19 @@ export const MIGRATIONS: readonly MigrationDefinition[] = [
         "TEXT"
       );
     }
+  },
+  {
+    version: 7,
+    name: "add worktree target repo root",
+    up(db) {
+      // Decouples the coordination/container root from the per-TeamMate TARGET
+      // repo. The worktree is branched FROM and merged BACK INTO this repo,
+      // which may be a CHILD of a multi-repo container (the container is not
+      // itself a repo). Idempotent additive add (addColumnIfMissing, same
+      // pattern as v4/v5/v6). Redaction (P5 D-19): a filesystem path like the
+      // existing workspace_path — never diff content / prompt / body.
+      addColumnIfMissing(db, TABLE_NAMES.runs, "worktree_repo_root", "TEXT");
+    }
   }
 ];
 

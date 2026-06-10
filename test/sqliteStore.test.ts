@@ -68,6 +68,10 @@ const expectedMergeAuditColumns = [
   "merge_conflict_files_json"
 ];
 
+// Migration v7: per-TeamMate TARGET repo root (decouples the coordination root
+// from the real repo a worktree is branched from / merged into).
+const expectedRepoDecouplingColumns = ["worktree_repo_root"];
+
 const tempRoots: string[] = [];
 
 function createTempStateRoot(): string {
@@ -405,7 +409,8 @@ describe("SQLite durable store", () => {
       3,
       4,
       5,
-      6
+      6,
+      7
     ]);
     expect(tableNames(db)).toEqual(expect.arrayContaining(requiredTables));
     expect(tableNames(db)).toEqual(expect.arrayContaining(["task_edges", "task_events"]));
@@ -430,8 +435,16 @@ describe("SQLite durable store", () => {
     ).toMatchObject({
       name: expect.stringContaining("add worktree merge audit metadata")
     });
+    expect(
+      db.prepare("SELECT name FROM schema_migrations WHERE version = 7").get()
+    ).toMatchObject({
+      name: expect.stringContaining("add worktree target repo root")
+    });
     expect(tableColumns(db, TABLE_NAMES.runs)).toEqual(
       expect.arrayContaining(expectedMergeAuditColumns)
+    );
+    expect(tableColumns(db, TABLE_NAMES.runs)).toEqual(
+      expect.arrayContaining(expectedRepoDecouplingColumns)
     );
 
     db.close();
@@ -447,8 +460,8 @@ describe("SQLite durable store", () => {
 
     expect(getMigrationStatus(db)).toMatchObject({
       status: "up_to_date",
-      targetVersion: 6,
-      latestVersion: 6
+      targetVersion: 7,
+      latestVersion: 7
     });
     expect(tableColumns(db, TABLE_NAMES.runs)).toEqual(
       expect.arrayContaining(expectedMergeAuditColumns)
@@ -460,6 +473,87 @@ describe("SQLite durable store", () => {
     expect(tableColumns(db, TABLE_NAMES.runs)).toEqual(
       expect.arrayContaining(expectedMergeAuditColumns)
     );
+
+    db.close();
+  });
+
+  it("adds version 7 worktree target repo root idempotently", () => {
+    expect(MIGRATIONS.map((migration) => migration.version)).toContain(7);
+
+    const stateRoot = createTempStateRoot();
+    const databasePath = path.join(stateRoot, STATE_DB_FILENAME);
+    const db = openTeamDatabase(databasePath);
+    runMigrations(db);
+
+    expect(getMigrationStatus(db)).toMatchObject({
+      status: "up_to_date",
+      targetVersion: 7,
+      latestVersion: 7
+    });
+    expect(tableColumns(db, TABLE_NAMES.runs)).toEqual(
+      expect.arrayContaining(expectedRepoDecouplingColumns)
+    );
+
+    // Idempotent: a second migration run applies nothing and never throws, and
+    // the v7 column is preserved (no data loss).
+    const secondRun = runMigrations(db);
+    expect(secondRun.appliedMigrations).toEqual([]);
+    expect(tableColumns(db, TABLE_NAMES.runs)).toEqual(
+      expect.arrayContaining(expectedRepoDecouplingColumns)
+    );
+
+    db.close();
+  });
+
+  it("upgrades an existing v6 database to v7 without data loss", () => {
+    const stateRoot = createTempStateRoot();
+    const databasePath = path.join(stateRoot, STATE_DB_FILENAME);
+    const db = openTeamDatabase(databasePath);
+
+    // Apply only v1..v6 (simulate an existing pre-decoupling database) and seed a
+    // team + run row so we can prove the additive upgrade preserves data.
+    for (const migration of MIGRATIONS.filter((entry) => entry.version <= 6)) {
+      migration.up(db);
+      db.prepare(
+        `
+          INSERT INTO schema_migrations (version, name, applied_at)
+          VALUES (?, ?, ?)
+        `
+      ).run(migration.version, migration.name, "2026-06-10T00:00:00.000Z");
+    }
+    expect(getMigrationStatus(db)).toMatchObject({ latestVersion: 6 });
+    expect(tableColumns(db, TABLE_NAMES.runs)).not.toContain("worktree_repo_root");
+
+    insertTeam(db, "team-v6-upgrade", "v6-upgrade");
+    db.prepare(
+      `
+        INSERT INTO runs (run_id, team_id, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+      `
+    ).run(
+      "run-v6-upgrade",
+      "team-v6-upgrade",
+      "scheduled",
+      "2026-06-10T00:00:00.000Z",
+      "2026-06-10T00:00:00.000Z"
+    );
+
+    const upgrade = runMigrations(db);
+    expect(upgrade.appliedMigrations.map((migration) => migration.version)).toEqual([
+      7
+    ]);
+    expect(getMigrationStatus(db)).toMatchObject({
+      status: "up_to_date",
+      latestVersion: 7,
+      targetVersion: 7
+    });
+    expect(tableColumns(db, TABLE_NAMES.runs)).toContain("worktree_repo_root");
+    // No data loss: the seeded run survived, the new column defaults to NULL.
+    expect(
+      db.prepare("SELECT worktree_repo_root FROM runs WHERE run_id = ?").get(
+        "run-v6-upgrade"
+      )
+    ).toMatchObject({ worktree_repo_root: null });
 
     db.close();
   });
@@ -518,7 +612,8 @@ describe("SQLite durable store", () => {
       3,
       4,
       5,
-      6
+      6,
+      7
     ]);
     expect(uniqueIndexes(db, "teams")).toContain(
       "idx_teams_workspace_canonical_name"
@@ -540,7 +635,8 @@ describe("SQLite durable store", () => {
       3,
       4,
       5,
-      6
+      6,
+      7
     ]);
     expect(result.appliedMigrations[0]?.name).toContain(
       "expand message and task coordination state"
@@ -729,7 +825,7 @@ describe("SQLite durable store", () => {
     ).toMatchObject({ canonical_name: "persisted" });
     expect(
       reopened.db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()
-    ).toMatchObject({ count: 6 });
+    ).toMatchObject({ count: 7 });
 
     reopened.db.close();
   });
@@ -776,8 +872,8 @@ describe("DurableStateAdapter", () => {
     expect(description.databasePath).toBe(path.join(stateRoot, STATE_DB_FILENAME));
     expect(description.migrationStatus).toMatchObject({
       status: "up_to_date",
-      latestVersion: 6,
-      targetVersion: 6,
+      latestVersion: 7,
+      targetVersion: 7,
       pendingMigrations: []
     });
     expect(description.tableCounts).toMatchObject({
@@ -823,7 +919,7 @@ describe("DurableStateAdapter", () => {
 
     expect(description.migrationStatus.status).toBe("up_to_date");
     expect(description.tableCounts.teams).toBe(1);
-    expect(description.tableCounts.schema_migrations).toBe(6);
+    expect(description.tableCounts.schema_migrations).toBe(7);
     expect(description.tableCounts.task_edges).toBe(0);
     expect(description.tableCounts.task_events).toBe(0);
 

@@ -465,6 +465,136 @@ describe("ReconciliationService.reconcileWorkspace", () => {
     );
   });
 
+  it("finalizes a running run to idle when the async backend reports a completed turn", () => {
+    const context = createContext();
+    insertTeammate({
+      db: context.db,
+      teamId: context.teamId,
+      workspaceRoot: context.identity.workspaceRoot,
+      memberId: "teammate:done",
+      status: MEMBER_STATUSES.running
+    });
+    insertRun({
+      db: context.db,
+      teamId: context.teamId,
+      memberId: "teammate:done",
+      runId: "run:done",
+      status: MEMBER_STATUSES.running
+    });
+    const backend = new FakeReconcileBackend({
+      status: "idle",
+      backend: "codex_cli_exec",
+      backend_status: RUN_BACKEND_STATUSES.idle,
+      thread_id: "thread-done",
+      ended_at: "2026-06-05T01:00:00.000Z"
+    });
+
+    const summary = createService(context, backend).reconcileWorkspace({
+      workspaceRoot: context.identity.workspaceRoot,
+      actorCallerKey: context.identity.callerKey
+    });
+
+    // idle is NOT a stale outcome; the run is finalized to idle, not stale.
+    expect(summary.staleRunsMarked).toBe(0);
+    expect(readRun(context.db, "run:done")).toMatchObject({
+      status: MEMBER_STATUSES.idle,
+      backend_status: RUN_BACKEND_STATUSES.idle
+    });
+    expect(readMember(context.db, "teammate:done")).toMatchObject({
+      status: MEMBER_STATUSES.idle
+    });
+    expect(eventRows(context.db)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ event_type: EVENT_TYPES.teammateRunCompleted })
+      ])
+    );
+  });
+
+  it("finalizes a running run to failed with a sanitized reason when the async backend reports a failed turn", () => {
+    const context = createContext();
+    insertTeammate({
+      db: context.db,
+      teamId: context.teamId,
+      workspaceRoot: context.identity.workspaceRoot,
+      memberId: "teammate:boom",
+      status: MEMBER_STATUSES.running
+    });
+    insertRun({
+      db: context.db,
+      teamId: context.teamId,
+      memberId: "teammate:boom",
+      runId: "run:boom",
+      status: MEMBER_STATUSES.running,
+      metadata: { prompt: ORDINARY_PHASE5_RECONCILE_PROMPT }
+    });
+    const backend = new FakeReconcileBackend({
+      status: "failed",
+      backend: "codex_cli_exec",
+      backend_status: RUN_BACKEND_STATUSES.failed,
+      last_error: `codex_exec_turn_failed: ${SECRET_PHASE5_RECONCILE} ${ORDINARY_PHASE5_RECONCILE_PROMPT}`
+    });
+
+    const summary = createService(context, backend).reconcileWorkspace({
+      workspaceRoot: context.identity.workspaceRoot,
+      actorCallerKey: context.identity.callerKey
+    });
+
+    expect(summary.staleRunsMarked).toBe(0);
+    const run = readRun(context.db, "run:boom");
+    expect(run).toMatchObject({
+      status: MEMBER_STATUSES.failed,
+      backend_status: RUN_BACKEND_STATUSES.failed
+    });
+    expect(run.last_error).toContain("codex_exec_turn_failed");
+    expect(run.last_error).not.toContain(SECRET_PHASE5_RECONCILE);
+    expect(run.last_error).not.toContain(ORDINARY_PHASE5_RECONCILE_PROMPT);
+    expect(run.last_error).toContain("[redacted_secret]");
+    expect(run.last_error).toContain("[redacted_prompt]");
+    expect(readMember(context.db, "teammate:boom")).toMatchObject({
+      status: MEMBER_STATUSES.failed
+    });
+    const serializedEvents = JSON.stringify(eventRows(context.db));
+    expect(serializedEvents).not.toContain(SECRET_PHASE5_RECONCILE);
+    expect(serializedEvents).not.toContain(ORDINARY_PHASE5_RECONCILE_PROMPT);
+  });
+
+  it("leaves a running run running when the async backend reports an active turn", () => {
+    const context = createContext();
+    insertTeammate({
+      db: context.db,
+      teamId: context.teamId,
+      workspaceRoot: context.identity.workspaceRoot,
+      memberId: "teammate:live",
+      status: MEMBER_STATUSES.running
+    });
+    insertRun({
+      db: context.db,
+      teamId: context.teamId,
+      memberId: "teammate:live",
+      runId: "run:live",
+      status: MEMBER_STATUSES.running
+    });
+    const backend = new FakeReconcileBackend({
+      status: "active",
+      backend: "codex_cli_exec",
+      backend_status: RUN_BACKEND_STATUSES.running
+    });
+
+    const summary = createService(context, backend).reconcileWorkspace({
+      workspaceRoot: context.identity.workspaceRoot,
+      actorCallerKey: context.identity.callerKey
+    });
+
+    expect(summary.staleRunsMarked).toBe(0);
+    // active keeps the Phase-5 running baseline — no terminal transition.
+    expect(readRun(context.db, "run:live")).toMatchObject({
+      status: MEMBER_STATUSES.running
+    });
+    expect(readMember(context.db, "teammate:live")).toMatchObject({
+      status: MEMBER_STATUSES.running
+    });
+  });
+
   it("marks running pane run stale when stored metadata points to a missing live tmux pane", () => {
     const context = createContext();
     insertTeammate({
@@ -945,5 +1075,106 @@ describe("ReconciliationService.reconcileWorkspace", () => {
     expect(serializedEvents).toContain("[redacted_secret]");
     expect(serializedEvents).toContain("[redacted_prompt]");
     expect(existsSync(workspace.workspacePath)).toBe(true);
+  });
+
+  it("finalize mode leaves a non-terminal (stale-reconciling) running run untouched and appends no events", () => {
+    const context = createContext();
+    insertTeammate({
+      db: context.db,
+      teamId: context.teamId,
+      workspaceRoot: context.identity.workspaceRoot,
+      memberId: "teammate:hold",
+      status: MEMBER_STATUSES.running
+    });
+    // A workspace_path + review_status proves finalize SKIPS workspace inspection
+    // (the path is missing, so apply mode would clobber review_status to needs_review).
+    insertRun({
+      db: context.db,
+      teamId: context.teamId,
+      memberId: "teammate:hold",
+      runId: "run:hold",
+      status: MEMBER_STATUSES.running,
+      workspacePath: "/tmp/codex-team-finalize-missing-hold",
+      reviewStatus: RUN_REVIEW_STATUSES.pendingReview
+    });
+    const backend = new FakeReconcileBackend({
+      status: "stale",
+      backend: "codex_cli_exec",
+      backend_status: RUN_BACKEND_STATUSES.stale,
+      last_error: "backend could not confirm activity"
+    });
+    const eventsBefore = rowCount(context.db, TABLE_NAMES.events);
+
+    const summary = createService(context, backend).reconcileWorkspace({
+      workspaceRoot: context.identity.workspaceRoot,
+      actorCallerKey: context.identity.callerKey,
+      mode: "finalize"
+    });
+
+    // The backend is still consulted, but a non-terminal result triggers NO mutation.
+    expect(backend.reconcileCalls).toHaveLength(1);
+    expect(summary.runningRunsChecked).toBe(1);
+    expect(summary.eventsAppended).toBe(0);
+    expect(rowCount(context.db, TABLE_NAMES.events)).toBe(eventsBefore);
+    // Run stays running; review_status is NOT clobbered (inspection loop skipped).
+    expect(readRun(context.db, "run:hold")).toMatchObject({
+      status: MEMBER_STATUSES.running,
+      review_status: RUN_REVIEW_STATUSES.pendingReview
+    });
+    expect(readMember(context.db, "teammate:hold")).toMatchObject({
+      status: MEMBER_STATUSES.running
+    });
+  });
+
+  it("finalize mode finalizes a completed running run to idle without inspecting workspaces", () => {
+    const context = createContext();
+    insertTeammate({
+      db: context.db,
+      teamId: context.teamId,
+      workspaceRoot: context.identity.workspaceRoot,
+      memberId: "teammate:fin",
+      status: MEMBER_STATUSES.running
+    });
+    insertRun({
+      db: context.db,
+      teamId: context.teamId,
+      memberId: "teammate:fin",
+      runId: "run:fin",
+      status: MEMBER_STATUSES.running,
+      workspacePath: "/tmp/codex-team-finalize-missing-fin",
+      reviewStatus: RUN_REVIEW_STATUSES.pendingReview
+    });
+    const backend = new FakeReconcileBackend({
+      status: "idle",
+      backend: "codex_cli_exec",
+      backend_status: RUN_BACKEND_STATUSES.idle,
+      thread_id: "thread-fin",
+      ended_at: "2026-06-05T02:00:00.000Z"
+    });
+    const eventsBefore = rowCount(context.db, TABLE_NAMES.events);
+
+    const summary = createService(context, backend).reconcileWorkspace({
+      workspaceRoot: context.identity.workspaceRoot,
+      actorCallerKey: context.identity.callerKey,
+      mode: "finalize"
+    });
+
+    // Terminal idle is the ONE mutation finalize performs: run + member promoted to
+    // idle, exactly one completion event, and review_status left intact (no inspect).
+    expect(summary.eventsAppended).toBe(1);
+    expect(rowCount(context.db, TABLE_NAMES.events) - eventsBefore).toBe(1);
+    expect(readRun(context.db, "run:fin")).toMatchObject({
+      status: MEMBER_STATUSES.idle,
+      backend_status: RUN_BACKEND_STATUSES.idle,
+      review_status: RUN_REVIEW_STATUSES.pendingReview
+    });
+    expect(readMember(context.db, "teammate:fin")).toMatchObject({
+      status: MEMBER_STATUSES.idle
+    });
+    expect(eventRows(context.db)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ event_type: EVENT_TYPES.teammateRunCompleted })
+      ])
+    );
   });
 });

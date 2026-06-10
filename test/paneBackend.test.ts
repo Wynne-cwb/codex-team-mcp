@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildExternalTmuxAttachCommand,
+  buildTmuxSocketName,
   createITerm2PaneBackend,
   createPaneBackendRegistry,
   createTmuxPaneBackend,
@@ -127,9 +129,10 @@ describe("pane backend detection and metadata", () => {
   });
 
   it("creates an external tmux session with a concrete attach command when outside tmux", () => {
+    const socketName = buildTmuxSocketName("alpha-team", "run-alpha-builder");
     const commandRunner = createFakeCommandRunner({
       tmux: { stdout: "tmux 3.6a\n" },
-      "tmux -L codex-team-alpha-team-run-alpha-builder new-session -d -s codex-team-alpha-team -n teammates -P -F #{pane_id}":
+      [`tmux -L ${socketName} new-session -d -s codex-team-alpha-team -n teammates -P -F #{pane_id}`]:
         { stdout: "%12\n" }
     });
     const backend = createTmuxPaneBackend({
@@ -147,7 +150,7 @@ describe("pane backend detection and metadata", () => {
       pane_id: "%12",
       session_name: "codex-team-alpha-team",
       window_name: "teammates",
-      socket_name: "codex-team-alpha-team-run-alpha-builder",
+      socket_name: socketName,
       is_native: false
     } satisfies Partial<PaneBackendMetadata>);
     expect(result.pane.attach_command).toMatch(
@@ -163,7 +166,7 @@ describe("pane backend detection and metadata", () => {
           command: "tmux",
           args: expect.arrayContaining([
             "-L",
-            "codex-team-alpha-team-run-alpha-builder",
+            socketName,
             "new-session",
             "-d",
             "-s",
@@ -175,9 +178,10 @@ describe("pane backend detection and metadata", () => {
   });
 
   it("claim downgrade keeps tmux attach metadata status-only without executing Codex", () => {
+    const socketName = buildTmuxSocketName("alpha-team", "run-alpha-builder");
     const commandRunner = createFakeCommandRunner({
       tmux: { stdout: "tmux 3.6a\n" },
-      "tmux -L codex-team-alpha-team-run-alpha-builder new-session -d -s codex-team-alpha-team -n teammates -P -F #{pane_id}":
+      [`tmux -L ${socketName} new-session -d -s codex-team-alpha-team -n teammates -P -F #{pane_id}`]:
         { stdout: "%12\n" }
     });
     const backend = createTmuxPaneBackend({
@@ -545,9 +549,10 @@ describe("pane backend detection and metadata", () => {
   });
 
   it("sanitizes attach command display without storing prompt message task or body text", () => {
+    const socketName = buildTmuxSocketName("alpha-team", "redaction");
     const commandRunner = createFakeCommandRunner({
       tmux: { stdout: "tmux 3.6a\n" },
-      "tmux -L codex-team-alpha-team-redaction new-session -d -s codex-team-alpha-team -n teammates -P -F #{pane_id}":
+      [`tmux -L ${socketName} new-session -d -s codex-team-alpha-team -n teammates -P -F #{pane_id}`]:
         { stdout: "%9\n" }
     });
     const backend = createTmuxPaneBackend({
@@ -568,5 +573,87 @@ describe("pane backend detection and metadata", () => {
     for (const redactedKey of ["prompt", "message", "task", "body"]) {
       expect(result.pane).not.toHaveProperty(redactedKey);
     }
+  });
+});
+
+describe("tmux socket name bounding", () => {
+  // macOS caps the Unix-domain-socket path (`sun_path`) at 104 bytes. tmux puts
+  // the socket at `/private/tmp/tmux-<uid>/<socketName>`, so a representative tmp
+  // dir lets us assert the full path stays comfortably under the limit.
+  const REPRESENTATIVE_TMP_DIR = "/private/tmp/tmux-501";
+  const SUN_PATH_LIMIT = 104;
+  const SOCKET_NAME_CAP = 50;
+
+  const longTeam =
+    "notification-directory-research-20260610-extra-long-team-name";
+  const longRun =
+    "run:notification-directory-research-team:builder-member-id:11111111-2222-3333-4444-555555555555";
+
+  it("bounds the socket name and full socket path for very long identifiers", () => {
+    const socketName = buildTmuxSocketName(longTeam, longRun);
+
+    expect(socketName.startsWith("codex-team-")).toBe(true);
+    expect(socketName.length).toBeLessThanOrEqual(SOCKET_NAME_CAP);
+
+    const fullPath = `${REPRESENTATIVE_TMP_DIR}/${socketName}`;
+    expect(Buffer.byteLength(fullPath, "utf8")).toBeLessThan(SUN_PATH_LIMIT);
+  });
+
+  it("produces a deterministic socket name for identical inputs", () => {
+    const first = buildTmuxSocketName("alpha-team", "run-alpha-builder");
+    const second = buildTmuxSocketName("alpha-team", "run-alpha-builder");
+
+    expect(first).toBe(second);
+    // Distinct (team, run) inputs resolve to distinct sockets.
+    expect(buildTmuxSocketName("alpha-team", "run-alpha-builder")).not.toBe(
+      buildTmuxSocketName("beta-team", "run-alpha-builder")
+    );
+    expect(buildTmuxSocketName("alpha-team", "run-alpha-builder")).not.toBe(
+      buildTmuxSocketName("alpha-team", "run-beta-builder")
+    );
+  });
+
+  it("keeps a generated pane's stored socket name and attach command bounded and identical", () => {
+    const expectedTeam = sanitizePaneIdentifier(longTeam, "team");
+    const expectedRun = sanitizePaneIdentifier(longRun, "run");
+    const expectedSocket = buildTmuxSocketName(expectedTeam, expectedRun);
+    const sessionName = `codex-team-${expectedTeam}`;
+
+    const commandRunner = createFakeCommandRunner({
+      tmux: { stdout: "tmux 3.6a\n" },
+      [`tmux -L ${expectedSocket} new-session -d -s ${sessionName} -n teammates -P -F #{pane_id}`]:
+        { stdout: "%7\n" }
+    });
+    const backend = createTmuxPaneBackend({
+      env: {},
+      commandRunner
+    });
+
+    const result = backend.createPane({
+      run_id: longRun,
+      team_name: longTeam,
+      teammate_id: "builder@notification-directory-research",
+      workspace_root: "/workspace",
+      start_command: ["codex", "exec", "--json", "bootstrap teammate"]
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.pane.pane_id).toBe("%7");
+    // The stored socket name is the bounded, deterministic name.
+    expect(result.pane.socket_name).toBe(expectedSocket);
+    expect((result.pane.socket_name ?? "").length).toBeLessThanOrEqual(
+      SOCKET_NAME_CAP
+    );
+    expect(
+      Buffer.byteLength(
+        `${REPRESENTATIVE_TMP_DIR}/${result.pane.socket_name}`,
+        "utf8"
+      )
+    ).toBeLessThan(SUN_PATH_LIMIT);
+    // The attach command rebuilt from the stored socket references the SAME name.
+    expect(result.pane.attach_command).toBe(
+      buildExternalTmuxAttachCommand({ socketName: expectedSocket, sessionName })
+    );
+    expect(result.pane.attach_command).toContain(`-L '${expectedSocket}'`);
   });
 });

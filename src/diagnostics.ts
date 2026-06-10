@@ -1,4 +1,10 @@
+import { readFileSync } from "node:fs";
+
 import type { ExecutionBackend, ExecutionBackendDescription } from "./adapters/execution.js";
+import {
+  codexExecLogPath,
+  extractCodexDeliverable
+} from "./adapters/codexCliExecutionBackend.js";
 import {
   createExecutionBackendFromOptions,
   extractPaneMetadata
@@ -120,6 +126,10 @@ interface DiagnosticsTeammateStatus {
   status: string;
   attached: boolean;
   needs_review: boolean;
+  // Deliverable capture: a SHORT, sanitized preview of the run's final agent
+  // output (extracted on demand from the per-run codex log). Present only when a
+  // deliverable exists; full text is exposed under include_debug (run.final_message).
+  result_preview?: string;
 }
 
 // OBS-02: enriched, sanitized metadata diagnostics surfaced only under
@@ -149,7 +159,16 @@ interface DiagnosticsRunDebugRow {
   merge_status: string | null;
   merge_commit: string | null;
   last_error: string | null;
+  // Deliverable capture (debug-only): the run's final agent output text,
+  // sanitized + prompt-redacted + bounded. Extracted on demand from the per-run
+  // codex JSONL log (never stored in the DB). Null when no deliverable exists.
+  final_message: string | null;
 }
+
+// Bounds: the default teammate view shows a short preview; include_debug shows
+// the (still bounded) full deliverable. Neither stores raw text in the DB.
+const DELIVERABLE_PREVIEW_MAX_LENGTH = 280;
+const DELIVERABLE_FULL_MAX_LENGTH = 4000;
 
 const MERGE_RELATED_REVIEW_STATUSES = new Set<string>([
   RUN_REVIEW_STATUSES.merged,
@@ -228,6 +247,19 @@ export function buildDiagnosticsPayload(options: DiagnosticsPayloadOptions = {})
       paneModeEnabled: options.paneMode?.enabled === true,
       includeDebug: options.includeDebug === true
     });
+    // Finalize-on-poll (finalize mode): with the async/detached codex_cli_exec
+    // backend, startRun returns `running` and the real task finishes in the
+    // background. TeamDiagnostics is the live reconcile trigger — "finalize" mode
+    // promotes a finished detached run out of `running` (idle on turn.completed,
+    // failed on turn.failed/crash) via markRunTerminal, while a still-running
+    // detached run stays `running` (active reconcile). It is otherwise READ-ONLY:
+    // it never marks runs stale, never runs the workspace-inspection mutation loop
+    // (which would clobber already-resolved merge review statuses), and never emits
+    // generic per-run reconciled events — preserving the diagnostics read-only
+    // contract. This runs BEFORE readTeammateStatuses so the teammate rows +
+    // deliverable preview reflect the freshly finalized status. Idempotent: reconcile
+    // only iterates running runs, so a run already finalized to idle/failed is not
+    // re-finalized and emits no duplicate completion event.
     const reconciliationSummary = new ReconciliationService({
       db,
       statePath: state.stateRoot,
@@ -235,7 +267,7 @@ export function buildDiagnosticsPayload(options: DiagnosticsPayloadOptions = {})
     }).reconcileWorkspace({
       workspaceRoot: state.workspaceRoot,
       actorCallerKey: caller.callerKey,
-      mode: "report"
+      mode: "finalize"
     });
     const teammates = readTeammateStatuses(db, state.workspaceRoot);
     const metadataDiagnostics =
@@ -438,7 +470,8 @@ function readRunDebugRows(
           runs.changed_files_json,
           runs.worktree_branch,
           runs.merge_commit,
-          runs.last_error
+          runs.last_error,
+          runs.metadata_json
         FROM ${TABLE_NAMES.runs} AS runs
         JOIN ${TABLE_NAMES.teams} AS teams
           ON teams.team_id = runs.team_id
@@ -449,10 +482,11 @@ function readRunDebugRows(
     .all(workspaceRoot) as Array<
     Omit<
       DiagnosticsRunDebugRow,
-      "changed_files" | "last_error" | "merge_status"
+      "changed_files" | "last_error" | "merge_status" | "final_message"
     > & {
       changed_files_json: string | null;
       last_error: string | null;
+      metadata_json: string | null;
     }
   >;
 
@@ -474,8 +508,77 @@ function readRunDebugRows(
         ? row.review_status
         : null,
     merge_commit: sanitizeDebugText(row.merge_commit),
-    last_error: sanitizeDebugText(row.last_error)
+    last_error: sanitizeDebugText(row.last_error),
+    final_message: readRunDeliverable({
+      metadataJson: row.metadata_json,
+      runId: row.run_id,
+      workspaceRoot,
+      maxLength: DELIVERABLE_FULL_MAX_LENGTH
+    })
   }));
+}
+
+// Deliverable capture: extract the run's final agent output from its per-run
+// codex JSONL log (on demand — never stored in the DB), then sanitize +
+// prompt-redact + bound. The log path is the one persisted at start
+// (backend_metadata.exec_log_path) or the deterministic reconstruction from
+// workspace_root + run_id. Returns null when no log / no deliverable.
+function readRunDeliverable(input: {
+  metadataJson: string | null;
+  runId: string;
+  workspaceRoot: string;
+  maxLength: number;
+}): string | null {
+  const metadata = parseJsonObject(input.metadataJson);
+  const backendMetadata = metadata.backend_metadata;
+  const persistedPath =
+    typeof backendMetadata === "object" &&
+    backendMetadata !== null &&
+    !Array.isArray(backendMetadata)
+      ? optionalText((backendMetadata as Record<string, unknown>).exec_log_path)
+      : undefined;
+  const logPath =
+    persistedPath ?? codexExecLogPath(input.workspaceRoot, input.runId);
+
+  let content: string;
+  try {
+    content = readFileSync(logPath, "utf8");
+  } catch {
+    return null;
+  }
+
+  const raw = extractCodexDeliverable(content);
+  if (!raw) {
+    return null;
+  }
+
+  return sanitizeDeliverable(raw, optionalText(metadata.prompt), input.maxLength);
+}
+
+// D-02: the surfaced deliverable is sanitized — redact the run's own prompt if it
+// is echoed back, strip SECRET_ tokens + control chars, and bound the length.
+function sanitizeDeliverable(
+  value: string,
+  prompt: string | undefined,
+  maxLength: number
+): string | null {
+  let sanitized = value;
+  if (prompt && prompt.length > 0 && sanitized.includes(prompt)) {
+    sanitized = sanitized.split(prompt).join("[redacted_prompt]");
+  }
+  sanitized = sanitized
+    .replace(/SECRET_[A-Z0-9_]+/g, "[redacted_secret]")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
+    .trim();
+
+  if (sanitized.length === 0) {
+    return null;
+  }
+
+  return sanitized.length > maxLength
+    ? `${sanitized.slice(0, maxLength)}…`
+    : sanitized;
 }
 
 const CODEX_SESSION_METADATA_UNAVAILABLE = "codex_session_metadata_unavailable";
@@ -500,6 +603,7 @@ interface TeammateStatusRow {
   display_name: string;
   member_status: string;
   member_metadata_json: string | null;
+  run_id: string | null;
   run_backend_status: string | null;
   run_review_status: string | null;
   run_metadata_json: string | null;
@@ -533,6 +637,7 @@ function readTeammateStatuses(
           members.display_name,
           members.status AS member_status,
           members.metadata_json AS member_metadata_json,
+          runs.run_id AS run_id,
           runs.backend_status AS run_backend_status,
           runs.review_status AS run_review_status,
           runs.metadata_json AS run_metadata_json,
@@ -572,6 +677,14 @@ function readTeammateStatuses(
       row.run_review_status === RUN_REVIEW_STATUSES.pendingReview;
     const memberMetadata = parseJsonObject(row.member_metadata_json);
     const teammateId = optionalText(memberMetadata.publicTeammateId);
+    const resultPreview = row.run_id
+      ? readRunDeliverable({
+          metadataJson: row.run_metadata_json,
+          runId: row.run_id,
+          workspaceRoot,
+          maxLength: DELIVERABLE_PREVIEW_MAX_LENGTH
+        })
+      : null;
 
     teammates.push({
       ...(teammateId ? { teammate_id: teammateId } : {}),
@@ -583,7 +696,8 @@ function readTeammateStatuses(
         row.run_last_error
       ),
       attached,
-      needs_review: needsReview
+      needs_review: needsReview,
+      ...(resultPreview ? { result_preview: resultPreview } : {})
     });
   }
 

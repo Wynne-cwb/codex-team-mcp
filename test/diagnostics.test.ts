@@ -1,10 +1,12 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
 import { buildDiagnosticsPayload } from "../src/diagnostics.js";
+import { CodexCliExecutionBackend } from "../src/adapters/codexCliExecutionBackend.js";
+import { createTerminalCommandRunner } from "../src/adapters/terminalCommand.js";
 import { FALLBACK_CALLER_KEY, normalizeCallerMetadata } from "../src/context/caller.js";
 import { AgentService } from "../src/services/agentService.js";
 import { buildWorkspaceScopedCallerIdentity } from "../src/services/callerIdentity.js";
@@ -403,6 +405,142 @@ function createTeammatesWithRealStatusForDiagnostics(input: {
   }
 }
 
+// Finalize-on-poll fixtures: a real detached codex_cli_exec run that is durably
+// `running` with a per-run JSONL log on disk. The injected CodexCliExecutionBackend
+// reconciles purely from that log (+ pid liveness) — no real `codex` binary is
+// spawned (the availability probe is faked) so reconcile is deterministic in CI.
+function seedRunningCodexExecRun(input: {
+  stateRoot: string;
+  workspaceRoot: string;
+  callerMetadata: unknown;
+  name: string;
+  prompt: string;
+  logLines: string[];
+  processId?: number;
+}): { runId: string; memberId: string; logPath: string } {
+  const caller = normalizeCallerMetadata(input.callerMetadata);
+  const identity = buildWorkspaceScopedCallerIdentity({
+    workspaceRoot: input.workspaceRoot,
+    caller
+  });
+  const adapter = new DurableStateAdapter({
+    stateRoot: input.stateRoot,
+    workspaceRoot: input.workspaceRoot
+  });
+
+  try {
+    const db = adapter.getDatabase();
+    const statePath = adapter.describeStateRoot().stateRoot;
+    new TeamService({ db, statePath }).createTeam({
+      teamName: "Alpha Team",
+      description: "Finalize-on-poll diagnostics team",
+      identity
+    });
+    const created = new AgentService({ db, statePath }).createAgent({
+      name: input.name,
+      teamName: "alpha-team",
+      prompt: input.prompt,
+      description: `Create finalize-on-poll ${input.name}`,
+      identity
+    }) as unknown as ScheduledAgentLike;
+
+    // The per-run codex JSONL log lives on disk OUTSIDE the transcript.
+    const logDir = createTempStateRoot();
+    const logPath = path.join(logDir, `${input.name.toLowerCase()}-run.jsonl`);
+    writeFileSync(logPath, input.logLines.join("\n"));
+
+    db.prepare(
+      `UPDATE ${TABLE_NAMES.members} SET status = ? WHERE member_id = ?`
+    ).run(MEMBER_STATUSES.running, created.debug.internal_member_id);
+    db.prepare(
+      `
+        UPDATE ${TABLE_NAMES.runs}
+        SET status = ?,
+            backend = ?,
+            backend_status = ?,
+            backend_process_id = ?,
+            metadata_json = ?
+        WHERE run_id = ?
+      `
+    ).run(
+      MEMBER_STATUSES.running,
+      "codex_cli_exec",
+      RUN_BACKEND_STATUSES.running,
+      input.processId !== undefined ? String(input.processId) : null,
+      JSON.stringify({
+        prompt: input.prompt,
+        backend_metadata: { exec_log_path: logPath }
+      }),
+      created.run_id
+    );
+
+    return {
+      runId: created.run_id,
+      memberId: created.debug.internal_member_id,
+      logPath
+    };
+  } finally {
+    adapter.close();
+  }
+}
+
+// A CodexCliExecutionBackend whose availability probe is faked (never spawns a
+// real `codex exec --help`). reconcileRun never touches the probe — it reads the
+// per-run log + checks pid liveness — so reconcile stays fully deterministic.
+function createCodexExecBackendForDiagnostics(): CodexCliExecutionBackend {
+  return new CodexCliExecutionBackend({
+    runner: createTerminalCommandRunner({
+      executor: () => ({ stdout: "", stderr: "", exitCode: 0, exit_code: 0 })
+    })
+  });
+}
+
+function countEventsByType(
+  stateRoot: string,
+  workspaceRoot: string,
+  eventType: string
+): number {
+  const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+  try {
+    const row = adapter
+      .getDatabase()
+      .prepare(
+        `SELECT COUNT(*) AS count FROM ${TABLE_NAMES.events} WHERE event_type = ?`
+      )
+      .get(eventType) as { count: number };
+    return row.count;
+  } finally {
+    adapter.close();
+  }
+}
+
+function readRunAndMemberStatus(
+  stateRoot: string,
+  workspaceRoot: string,
+  runId: string,
+  memberId: string
+): { runStatus: string; runBackendStatus: string; memberStatus: string } {
+  const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+  try {
+    const db = adapter.getDatabase();
+    const run = db
+      .prepare(
+        `SELECT status, backend_status FROM ${TABLE_NAMES.runs} WHERE run_id = ?`
+      )
+      .get(runId) as { status: string; backend_status: string };
+    const member = db
+      .prepare(`SELECT status FROM ${TABLE_NAMES.members} WHERE member_id = ?`)
+      .get(memberId) as { status: string };
+    return {
+      runStatus: run.status,
+      runBackendStatus: run.backend_status,
+      memberStatus: member.status
+    };
+  } finally {
+    adapter.close();
+  }
+}
+
 afterEach(() => {
   for (const stateRoot of tempRoots.splice(0)) {
     rmSync(stateRoot, { recursive: true, force: true });
@@ -436,12 +574,12 @@ describe("TeamDiagnostics payload", () => {
       warnings: [],
       migrationStatus: {
         status: "up_to_date",
-        latestVersion: 6,
-        targetVersion: 6,
+        latestVersion: 7,
+        targetVersion: 7,
         pendingMigrations: []
       },
       tableCounts: {
-        schema_migrations: 6,
+        schema_migrations: 7,
         teams: 0,
         members: 0,
         active_bindings: 0,
@@ -705,12 +843,19 @@ describe("TeamDiagnostics payload", () => {
       needs_review: 1,
       with_workspace_path: 1
     });
+    // TeamDiagnostics reconciles in FINALIZE mode (finalize-on-poll): it observes
+    // statuses (staleRunsMarked counts the scaffold backend's unsupported result,
+    // reviewNeededWorkspaces reflects the durable review_status) but performs NO
+    // mutation here — the running run is NOT marked stale, the workspace-inspection
+    // loop is SKIPPED (workspaceInspectionFailures stays 0), and no events are
+    // appended (the run reconciles to a stale, non-terminal outcome). Only a
+    // terminal idle/failed running run would be finalized + emit one event.
     expect(payload.reconciliationSummary).toMatchObject({
       teams: 1,
       runningRunsChecked: 1,
       staleRunsMarked: 1,
       reviewNeededWorkspaces: 1,
-      workspaceInspectionFailures: 1,
+      workspaceInspectionFailures: 0,
       eventsAppended: 0
     });
     expect(serialized).toContain("needs_review");
@@ -984,6 +1129,104 @@ describe("TeamDiagnostics payload", () => {
     expect(serializedEvents).not.toContain("description");
   });
 
+  it("surfaces the sanitized run deliverable from the codex log (default preview + full under include_debug)", () => {
+    const stateRoot = createTempStateRoot();
+    const logDir = createTempStateRoot();
+    const workspaceRoot = "/workspace";
+    const callerMetadata = { sessionId: "session-1", clientName: "codex" };
+    const deliverablePrompt = "implement the billing summary feature";
+    const deliverableSecret = "SECRET_DELIVERABLE_LEAK";
+
+    const caller = normalizeCallerMetadata(callerMetadata);
+    const identity = buildWorkspaceScopedCallerIdentity({ workspaceRoot, caller });
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    const db = adapter.getDatabase();
+    const statePath = adapter.describeStateRoot().stateRoot;
+    new TeamService({ db, statePath }).createTeam({
+      teamName: "Alpha Team",
+      description: "Deliverable diagnostics team",
+      identity
+    });
+    const created = new AgentService({ db, statePath }).createAgent({
+      name: "Researcher",
+      teamName: "alpha-team",
+      prompt: deliverablePrompt,
+      description: "Create deliverable diagnostics Researcher",
+      identity
+    }) as unknown as ScheduledAgentLike;
+
+    // The per-run codex JSONL log lives on disk OUTSIDE the transcript. It echoes
+    // the prompt + a secret to prove both are redacted out of the surfaced result.
+    const logPath = path.join(logDir, "researcher-run.jsonl");
+    writeFileSync(
+      logPath,
+      [
+        JSON.stringify({ type: "thread.started", thread_id: "thread-deliverable" }),
+        JSON.stringify({
+          type: "item.completed",
+          item: {
+            type: "agent_message",
+            text: `Completed ${deliverablePrompt}. Internal token ${deliverableSecret}. Billing healthy.`
+          }
+        }),
+        JSON.stringify({ type: "turn.completed" })
+      ].join("\n")
+    );
+
+    db.prepare(
+      `UPDATE ${TABLE_NAMES.members} SET status = ? WHERE member_id = ?`
+    ).run(MEMBER_STATUSES.idle, created.debug.internal_member_id);
+    db.prepare(
+      `
+        UPDATE ${TABLE_NAMES.runs}
+        SET status = ?,
+            backend = ?,
+            backend_status = ?,
+            backend_thread_id = ?,
+            metadata_json = ?
+        WHERE run_id = ?
+      `
+    ).run(
+      MEMBER_STATUSES.idle,
+      "codex_cli_exec",
+      RUN_BACKEND_STATUSES.idle,
+      "thread-deliverable",
+      JSON.stringify({
+        prompt: deliverablePrompt,
+        backend_metadata: { exec_log_path: logPath }
+      }),
+      created.run_id
+    );
+    adapter.close();
+
+    const payload = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata,
+      includeDebug: true,
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+
+    const researcher = payload.teammates.find(
+      (teammate) => teammate.teammate_id === "researcher@alpha-team"
+    );
+    expect(researcher?.result_preview).toContain("Billing healthy.");
+
+    const debugRow = (payload.debug?.runs ?? []).find(
+      (row) => row.run_id === created.run_id
+    );
+    expect(debugRow?.final_message).toContain("Completed");
+    expect(debugRow?.final_message).toContain("Billing healthy.");
+
+    // D-02: the surfaced deliverable redacts the run's own prompt + secret tokens.
+    const serialized = JSON.stringify(payload);
+    expect(serialized).toContain("[redacted_prompt]");
+    expect(serialized).toContain("[redacted_secret]");
+    expect(serialized).not.toContain(deliverablePrompt);
+    expect(serialized).not.toContain(deliverableSecret);
+  });
+
   it("preserves observed caller metadata when provided", () => {
     const payload = buildDiagnosticsPayload({
       stateRoot: createTempStateRoot(),
@@ -1147,5 +1390,257 @@ describe("TeamDiagnostics payload", () => {
       expect(teammate).not.toHaveProperty("metadata_json");
       expect(teammate).not.toHaveProperty("description");
     }
+  });
+
+  it("finalizes a completed detached run to idle on poll and surfaces its deliverable", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace";
+    const callerMetadata = { sessionId: "session-1", clientName: "codex" };
+    const prompt = "implement the billing summary feature";
+    const secret = "SECRET_FINALIZE_LEAK";
+
+    const seeded = seedRunningCodexExecRun({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata,
+      name: "Finisher",
+      prompt,
+      // turn.completed in the log → the detached run finished in the background.
+      logLines: [
+        JSON.stringify({ type: "thread.started", thread_id: "thread-finisher" }),
+        JSON.stringify({
+          type: "item.completed",
+          item: {
+            type: "agent_message",
+            text: `Completed ${prompt}. Token ${secret}. Billing summary shipped.`
+          }
+        }),
+        JSON.stringify({ type: "turn.completed" })
+      ]
+    });
+
+    const payload = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata,
+      executionBackend: createCodexExecBackendForDiagnostics(),
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+
+    // The teammate row reflects the freshly finalized status (read AFTER reconcile).
+    const finisher = payload.teammates.find(
+      (teammate) => teammate.teammate_id === "finisher@alpha-team"
+    );
+    expect(finisher?.status).toBe(MEMBER_STATUSES.idle);
+    expect(finisher?.result_preview).toContain("Billing summary shipped.");
+
+    // Durable state was finalized running → idle (member + run), not left running.
+    const status = readRunAndMemberStatus(
+      stateRoot,
+      workspaceRoot,
+      seeded.runId,
+      seeded.memberId
+    );
+    expect(status).toMatchObject({
+      runStatus: MEMBER_STATUSES.idle,
+      runBackendStatus: RUN_BACKEND_STATUSES.idle,
+      memberStatus: MEMBER_STATUSES.idle
+    });
+
+    // Exactly one completion event was appended by the finalize-on-poll.
+    expect(
+      countEventsByType(stateRoot, workspaceRoot, EVENT_TYPES.teammateRunCompleted)
+    ).toBe(1);
+
+    // D-02: the surfaced deliverable stays sanitized — prompt + secret redacted.
+    const serialized = JSON.stringify(payload);
+    expect(serialized).not.toContain(secret);
+    expect(serialized).not.toContain(prompt);
+    expect(serialized).toContain("[redacted_secret]");
+  });
+
+  it("finalizes a crashed/failed detached run to failed with a sanitized reason", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace";
+    const callerMetadata = { sessionId: "session-1", clientName: "codex" };
+    const prompt = "rotate the production credentials";
+    const secret = "SECRET_TURN_FAILURE_LEAK";
+
+    const seeded = seedRunningCodexExecRun({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata,
+      name: "Boomer",
+      prompt,
+      // turn.failed in the log → the detached run failed in the background. The
+      // error message echoes the prompt + a secret to prove both are redacted.
+      logLines: [
+        JSON.stringify({ type: "thread.started", thread_id: "thread-boomer" }),
+        JSON.stringify({
+          type: "turn.failed",
+          error: {
+            message: `model overloaded while running "${prompt}" with ${secret}`
+          }
+        })
+      ]
+    });
+
+    const payload = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata,
+      includeDebug: true,
+      executionBackend: createCodexExecBackendForDiagnostics(),
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+
+    const boomer = payload.teammates.find(
+      (teammate) => teammate.teammate_id === "boomer@alpha-team"
+    );
+    expect(boomer?.status).toBe(MEMBER_STATUSES.failed);
+
+    const status = readRunAndMemberStatus(
+      stateRoot,
+      workspaceRoot,
+      seeded.runId,
+      seeded.memberId
+    );
+    expect(status).toMatchObject({
+      runStatus: MEMBER_STATUSES.failed,
+      runBackendStatus: RUN_BACKEND_STATUSES.failed,
+      memberStatus: MEMBER_STATUSES.failed
+    });
+
+    // The sanitized failure reason surfaces in the debug run row (D-02-safe).
+    const debugRow = (payload.debug?.runs ?? []).find(
+      (row) => row.run_id === seeded.runId
+    );
+    expect(debugRow?.last_error).toContain("codex_exec_turn_failed");
+    expect(debugRow?.last_error).toContain("[redacted_secret]");
+    expect(debugRow?.last_error).toContain("[redacted_prompt]");
+
+    expect(
+      countEventsByType(stateRoot, workspaceRoot, EVENT_TYPES.teammateBackendFailed)
+    ).toBe(1);
+
+    const serialized = JSON.stringify(payload);
+    expect(serialized).not.toContain(secret);
+    expect(serialized).not.toContain(prompt);
+  });
+
+  it("keeps an alive, still-running detached run running on poll (not stale, not completed)", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace";
+    const callerMetadata = { sessionId: "session-1", clientName: "codex" };
+    const prompt = "refactor the retry scheduler";
+
+    const seeded = seedRunningCodexExecRun({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata,
+      name: "Livewire",
+      prompt,
+      // No terminal event yet; the run's pid is alive (this test process), so the
+      // backend reconciles to `active` → the run must stay running, not stale.
+      logLines: [
+        JSON.stringify({ type: "thread.started", thread_id: "thread-livewire" }),
+        JSON.stringify({ type: "item.started", item: { type: "agent_message" } })
+      ],
+      processId: process.pid
+    });
+
+    const payload = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata,
+      executionBackend: createCodexExecBackendForDiagnostics(),
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+
+    const livewire = payload.teammates.find(
+      (teammate) => teammate.teammate_id === "livewire@alpha-team"
+    );
+    expect(livewire?.status).toBe(MEMBER_STATUSES.running);
+
+    const status = readRunAndMemberStatus(
+      stateRoot,
+      workspaceRoot,
+      seeded.runId,
+      seeded.memberId
+    );
+    expect(status).toMatchObject({
+      runStatus: MEMBER_STATUSES.running,
+      runBackendStatus: RUN_BACKEND_STATUSES.running,
+      memberStatus: MEMBER_STATUSES.running
+    });
+
+    // An active run is neither completed nor marked stale by the diagnostics poll.
+    expect(
+      countEventsByType(stateRoot, workspaceRoot, EVENT_TYPES.teammateRunCompleted)
+    ).toBe(0);
+    expect(
+      countEventsByType(stateRoot, workspaceRoot, EVENT_TYPES.teammateMarkedStale)
+    ).toBe(0);
+  });
+
+  it("finalizes a completed detached run exactly once across consecutive polls (idempotent)", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace";
+    const callerMetadata = { sessionId: "session-1", clientName: "codex" };
+    const prompt = "summarize the changelog";
+
+    const seeded = seedRunningCodexExecRun({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata,
+      name: "Idem",
+      prompt,
+      logLines: [
+        JSON.stringify({ type: "thread.started", thread_id: "thread-idem" }),
+        JSON.stringify({
+          type: "item.completed",
+          item: { type: "agent_message", text: "Changelog summarized." }
+        }),
+        JSON.stringify({ type: "turn.completed" })
+      ]
+    });
+
+    const runDiagnostics = (): ReturnType<typeof buildDiagnosticsPayload> =>
+      buildDiagnosticsPayload({
+        stateRoot,
+        workspaceRoot,
+        callerMetadata,
+        executionBackend: createCodexExecBackendForDiagnostics(),
+        targetClaudeTools: TARGET_CLAUDE_TOOLS,
+        registeredTools: COMPATIBILITY_TOOLS
+      });
+
+    // First poll finalizes the run; the second poll sees an already-idle run, so
+    // reconcile (which only iterates running runs) does not re-finalize it.
+    runDiagnostics();
+    const secondPayload = runDiagnostics();
+
+    const idem = secondPayload.teammates.find(
+      (teammate) => teammate.teammate_id === "idem@alpha-team"
+    );
+    expect(idem?.status).toBe(MEMBER_STATUSES.idle);
+    expect(idem?.result_preview).toContain("Changelog summarized.");
+
+    const status = readRunAndMemberStatus(
+      stateRoot,
+      workspaceRoot,
+      seeded.runId,
+      seeded.memberId
+    );
+    expect(status.runStatus).toBe(MEMBER_STATUSES.idle);
+    expect(status.memberStatus).toBe(MEMBER_STATUSES.idle);
+
+    // Exactly ONE completion event across two consecutive diagnostics calls.
+    expect(
+      countEventsByType(stateRoot, workspaceRoot, EVENT_TYPES.teammateRunCompleted)
+    ).toBe(1);
   });
 });

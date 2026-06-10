@@ -182,6 +182,20 @@ describe("ISOL-01: file-modifying work without concrete isolation is blocked", (
     // The leader tree was never touched (no git repo materialized).
     expect(existsSync(path.join(nonGitLeader, ".git"))).toBe(false);
 
+    // The specific fail-closed reason is surfaced on the auditable event: the
+    // TARGET repo could not be resolved (no cwd hint + container is not a repo).
+    const reviewEvent = db
+      .prepare(
+        `SELECT payload_json FROM ${TABLE_NAMES.events} WHERE event_type = ? ORDER BY created_at, event_id`
+      )
+      .get(EVENT_TYPES.workspaceReviewRequired) as
+      | { payload_json: string }
+      | undefined;
+    expect(reviewEvent).toBeDefined();
+    expect(JSON.parse(reviewEvent?.payload_json ?? "{}").reason).toContain(
+      "workspace_target_repo_unresolved"
+    );
+
     adapter.close();
   });
 

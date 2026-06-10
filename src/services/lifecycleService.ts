@@ -251,6 +251,7 @@ interface MergeTargetRow {
   workspace_path: string | null;
   base_revision: string | null;
   worktree_branch: string | null;
+  worktree_repo_root: string | null;
 }
 
 interface DeliveryRunRow {
@@ -533,7 +534,7 @@ export class LifecycleService {
   startScheduledRun(input: StartScheduledRunInput): LifecycleActionResult {
     const backendDescription = this.executionBackend.describeBackend();
     const classification = this.classifyWork(input).work_classification;
-    const { safety, worktreeBranch } = this.prepareSafety(
+    const { safety, worktreeBranch, worktreeBlockedReason } = this.prepareSafety(
       input,
       backendDescription,
       classification
@@ -564,7 +565,12 @@ export class LifecycleService {
     }
 
     if (isFileModifyingWork(classification) && !isStartSafe(safety, classification)) {
-      this.markWorkspaceReviewRequired(input, classification, safety);
+      this.markWorkspaceReviewRequired(
+        input,
+        classification,
+        safety,
+        worktreeBlockedReason
+      );
       return this.buildScheduledResult({
         backendDescription,
         classification,
@@ -1110,6 +1116,9 @@ export class LifecycleService {
 
     const result = this.worktreeMergeService.reviewWorktree({
       leaderWorkspaceRoot: request.identity.workspaceRoot,
+      // Review/merge run against the run's persisted TARGET repo (the real repo
+      // the worktree was branched from), NOT the coordination/container root.
+      repoRoot: resolveTargetRepoRoot(validation.run, request.identity),
       workspace_path: validation.run.workspace_path,
       base_revision: validation.run.base_revision,
       branch: validation.run.worktree_branch
@@ -1150,6 +1159,9 @@ export class LifecycleService {
 
     const result: MergeWorktreeResult = this.worktreeMergeService.mergeIntoLeader({
       leaderWorkspaceRoot: request.identity.workspaceRoot,
+      // Merge BACK INTO the run's persisted TARGET repo (the real repo the
+      // worktree was branched from), NOT the coordination/container root.
+      repoRoot: resolveTargetRepoRoot(target, request.identity),
       workspace_path: target.workspace_path,
       branch: target.worktree_branch,
       mergeLabel: request.merge_label ?? (eventContext.teammate_id || null)
@@ -1324,12 +1336,17 @@ export class LifecycleService {
     target: ValidatedMergeTarget,
     eventContext: LifecycleRunContextInput
   ): "removed" | "preserved" | "not_found" {
+    // `git worktree remove`/`prune` must run against the repo that OWNS the
+    // worktree (the run's persisted TARGET repo), which may be a child of the
+    // container. Falls back to the coordination root for v1.1 single-repo runs.
+    const repoRoot = resolveTargetRepoRoot(target, eventContext.identity);
     const removal = this.worktreeService.removeWorktreeIfClean({
       leaderWorkspaceRoot: eventContext.identity.workspaceRoot,
+      repoRoot,
       workspace_path: target.workspace_path,
       base_revision: null
     });
-    this.worktreeService.pruneWorktrees(eventContext.identity.workspaceRoot);
+    this.worktreeService.pruneWorktrees(repoRoot);
     this.appendEvent({
       input: eventContext,
       eventType: EVENT_TYPES.workspaceWorktreeCleaned,
@@ -1372,7 +1389,8 @@ export class LifecycleService {
               review_status,
               workspace_path,
               base_revision,
-              worktree_branch
+              worktree_branch,
+              worktree_repo_root
             FROM ${TABLE_NAMES.runs}
             WHERE run_id = ?
             LIMIT 1
@@ -1394,7 +1412,11 @@ export class LifecycleService {
     input: StartScheduledRunInput,
     backendDescription: ExecutionBackendDescription,
     classification: WorkClassification
-  ): { safety: WorkspaceSafetyResult; worktreeBranch: string | null } {
+  ): {
+    safety: WorkspaceSafetyResult;
+    worktreeBranch: string | null;
+    worktreeBlockedReason: string | null;
+  } {
     if (!isFileModifyingWork(classification)) {
       return {
         safety: this.workspaceSafetyService.prepareWorkspace({
@@ -1404,13 +1426,16 @@ export class LifecycleService {
             backendDescription.capabilities
           )
         }),
-        worktreeBranch: null
+        worktreeBranch: null,
+        worktreeBlockedReason: null
       };
     }
 
-    const resolvedWorkspacePath =
-      normalizeOptionalText(input.workspace_path) ??
-      inferWorkspacePathFromCwd(input);
+    // NOTE: `cwd` is NO LONGER a direct (unisolated) workspace_path — it is the
+    // per-TeamMate TARGET repo HINT that feeds repo resolution + worktree
+    // creation below. Only an explicit workspace_path is treated as a concrete,
+    // already-isolated path.
+    const resolvedWorkspacePath = normalizeOptionalText(input.workspace_path);
     const resolvedReviewDiff = normalizeOptionalText(
       input.review_diff_artifact_path
     );
@@ -1421,6 +1446,7 @@ export class LifecycleService {
     let workspacePath = resolvedWorkspacePath;
     let baseRevision = normalizeOptionalText(input.base_revision);
     let worktreeBranch: string | null = null;
+    let worktreeBlockedReason: string | null = null;
 
     // EXEC-04/D-01 (tightened in Phase 12): for a workspaces-capable backend the
     // git worktree is the REQUIRED primary isolation for every file-modifying
@@ -1438,6 +1464,9 @@ export class LifecycleService {
     ) {
       const created = this.worktreeService.createIsolatedWorktree({
         leaderWorkspaceRoot: input.identity.workspaceRoot,
+        // The cwd repo HINT: resolves the TARGET repo (which may be a CHILD of a
+        // non-repo container). Absent → the leader must itself be a repo (v1.1).
+        cwd: normalizeOptionalText(input.cwd),
         teamName: input.team_name,
         memberCanonicalName: canonicalNameFromMemberId(input.member_id),
         runId: input.run_id
@@ -1447,15 +1476,23 @@ export class LifecycleService {
         workspacePath = created.workspace_path;
         baseRevision = created.base_revision;
         worktreeBranch = created.branch;
-        // ISOL-02: persist the worktree branch on the run row (targeted UPDATE,
-        // never rewrites metadata_json) so the TL merge flow (D-04) and
-        // diagnostics can resolve the branch. Mirrors stampResumeAttempt.
+        // ISOL-02: persist the worktree branch + resolved TARGET repo root on
+        // the run row (targeted UPDATEs, never rewrite metadata_json) so the TL
+        // merge flow (D-04) and diagnostics resolve them. Mirrors
+        // stampResumeAttempt.
         this.stampWorktreeBranch(input.run_id, created.branch);
+        this.stampWorktreeRepoRoot(input.run_id, created.repo_root);
         this.appendWorkspaceIsolationCreatedEvent({
           input,
           classification,
           created
         });
+      } else {
+        // Fail-closed (ISOL-01): the TARGET repo could not be resolved (e.g.
+        // workspace_target_repo_unresolved). Surface the sanitized reason; the
+        // run stays BLOCKED below and is never run unisolated nor redirected
+        // into the leader/container tree.
+        worktreeBlockedReason = sanitizeText(created.reason, input.prompt);
       }
     }
 
@@ -1472,7 +1509,8 @@ export class LifecycleService {
         declared_output_path: resolvedDeclaredOutput,
         base_revision: baseRevision
       }),
-      worktreeBranch
+      worktreeBranch,
+      worktreeBlockedReason
     };
   }
 
@@ -1608,6 +1646,7 @@ export class LifecycleService {
         teammate_id: input.input.teammate_id,
         run_id: input.input.run_id,
         workspace_path: input.created.workspace_path,
+        worktree_repo_root: input.created.repo_root,
         base_revision: input.created.base_revision,
         branch: input.created.branch,
         isolation_kind: ISOLATION_KINDS.gitWorktree,
@@ -1653,7 +1692,11 @@ export class LifecycleService {
   private markWorkspaceReviewRequired(
     input: StartScheduledRunInput,
     classification: WorkClassification,
-    safety: WorkspaceSafetyResult
+    safety: WorkspaceSafetyResult,
+    // When set (e.g. workspace_target_repo_unresolved), the SPECIFIC fail-closed
+    // reason. The MCP-facing error_code stays the stable workspace_isolation_
+    // required contract; the precise reason is surfaced in the auditable event.
+    blockedReason: string | null = null
   ): void {
     const updatedAt = new Date().toISOString();
     this.updateRunLifecycle({
@@ -1676,6 +1719,7 @@ export class LifecycleService {
         run_id: input.run_id,
         delivery_status: MESSAGE_DELIVERY_STATUSES.backendUnavailable,
         error_code: WORKSPACE_ISOLATION_ERROR_CODE,
+        reason: blockedReason ?? undefined,
         work_classification: classification,
         isolation_kind: safety.isolation_kind,
         review_status: RUN_REVIEW_STATUSES.needsReview,
@@ -2252,6 +2296,19 @@ export class LifecycleService {
       )
       .run(branch, runId);
   }
+
+  // Decoupling (migration v7): targeted write of the resolved TARGET repo root
+  // (the real repo the worktree was branched from — may be a CHILD of a non-repo
+  // container). Independent of updateRunLifecycle (which never touches this
+  // column), mirroring stampWorktreeBranch, so it never clobbers the lifecycle
+  // write. The merge/review flow reads it back to run git against the right repo.
+  private stampWorktreeRepoRoot(runId: string, repoRoot: string): void {
+    this.options.db
+      .prepare(
+        `UPDATE ${TABLE_NAMES.runs} SET worktree_repo_root = ? WHERE run_id = ?`
+      )
+      .run(repoRoot, runId);
+  }
 }
 
 function isFileModifyingWork(classification: WorkClassification): boolean {
@@ -2300,6 +2357,17 @@ function validateMergeTarget(
       base_revision: baseRevision
     }
   };
+}
+
+// The repo a worktree run is merged/reviewed/cleaned against. Prefers the run's
+// persisted TARGET repo root (multi-repo container → the real child repo the
+// worktree was branched from) and falls back to the coordination root for v1.1
+// single-repo runs (leader IS the repo) and pre-v7 runs with no stamped value.
+function resolveTargetRepoRoot(
+  run: { worktree_repo_root: string | null },
+  identity: WorkspaceScopedCallerIdentity
+): string {
+  return normalizeOptionalText(run.worktree_repo_root) ?? identity.workspaceRoot;
 }
 
 function isStartSafe(
@@ -2615,16 +2683,6 @@ function toWorkspaceBackendCapabilities(
 function canonicalNameFromMemberId(memberId: string): string {
   const tail = memberId.split(":").at(-1);
   return tail && tail.length > 0 ? tail : memberId;
-}
-
-function inferWorkspacePathFromCwd(
-  input: StartScheduledRunInput
-): string | null {
-  if (normalizeOptionalText(input.isolation) !== "worktree") {
-    return null;
-  }
-
-  return normalizeOptionalText(input.cwd);
 }
 
 function sanitizeText(

@@ -32,6 +32,12 @@ export interface WorktreeMergeServiceOptions {
 
 export interface ReviewWorktreeInput {
   leaderWorkspaceRoot: string;
+  /**
+   * The TARGET repo the worktree branch is reviewed/merged against (where the
+   * conflict preview + rev-list run). For a multi-repo container this is the
+   * CHILD repo; falls back to leaderWorkspaceRoot for v1.1 single-repo runs.
+   */
+  repoRoot?: string | null;
   workspace_path: string;
   base_revision?: string | null;
   branch?: string | null;
@@ -49,6 +55,12 @@ export interface ReviewWorktreeResult {
 
 export interface MergeWorktreeInput {
   leaderWorkspaceRoot: string;
+  /**
+   * The TARGET repo the worktree branch is merged BACK INTO. For a multi-repo
+   * container this is the CHILD repo; falls back to leaderWorkspaceRoot for
+   * v1.1 single-repo runs.
+   */
+  repoRoot?: string | null;
   workspace_path: string;
   branch?: string | null;
   /** A short, NON-sensitive label (e.g. member@run) used in the commit message. */
@@ -83,7 +95,7 @@ export class WorktreeMergeService {
   }
 
   reviewWorktree(input: ReviewWorktreeInput): ReviewWorktreeResult {
-    const leaderRoot = path.resolve(input.leaderWorkspaceRoot);
+    const repoRoot = resolveRepoRoot(input.repoRoot, input.leaderWorkspaceRoot);
     const workspacePath = normalizeText(input.workspace_path);
     if (!workspacePath) {
       return { status: "blocked", reason: "missing_workspace_path" };
@@ -125,7 +137,7 @@ export class WorktreeMergeService {
       : "";
     const diffSummary = sanitizeText(diffStat) || undefined;
 
-    const conflictPreview = this.previewConflict(leaderRoot, branch);
+    const conflictPreview = this.previewConflict(repoRoot, branch);
 
     return {
       status: "reviewed",
@@ -138,7 +150,7 @@ export class WorktreeMergeService {
   }
 
   mergeIntoLeader(input: MergeWorktreeInput): MergeWorktreeResult {
-    const leaderRoot = path.resolve(input.leaderWorkspaceRoot);
+    const repoRoot = resolveRepoRoot(input.repoRoot, input.leaderWorkspaceRoot);
     const workspacePath = normalizeText(input.workspace_path);
     if (!workspacePath) {
       return { status: "blocked", reason: "missing_workspace_path" };
@@ -174,8 +186,9 @@ export class WorktreeMergeService {
       };
     }
 
-    // 2. Nothing to merge (branch has no commits beyond leader HEAD) → no_op.
-    const revList = this.execGit(leaderRoot, [
+    // 2. Nothing to merge (branch has no commits beyond the target repo HEAD) →
+    //    no_op.
+    const revList = this.execGit(repoRoot, [
       "rev-list",
       "--count",
       `HEAD..${branch}`
@@ -184,10 +197,10 @@ export class WorktreeMergeService {
       return { status: "no_op", branch };
     }
 
-    // 3. TL-triggered merge into the leader working tree (auditable --no-ff
-    //    commit). On conflict, roll the leader back clean and preserve the
+    // 3. TL-triggered merge into the TARGET repo working tree (auditable --no-ff
+    //    commit). On conflict, roll the target repo back clean and preserve the
     //    worktree (fail-closed).
-    const merge = this.execGit(leaderRoot, [
+    const merge = this.execGit(repoRoot, [
       "merge",
       "--no-ff",
       branch,
@@ -196,7 +209,7 @@ export class WorktreeMergeService {
     ]);
 
     if (merge.ok) {
-      const head = this.execGit(leaderRoot, ["rev-parse", "HEAD"]);
+      const head = this.execGit(repoRoot, ["rev-parse", "HEAD"]);
       return {
         status: "merged",
         branch,
@@ -205,7 +218,7 @@ export class WorktreeMergeService {
     }
 
     const conflictFiles = parseLineList(
-      this.execGit(leaderRoot, [
+      this.execGit(repoRoot, [
         "diff",
         "--name-only",
         "--diff-filter=U"
@@ -214,9 +227,9 @@ export class WorktreeMergeService {
       .map(sanitizeText)
       .filter(Boolean);
 
-    // Always restore the leader to a clean state, regardless of conflict vs other
-    // git failure. abort is best-effort.
-    this.execGit(leaderRoot, ["merge", "--abort"]);
+    // Always restore the target repo to a clean state, regardless of conflict vs
+    // other git failure. abort is best-effort.
+    this.execGit(repoRoot, ["merge", "--abort"]);
 
     if (conflictFiles.length > 0) {
       return { status: "conflict", branch, conflict_files: conflictFiles };
@@ -248,8 +261,8 @@ export class WorktreeMergeService {
   // Best-effort, non-destructive conflict prediction via `git merge-tree`. Any
   // interpretation failure simply reports false (the authoritative conflict
   // handling happens at merge time with abort).
-  private previewConflict(leaderRoot: string, branch: string): boolean {
-    const writeTree = this.execGit(leaderRoot, [
+  private previewConflict(repoRoot: string, branch: string): boolean {
+    const writeTree = this.execGit(repoRoot, [
       "merge-tree",
       "--write-tree",
       "HEAD",
@@ -325,6 +338,16 @@ function bufferToString(value: string | Buffer | undefined): string {
 function normalizeText(value: string | null | undefined): string {
   const trimmed = value?.trim();
   return trimmed && trimmed.length > 0 ? trimmed : "";
+}
+
+// The repo the worktree branch is reviewed/merged against. Prefers the run's
+// persisted target repo root (multi-repo container → child repo) and falls back
+// to the coordination root for v1.1 single-repo runs.
+function resolveRepoRoot(
+  repoRoot: string | null | undefined,
+  leaderWorkspaceRoot: string
+): string {
+  return path.resolve(normalizeText(repoRoot) || leaderWorkspaceRoot);
 }
 
 // Commit/merge messages carry only a caller-supplied label; strip secrets and
