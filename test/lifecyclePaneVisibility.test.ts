@@ -16,6 +16,7 @@ import type {
   PaneBackendCloseResult,
   PaneBackendMetadata,
   PaneBackendRegistry,
+  PaneLaunchRequest,
   PaneLaunchResult,
   PaneReconcileResult
 } from "../src/adapters/paneBackend.js";
@@ -131,12 +132,88 @@ class FakeExecBackendWithLog extends FakeRealExecutionBackend {
   }
 }
 
+// A PANE-HOSTED execution backend (like the real PaneExecutionBackend): startRun
+// opens the teammate pane itself and returns pane metadata + a durable thread_id,
+// staying `running` (the async TUI turn finalizes on a later reconcile). Records
+// the start context so tests can assert the lifecycle threaded the DB-derived
+// layout anchors (previousTeammatePaneIds) in BEFORE startRun.
+class FakePaneHostedExecutionBackend implements ExecutionBackend {
+  readonly startCalls: Array<
+    ExecutionRunContext & { previousTeammatePaneIds?: readonly string[] }
+  > = [];
+
+  describeBackend(): ExecutionBackendDescription {
+    return {
+      status: "available",
+      teammateExecutionImplemented: true,
+      backend: "iterm2",
+      backend_status: RUN_BACKEND_STATUSES.running,
+      capabilities: {
+        canStart: true,
+        canResume: true,
+        canReconcile: true,
+        supportsWorkspaces: true,
+        supportsOsSandbox: true
+      }
+    };
+  }
+
+  startRun(context: ExecutionRunContext): ExecutionBackendActionResult {
+    this.startCalls.push(context);
+    const paneId = `iterm-pane-${this.startCalls.length}`;
+    return {
+      status: "started",
+      delivery_status: MESSAGE_DELIVERY_STATUSES.backendStartAttempted,
+      backend: "iterm2",
+      backend_status: RUN_BACKEND_STATUSES.running,
+      backend_run_id: REAL_THREAD_ID,
+      thread_id: REAL_THREAD_ID,
+      process_id: paneId,
+      started_at: "2026-06-10T00:00:00.000Z",
+      metadata: {
+        pane: {
+          mode: "pane",
+          backend_type: "iterm2",
+          availability_status: "available",
+          pane_id: paneId,
+          session_name: "w0t0p0:session"
+        }
+      }
+    };
+  }
+
+  resumeRun(
+    _context: ExecutionRunContext,
+    _trigger: ExecutionTrigger
+  ): ExecutionBackendActionResult {
+    return {
+      status: "resumed",
+      delivery_status: MESSAGE_DELIVERY_STATUSES.backendResumeAttempted,
+      backend: "iterm2",
+      backend_status: RUN_BACKEND_STATUSES.running,
+      backend_run_id: REAL_THREAD_ID,
+      thread_id: REAL_THREAD_ID
+    };
+  }
+
+  reconcileRun(_context: ExecutionRunContext): ExecutionBackendReconcileResult {
+    return {
+      status: "active",
+      backend: "iterm2",
+      backend_status: RUN_BACKEND_STATUSES.running,
+      thread_id: REAL_THREAD_ID
+    };
+  }
+}
+
 // Fully featured fake pane backend with an available terminal. `closeBehavior`
 // controls closePane: "ok" -> success, "fail" -> ok:false, "throw" -> throws (to
 // exercise the best-effort teardown guard).
 class FakeAvailablePaneBackend implements PaneBackendRegistry {
   readonly createCalls: ExecutionRunContext[] = [];
   readonly createCommands: Array<readonly string[] | undefined> = [];
+  // Records the DB-derived anchor list each createPane received (layout fix).
+  readonly createPreviousIds: Array<readonly string[] | undefined> = [];
   readonly resumeCalls: ExecutionRunContext[] = [];
   readonly reconcileCalls: ExecutionRunContext[] = [];
   readonly closeCalls: PaneBackendMetadata[] = [];
@@ -151,11 +228,12 @@ class FakeAvailablePaneBackend implements PaneBackendRegistry {
   }
 
   createPane(
-    context: ExecutionRunContext,
+    context: PaneLaunchRequest,
     command?: readonly string[]
   ): PaneLaunchResult {
     this.createCalls.push(context);
     this.createCommands.push(command);
+    this.createPreviousIds.push(context.previousTeammatePaneIds);
     return { ok: true, pane: this.pane };
   }
 
@@ -747,6 +825,389 @@ describe("lifecycle pane visibility overlay", () => {
       // Derived from workspace_root + run_id via codexExecLogPath.
       expect(command?.[2]).toContain(`${workspaceRoot}/.codex-team/runs/`);
       expect(command?.[2]?.endsWith(".jsonl")).toBe(true);
+    } finally {
+      adapter.close();
+    }
+  });
+
+  it("passes the DB-derived previous teammate pane ids to createPane (layout determinism)", () => {
+    // Regression for the horizontal-stacking bug: the pane backend is rebuilt on
+    // every Agent tool call, so closure layout state reset and every teammate
+    // re-split the leader. The lifecycle now derives the anchor list from the DB
+    // and hands it to createPane via previousTeammatePaneIds.
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace/pane-visibility";
+    const identity = buildIdentity(workspaceRoot);
+    const fakePane = new FakeAvailablePaneBackend({
+      mode: "pane",
+      backend_type: "iterm2",
+      availability_status: "available",
+      pane_id: "iterm-pane-1",
+      session_name: "w0t0p0:session"
+    });
+
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    try {
+      const db = adapter.getDatabase();
+      const statePath = adapter.describeStateRoot().stateRoot;
+      new TeamService({ db, statePath }).createTeam({
+        teamName: "Alpha Team",
+        description: "Pane layout team",
+        identity
+      });
+      // Each Agent tool call builds a fresh AgentService (the real-world condition
+      // that reset the old closure state) — share the pane backend to record calls.
+      const makeAgent = (name: string) =>
+        new AgentService({
+          db,
+          statePath,
+          executionBackend: new FakeRealExecutionBackend(),
+          paneMode: { enabled: true },
+          paneBackend: fakePane
+        }).createAgent({
+          name,
+          teamName: "alpha-team",
+          mode: "read",
+          prompt: SECRET_PANE_VISIBILITY_PROMPT,
+          description: `Pane layout ${name}`,
+          identity
+        });
+
+      makeAgent("Builder");
+      makeAgent("Reviewer");
+
+      expect(fakePane.createCalls).toHaveLength(2);
+      // First teammate: no prior panes -> empty anchor list -> leader split.
+      expect(fakePane.createPreviousIds[0]).toEqual([]);
+      // Second teammate: anchored off the first teammate's persisted pane so the
+      // backend stacks it instead of re-splitting the leader.
+      expect(fakePane.createPreviousIds[1]).toEqual(["iterm-pane-1"]);
+    } finally {
+      adapter.close();
+    }
+  });
+
+  it("derives previousTeammatePaneIds most-recent first and excludes non-available panes", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace/pane-visibility";
+    const identity = buildIdentity(workspaceRoot);
+    const fakePane = new FakeAvailablePaneBackend({
+      mode: "pane",
+      backend_type: "iterm2",
+      availability_status: "available",
+      pane_id: "iterm-pane-new",
+      session_name: "w0t0p0:session"
+    });
+
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    try {
+      const db = adapter.getDatabase();
+      const statePath = adapter.describeStateRoot().stateRoot;
+      new TeamService({ db, statePath }).createTeam({
+        teamName: "Alpha Team",
+        description: "Pane ordering team",
+        identity
+      });
+      const teamId = (
+        db
+          .prepare(`SELECT team_id FROM ${TABLE_NAMES.teams} LIMIT 1`)
+          .get() as { team_id: string }
+      ).team_id;
+
+      // Seed three prior runs with explicit created_at so ordering is deterministic
+      // (run_id carries a random UUID, so we never rely on the timestamp tiebreak):
+      //   - older available pane %10
+      //   - newer available pane %20
+      //   - newest pane %30 but UNAVAILABLE (must be excluded)
+      const seedRun = (
+        runId: string,
+        createdAt: string,
+        pane: PaneBackendMetadata
+      ) => {
+        db.prepare(
+          `INSERT INTO ${TABLE_NAMES.runs}
+             (run_id, team_id, member_id, status, backend, workspace_path,
+              metadata_json, created_at, updated_at, last_error)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(
+          runId,
+          teamId,
+          null,
+          "idle",
+          "codex_cli_exec",
+          null,
+          JSON.stringify({ backend_metadata: { pane } }),
+          createdAt,
+          createdAt,
+          null
+        );
+      };
+      seedRun("run:seed:older", "2026-01-01T00:00:01.000Z", {
+        mode: "pane",
+        backend_type: "iterm2",
+        availability_status: "available",
+        pane_id: "%10",
+        session_name: "w0t0p0:session"
+      });
+      seedRun("run:seed:newer", "2026-01-01T00:00:02.000Z", {
+        mode: "pane",
+        backend_type: "iterm2",
+        availability_status: "available",
+        pane_id: "%20",
+        session_name: "w0t0p0:session"
+      });
+      seedRun("run:seed:newest-closed", "2026-01-01T00:00:03.000Z", {
+        mode: "pane",
+        backend_type: "iterm2",
+        availability_status: "unavailable",
+        degradation_reason: "pane_closed",
+        pane_id: "%30",
+        session_name: "w0t0p0:session"
+      });
+
+      new AgentService({
+        db,
+        statePath,
+        executionBackend: new FakeRealExecutionBackend(),
+        paneMode: { enabled: true },
+        paneBackend: fakePane
+      }).createAgent({
+        name: "Builder",
+        teamName: "alpha-team",
+        mode: "read",
+        prompt: SECRET_PANE_VISIBILITY_PROMPT,
+        description: "Pane ordering Builder",
+        identity
+      });
+
+      expect(fakePane.createCalls).toHaveLength(1);
+      // Most-recent first, unavailable %30 excluded -> ["%20", "%10"].
+      expect(fakePane.createPreviousIds[0]).toEqual(["%20", "%10"]);
+    } finally {
+      adapter.close();
+    }
+  });
+
+  it("pane-hosted execution backend: startContext carries previousTeammatePaneIds and the overlay never re-opens a pane", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace/pane-visibility";
+    const identity = buildIdentity(workspaceRoot);
+    // A SEPARATE overlay pane backend — it must NOT be used because the execution
+    // backend already produced pane metadata (overlay skip via extractPaneMetadata).
+    const overlayPane = new FakeAvailablePaneBackend({
+      mode: "pane",
+      backend_type: "iterm2",
+      availability_status: "available",
+      pane_id: "overlay-should-not-open",
+      session_name: "w0t0p0:session"
+    });
+
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    try {
+      const db = adapter.getDatabase();
+      const statePath = adapter.describeStateRoot().stateRoot;
+      new TeamService({ db, statePath }).createTeam({
+        teamName: "Alpha Team",
+        description: "Pane-hosted team",
+        identity
+      });
+
+      const exec = new FakePaneHostedExecutionBackend();
+      const makeAgent = (name: string) =>
+        new AgentService({
+          db,
+          statePath,
+          executionBackend: exec,
+          paneMode: { enabled: true },
+          paneBackend: overlayPane
+        }).createAgent({
+          name,
+          teamName: "alpha-team",
+          mode: "read",
+          prompt: SECRET_PANE_VISIBILITY_PROMPT,
+          description: `Pane-hosted ${name}`,
+          identity
+        });
+
+      makeAgent("Builder");
+      makeAgent("Reviewer");
+
+      // The lifecycle threaded the DB-derived anchors into the start context BEFORE
+      // calling the (pane-hosted) execution backend's startRun.
+      expect(exec.startCalls).toHaveLength(2);
+      expect(exec.startCalls[0].previousTeammatePaneIds).toEqual([]);
+      expect(exec.startCalls[1].previousTeammatePaneIds).toEqual(["iterm-pane-1"]);
+
+      // The overlay was skipped entirely — the execution backend owns the pane.
+      expect(overlayPane.createCalls).toHaveLength(0);
+
+      // Both runs persisted the EXECUTION backend's pane (never an overlay pane).
+      const paneIds = (
+        db
+          .prepare(`SELECT metadata_json FROM ${TABLE_NAMES.runs}`)
+          .all() as Array<{ metadata_json: string }>
+      )
+        .map((row) =>
+          readPaneFromRun({
+            status: "",
+            backend_status: null,
+            backend_thread_id: null,
+            metadata_json: row.metadata_json
+          })
+        )
+        .map((pane) => pane?.pane_id);
+      expect(paneIds.sort()).toEqual(["iterm-pane-1", "iterm-pane-2"]);
+      expect(paneIds).not.toContain("overlay-should-not-open");
+    } finally {
+      adapter.close();
+    }
+  });
+});
+
+describe("SendMessage full-body delivery to a resumed teammate (做法 1 escalation loop)", () => {
+  const FULL_BODY_SENTINEL =
+    "FULL_BODY_DELIVERY_SENTINEL: the complete human answer the teammate must receive verbatim.";
+
+  it("threads the full body into the resume context as resume_delivery_text without persisting it (D-02)", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace/full-body-delivery";
+    const callerMetadata = { sessionId: "session-1", clientName: "codex" };
+    const identity = buildIdentity(workspaceRoot);
+    const fakeExec = new FakeRealExecutionBackend();
+    const fakePane = new FakeAvailablePaneBackend({
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available",
+      pane_id: "%201",
+      session_name: "codex-team-alpha-team"
+    });
+
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    try {
+      const db = adapter.getDatabase();
+      const statePath = adapter.describeStateRoot().stateRoot;
+      new TeamService({ db, statePath }).createTeam({
+        teamName: "Alpha Team",
+        description: "Full-body delivery team",
+        identity
+      });
+      new AgentService({
+        db,
+        statePath,
+        executionBackend: fakeExec,
+        paneMode: { enabled: true },
+        paneBackend: fakePane
+      }).createAgent({
+        name: "Builder",
+        teamName: "alpha-team",
+        mode: "read",
+        prompt: SECRET_PANE_VISIBILITY_PROMPT,
+        description: "Full-body delivery Builder",
+        identity
+      });
+
+      new MessageService({
+        db,
+        statePath,
+        executionBackend: fakeExec,
+        paneMode: { enabled: true },
+        paneBackend: fakePane
+      }).sendMessage({
+        teamName: "alpha-team",
+        to: "Builder",
+        message: FULL_BODY_SENTINEL,
+        summary: "short summary",
+        identity
+      });
+
+      // The resume CONTEXT carried the full body verbatim (not just the summary).
+      expect(fakeExec.resumeCalls).toHaveLength(1);
+      const resumeMeta = fakeExec.resumeCalls[0].context.metadata ?? {};
+      expect(resumeMeta.resume_delivery_text).toBe(FULL_BODY_SENTINEL);
+      // The non-sensitive summary still rides alongside (the fallback channel).
+      expect(resumeMeta.summary).toBe("short summary");
+
+      // D-02: neither the full body nor the resume_delivery_text key ever lands in
+      // the persisted run metadata (the body lives only in the messages table).
+      const run = readRunRow(db);
+      expect(run.metadata_json).not.toContain("resume_delivery_text");
+      expect(run.metadata_json).not.toContain(FULL_BODY_SENTINEL);
+    } finally {
+      adapter.close();
+    }
+
+    // D-02: nor anywhere in the diagnostics payload (reads runs/members/messages
+    // metadata — never message body_json or the in-memory resume context).
+    const payload = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata,
+      paneMode: { enabled: true },
+      includeDebug: true
+    });
+    const serialized = JSON.stringify(payload);
+    expect(serialized).not.toContain("resume_delivery_text");
+    expect(serialized).not.toContain(FULL_BODY_SENTINEL);
+  });
+
+  it("never threads delivery_text for a system lifecycle notice (and never resumes it)", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace/full-body-delivery";
+    const identity = buildIdentity(workspaceRoot);
+    const fakeExec = new FakeRealExecutionBackend();
+    const fakePane = new FakeAvailablePaneBackend({
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available",
+      pane_id: "%202",
+      session_name: "codex-team-alpha-team"
+    });
+
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    try {
+      const db = adapter.getDatabase();
+      const statePath = adapter.describeStateRoot().stateRoot;
+      new TeamService({ db, statePath }).createTeam({
+        teamName: "Alpha Team",
+        description: "System notice team",
+        identity
+      });
+      new AgentService({
+        db,
+        statePath,
+        executionBackend: fakeExec,
+        paneMode: { enabled: true },
+        paneBackend: fakePane
+      }).createAgent({
+        name: "Builder",
+        teamName: "alpha-team",
+        mode: "read",
+        prompt: SECRET_PANE_VISIBILITY_PROMPT,
+        description: "System notice Builder",
+        identity
+      });
+
+      new MessageService({
+        db,
+        statePath,
+        executionBackend: fakeExec,
+        paneMode: { enabled: true },
+        paneBackend: fakePane
+      }).sendMessage({
+        teamName: "alpha-team",
+        to: "Builder",
+        message: FULL_BODY_SENTINEL,
+        summary: "lifecycle completion",
+        // A system lifecycle notice: suppresses resume (D10-3) AND carries no body.
+        metadata: { message_type: "lifecycle_completion" },
+        identity
+      });
+
+      // The recursion guard prevented any resume, so no delivery_text was injected.
+      expect(fakeExec.resumeCalls).toHaveLength(0);
+      const run = readRunRow(db);
+      expect(run.metadata_json).not.toContain("resume_delivery_text");
+      expect(run.metadata_json).not.toContain(FULL_BODY_SENTINEL);
     } finally {
       adapter.close();
     }

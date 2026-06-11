@@ -31,6 +31,10 @@ export interface WorkspaceSafetyInput {
   review_diff_artifact_path?: string | null;
   declared_output_path?: string | null;
   base_revision?: string | null;
+  // 自动创建的 worktree 所基于的目标仓(在多仓 container 模型里可能是非 git
+  // 容器的子仓)。存在时,worktree 必须位于其 *之外* —— 这才是正确的隔离边界;
+  // 缺省时回退到 leaderWorkspaceRoot(v1.1 单仓 / 调用方直接传 workspace_path)。
+  worktree_repo_root?: string | null;
   // Phase 12 (D-01): optional sandbox mode passthrough recorded alongside the
   // sandbox_overlay flag when the backend supports an OS sandbox.
   sandbox_mode?: string | null;
@@ -229,7 +233,14 @@ export class WorkspaceSafetyService {
       return null;
     }
 
-    if (isPathInsideOrEqual(workspacePath, input.leaderWorkspaceRoot)) {
+    // D-01 边界:worktree 必须位于*被修改的目标仓*之外(写入永不落进该仓的工作树)。
+    // 多仓 container 模型下目标仓是非 git 协调容器的子目录,因此受管的 worktree 存储
+    // 合法地位于 container 内部(如 <container>/.codex-team/...),同时仍在目标仓之外。
+    // 已知目标仓时按目标仓判定;未知时(v1.1 单仓 / 调用方自带 workspace_path)才回退
+    // 到 leader/container 根。
+    const isolationBoundary =
+      normalizeConcretePath(input.worktree_repo_root) ?? input.leaderWorkspaceRoot;
+    if (isPathInsideOrEqual(workspacePath, isolationBoundary)) {
       return null;
     }
 

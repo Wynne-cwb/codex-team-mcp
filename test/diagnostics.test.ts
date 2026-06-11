@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -1225,6 +1225,135 @@ describe("TeamDiagnostics payload", () => {
     expect(serialized).toContain("[redacted_secret]");
     expect(serialized).not.toContain(deliverablePrompt);
     expect(serialized).not.toContain(deliverableSecret);
+  });
+
+  it("relocates a pane-hosted run's deliverable by workspace cwd when rollout_path was never captured at start", () => {
+    const stateRoot = createTempStateRoot();
+    const codexHome = createTempStateRoot();
+    const workspaceRoot = "/workspace";
+    const callerMetadata = { sessionId: "session-1", clientName: "codex" };
+    // The run's UNIQUE isolated worktree path. It IS persisted (metadata.workspace_path)
+    // and pins the rollout via session_meta.cwd, the same way reconcile relocates it.
+    const workspaceCwd = "/workspace/.codex-team/worktrees/sprite-cold-start";
+    // The prompt must NOT overlap the deliverable text, or D-02 redaction would
+    // rewrite it and the substring assertions below would falsely fail.
+    const prompt = "wire up the pane cold-start rollout relocation path";
+
+    // Codex always writes a full rollout transcript at
+    // <CODEX_HOME>/sessions/YYYY/MM/DD/rollout-<ISO>-<uuid>.jsonl. The FIRST line is a
+    // session_meta carrying the worktree cwd; a trailing assistant message + task_complete
+    // make this a completed turn with a real deliverable.
+    const sessionId = "11111111-2222-3333-4444-555555555555";
+    const rolloutDir = path.join(codexHome, "sessions", "2026", "06", "11");
+    mkdirSync(rolloutDir, { recursive: true });
+    const rolloutPath = path.join(
+      rolloutDir,
+      `rollout-2026-06-11T10-00-00-${sessionId}.jsonl`
+    );
+    writeFileSync(
+      rolloutPath,
+      [
+        JSON.stringify({
+          type: "session_meta",
+          payload: { id: sessionId, cwd: workspaceCwd }
+        }),
+        JSON.stringify({
+          type: "event_msg",
+          payload: { type: "task_started", turn_id: "turn-1" }
+        }),
+        JSON.stringify({
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "已完成。author=Sprite" }]
+          }
+        }),
+        JSON.stringify({ type: "event_msg", payload: { type: "task_complete" } })
+      ].join("\n")
+    );
+
+    const caller = normalizeCallerMetadata(callerMetadata);
+    const identity = buildWorkspaceScopedCallerIdentity({ workspaceRoot, caller });
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    const db = adapter.getDatabase();
+    const statePath = adapter.describeStateRoot().stateRoot;
+    new TeamService({ db, statePath }).createTeam({
+      teamName: "Alpha Team",
+      description: "Cold-start relocation diagnostics team",
+      identity
+    });
+    const created = new AgentService({ db, statePath }).createAgent({
+      name: "Sprite",
+      teamName: "alpha-team",
+      prompt,
+      description: "Create cold-start relocation Sprite",
+      identity
+    }) as unknown as ScheduledAgentLike;
+
+    db.prepare(
+      `UPDATE ${TABLE_NAMES.members} SET status = ? WHERE member_id = ?`
+    ).run(MEMBER_STATUSES.idle, created.debug.internal_member_id);
+    // Pane-hosted run: backend_metadata carries ONLY pane info — NO rollout_path and
+    // NO exec_log_path were captured at start (the cold-start codex wrote session_meta
+    // after the bounded startRun poll window). workspace_path IS persisted.
+    db.prepare(
+      `
+        UPDATE ${TABLE_NAMES.runs}
+        SET status = ?,
+            backend = ?,
+            backend_status = ?,
+            workspace_path = ?,
+            metadata_json = ?
+        WHERE run_id = ?
+      `
+    ).run(
+      MEMBER_STATUSES.idle,
+      "iterm2",
+      RUN_BACKEND_STATUSES.idle,
+      workspaceCwd,
+      JSON.stringify({
+        prompt,
+        workspace_path: workspaceCwd,
+        backend_metadata: {
+          pane: {
+            mode: "pane",
+            backend_type: "iterm2",
+            availability_status: "available",
+            is_native: true
+          }
+        }
+      }),
+      created.run_id
+    );
+    adapter.close();
+
+    const previousCodexHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = codexHome;
+    try {
+      const payload = buildDiagnosticsPayload({
+        stateRoot,
+        workspaceRoot,
+        callerMetadata,
+        includeDebug: true,
+        targetClaudeTools: TARGET_CLAUDE_TOOLS,
+        registeredTools: COMPATIBILITY_TOOLS
+      });
+
+      const debugRow = (payload.debug?.runs ?? []).find(
+        (row) => row.run_id === created.run_id
+      );
+      // Without the cwd fallback the deliverable is unreachable (no exec log, no
+      // persisted rollout_path) → final_message is null. The relocation recovers it.
+      expect(debugRow?.final_message).toContain("已完成");
+      expect(debugRow?.final_message).toContain("Sprite");
+    } finally {
+      if (previousCodexHome === undefined) {
+        delete process.env.CODEX_HOME;
+      } else {
+        process.env.CODEX_HOME = previousCodexHome;
+      }
+    }
   });
 
   it("preserves observed caller metadata when provided", () => {

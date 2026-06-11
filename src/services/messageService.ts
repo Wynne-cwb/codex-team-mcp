@@ -323,6 +323,13 @@ export class MessageService {
     const persisted = tx(input);
     // D10-3 recursion guard: a system lifecycle notice never re-triggers resume.
     const inboundIsSystemNotice = isSystemLifecycleNotice(input.metadata);
+    // Full body text delivered into a pane-hosted teammate's TUI on resume (the
+    // "做法 1" escalation closed loop). Threaded in-memory only (never persisted —
+    // see lifecycle buildResumeContextMetadata D-02 note). System lifecycle notices
+    // deliberately carry no body text: they only ever surfaced a summary, kept so.
+    const deliveryText = inboundIsSystemNotice
+      ? null
+      : deliveryTextFromBody(input.body);
     const lifecycleDelivery =
       this.createLifecycleService().attemptDeliveryAfterPersistence({
         message_id: persisted.messageId,
@@ -333,6 +340,7 @@ export class MessageService {
         recipient_status: input.recipient.status,
         teammate_id: input.recipient.public_id,
         summary: input.summary,
+        delivery_text: deliveryText,
         task_id: taskIdFromMetadata(input.metadata),
         trigger_kind: triggerKindFromMetadata(input.metadata),
         suppress_resume: inboundIsSystemNotice,
@@ -625,6 +633,24 @@ function normalizeMessageBody(value: unknown): unknown {
   }
 
   return value ?? {};
+}
+
+// Extract the deliverable text from an already-normalized message body for the
+// in-memory resume passthrough (delivery_text). A string body (or a normalized
+// `{ type: "text", text }`) yields its text; any other structured body whose
+// `text` field is a non-empty string yields that; otherwise null (e.g.
+// shutdown_request and other text-less structured bodies type nothing into a pane).
+function deliveryTextFromBody(body: unknown): string | null {
+  if (typeof body === "string") {
+    return normalizeOptionalText(body);
+  }
+  if (typeof body === "object" && body !== null && !Array.isArray(body)) {
+    const text = (body as Record<string, unknown>).text;
+    if (typeof text === "string") {
+      return normalizeOptionalText(text);
+    }
+  }
+  return null;
 }
 
 function normalizeOptionalText(value: string | undefined): string | null {

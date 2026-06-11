@@ -34,6 +34,15 @@ export interface PaneRunMetadata {
 
 export interface PaneLaunchRequest extends ExecutionRunContext {
   start_command?: readonly string[];
+  // Ordered list (MOST RECENTLY CREATED FIRST) of this team's already-open
+  // iTerm2 pane ids, derived from the durable DB by the lifecycle layer. The
+  // iTerm2 backend anchors a new teammate split off the first LIVE candidate so
+  // panes stack vertically down the right column. This is DB-derived rather than
+  // in-process closure state because the pane backend is re-instantiated on every
+  // Agent tool call — the old closure tracking reset each time, so every teammate
+  // was treated as "first" and re-split the leader, piling up horizontally. tmux
+  // ignores this field (its layout is handled per-session natively).
+  previousTeammatePaneIds?: readonly string[];
 }
 
 export interface PaneLaunchResult {
@@ -91,6 +100,15 @@ export interface PaneBackend {
   // it; the registry routes to the right one and reports "close_unsupported"
   // when absent.
   closePane?(pane: PaneBackendMetadata): PaneBackendCloseResult;
+  // Optional "type text into an already-open pane" capability. Used by the
+  // pane-hosted execution backend to deliver a resume nudge into a teammate's
+  // live codex TUI (iTerm2: `it2 session run -s <id> <text>`; tmux:
+  // `send-keys -t <id> <text> Enter`). Best-effort: the result mirrors the
+  // underlying command's exit status and is never allowed to throw to the caller.
+  sendToPane?(
+    pane: PaneBackendMetadata,
+    command: readonly string[]
+  ): PaneBackendCommandResult;
 }
 
 export interface PaneBackendRegistry {
@@ -108,6 +126,13 @@ export interface PaneBackendRegistry {
   // Best-effort pane teardown, routed by pane.backend_type so a pane created in
   // a different terminal context than the current one is still closed correctly.
   closePane(pane: PaneBackendMetadata): PaneBackendCloseResult;
+  // Best-effort text delivery into an already-open pane (resume nudge), routed by
+  // pane.backend_type. Optional: a registry whose selected backend cannot deliver
+  // text reports ok:false rather than throwing.
+  sendToPane?(
+    pane: PaneBackendMetadata,
+    command: readonly string[]
+  ): PaneBackendCommandResult;
 }
 
 export interface PaneBackendRegistryOptions {
@@ -128,12 +153,20 @@ export interface ITerm2PaneBackendOptions {
   commandRunner?: PaneBackendCommandRunner;
   env?: NodeJS.ProcessEnv;
   stableId?: string;
+  // Synchronous settle between the two-step submit sends (see sendToPane). Tests
+  // inject a no-op; production defaults to a real blocking sleep.
+  sleep?: (ms: number) => void;
 }
 
 const DEFAULT_SESSION_PREFIX = "codex-team";
 const SOCKET_NAME_PREFIX = "codex-team-";
 const DEFAULT_WINDOW_NAME = "teammates";
 const SECRET_TOKEN_PATTERN = /SECRET_[A-Z0-9_]+/gi;
+
+// Settle delay between delivering the bracketed-paste body and the lone carriage
+// return that submits it. Keeps the CR clear of codex's 120ms paste-burst suppress
+// window. Production uses a real synchronous sleep; tests inject a no-op.
+const PANE_SUBMIT_SETTLE_MS = 400;
 
 // tmux is launched with `-L <socketName>`, which places the socket at
 // `/private/tmp/tmux-<uid>/<socketName>`. macOS caps the Unix-domain-socket
@@ -355,6 +388,21 @@ export function createPaneBackendRegistry(
         return { ok: false, reason: "close_unsupported" };
       }
       return target.closePane(pane);
+    },
+    sendToPane(pane, command) {
+      // Route by the pane's OWN backend_type, mirroring closePane: the teammate
+      // pane being nudged was created under that backend, which may differ from
+      // selectBackend() in an unusual terminal context.
+      const target = pane.backend_type === "iterm2" ? iterm2 : tmux;
+      if (!target.sendToPane) {
+        return {
+          ok: false,
+          stdout: "",
+          stderr: "send_unsupported",
+          exit_code: 1
+        };
+      }
+      return target.sendToPane(pane, command);
     }
   };
 }
@@ -466,6 +514,28 @@ export function createTmuxPaneBackend(
           ? undefined
           : sanitizePaneText(result.stderr || "tmux kill-pane failed")
       };
+    },
+    sendToPane(pane, command) {
+      const paneId = sanitizePaneText(pane.pane_id ?? "").trim();
+      if (!paneId) {
+        return { ok: false, stdout: "", stderr: "pane_id_missing", exit_code: 1 };
+      }
+      if (!command || command.length === 0) {
+        return { ok: false, stdout: "", stderr: "empty_command", exit_code: 1 };
+      }
+
+      // `tmux send-keys -t <pane> <literal text> Enter` types the text into the
+      // pane's foreground process (the codex TUI input) and submits it. send-keys
+      // types literal characters, so the tokens are joined raw (sanitized only) —
+      // NOT shell-quoted, which would type stray quotes into the TUI.
+      const socketName = sanitizePaneText(pane.socket_name ?? "").trim();
+      const text = command
+        .map((token) => sanitizePaneText(token))
+        .join(" ");
+      const args = socketName
+        ? ["-L", socketName, "send-keys", "-t", paneId, text, "Enter"]
+        : ["send-keys", "-t", paneId, text, "Enter"];
+      return commandRunner.run("tmux", args);
     }
   };
 }
@@ -475,14 +545,21 @@ export function createITerm2PaneBackend(
 ): PaneBackend {
   const commandRunner = options.commandRunner ?? createCommandRunner();
   const env = options.env ?? process.env;
+  const sleep =
+    options.sleep ??
+    ((ms: number) => {
+      if (ms > 0) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+      }
+    });
 
-  // Instance-level (closure) teammate-session tracking. Kept per backend INSTANCE
-  // (never module-level) so the layout state survives across createPane calls
-  // within one registry yet stays isolated between independent backends and tests.
-  // commandRunner.run is synchronous (execFileSync-style), so the reference's async
-  // lock is unnecessary — the state below is mutated strictly in call order.
-  let teammateSessionIds: string[] = [];
-  let firstPaneUsed = false;
+  // NOTE (layout determinism): this backend keeps NO in-process layout state.
+  // The anchor a new teammate splits off is derived from the durable DB and
+  // passed in via context.previousTeammatePaneIds. The previous design tracked
+  // teammateSessionIds/firstPaneUsed in a closure, but the backend is rebuilt on
+  // every Agent tool call, so that closure reset each time and every teammate was
+  // (wrongly) treated as the first — re-splitting the leader and stacking panes
+  // horizontally. Sourcing anchors from the DB makes the layout survive re-instantiation.
 
   function describeAvailability(): PaneBackendMetadata {
     // Require the iTerm2 env context first so we never probe it2 outside iTerm2.
@@ -527,54 +604,57 @@ export function createITerm2PaneBackend(
       const cwd = context.workspace_path ?? context.workspace_root;
 
       // Layout (mirrors restored-src ITermBackend.ts): leader on the left, each
-      // teammate stacked vertically on the right. The FIRST teammate splits the
-      // leader session vertically (`-v -s <leader>`, via buildITerm2SplitArgs);
-      // SUBSEQUENT teammates split OFF the previous teammate session (no `-v`) so
-      // they stack instead of re-splitting the leader (the v1 bug where every
-      // teammate piled up horizontally). `-s` targets the exact session so the
-      // layout is correct no matter which pane the user last clicked.
+      // teammate stacked vertically down the right. With NO prior teammate panes
+      // the FIRST teammate splits the leader session vertically (`-v -s <leader>`,
+      // via buildITerm2SplitArgs); when prior panes exist a SUBSEQUENT teammate
+      // splits OFF the most recent one (no `-v`) so it stacks instead of
+      // re-splitting the leader (the v1 bug where every teammate piled up
+      // horizontally). `-s` targets the exact session so the layout is correct no
+      // matter which pane the user last clicked.
+      //
+      // The anchor candidates come from context.previousTeammatePaneIds (DB-derived,
+      // most-recent first) — NOT an in-process closure that resets on every Agent
+      // tool call. `cursor` walks them.
       //
       // At-fault recovery: if a targeted teammate session is dead (user closed it),
-      // `it2 session list` confirms death before we prune and retry with the next
-      // teammate (or leader). We never prune on a systemic it2 failure (Python API
-      // off, it2 gone, transient socket error), which would drain all live ids.
-      // Bounded at O(N+1) iterations: each `continue` shrinks teammateSessionIds by
-      // one; empty → firstPaneUsed resets → next iteration targets the leader.
+      // `it2 session list` confirms death before we advance to the next candidate.
+      // We never advance on a systemic it2 failure (Python API off, it2 gone,
+      // transient socket error), which would mistake a live anchor for dead.
+      // Bounded at O(N+1) iterations: each `continue` advances the cursor by one;
+      // once every candidate is exhausted we fall back to the leader split once.
+      const candidates = context.previousTeammatePaneIds ?? [];
+      let cursor = 0;
+      let fellBackToLeader = false;
       // eslint-disable-next-line no-constant-condition
       while (true) {
-        const isFirstTeammate = !firstPaneUsed;
         let splitArgs: string[];
         let targetedTeammateId: string | undefined;
-        if (isFirstTeammate) {
+        if (fellBackToLeader || candidates.length === 0) {
+          // No live candidate anchor (first teammate, or all prior panes dead):
+          // split the leader vertically so the leader stays on the left.
           splitArgs = buildITerm2SplitArgs(env);
         } else {
-          targetedTeammateId =
-            teammateSessionIds[teammateSessionIds.length - 1];
+          targetedTeammateId = candidates[cursor];
           splitArgs = targetedTeammateId
             ? ["session", "split", "-s", targetedTeammateId]
-            : ["session", "split"];
+            : buildITerm2SplitArgs(env);
         }
 
         const splitResult = commandRunner.run("it2", splitArgs, { cwd });
 
         if (!splitResult.ok) {
           if (targetedTeammateId) {
-            const listResult = commandRunner.run("it2", ["session", "list"]);
-            if (
-              listResult.ok &&
-              !listResult.stdout.includes(targetedTeammateId)
-            ) {
-              // Confirmed dead — prune and retry with the next-to-last teammate.
-              const idx = teammateSessionIds.indexOf(targetedTeammateId);
-              if (idx !== -1) {
-                teammateSessionIds.splice(idx, 1);
-              }
-              if (teammateSessionIds.length === 0) {
-                firstPaneUsed = false;
+            const { ok: listOk, ids } = listITerm2SessionIds(commandRunner);
+            if (listOk && !ids.includes(targetedTeammateId)) {
+              // Confirmed dead — advance to the next candidate; when the list is
+              // exhausted, fall back to the leader split on the next iteration.
+              cursor += 1;
+              if (cursor >= candidates.length) {
+                fellBackToLeader = true;
               }
               continue;
             }
-            // Target alive or undeterminable — don't corrupt state; degrade below.
+            // Target alive or undeterminable — don't retry blindly; degrade below.
           }
           // Best-effort, non-gating: degrade rather than throw.
           return {
@@ -596,11 +676,6 @@ export function createITerm2PaneBackend(
             )
           };
         }
-
-        if (isFirstTeammate) {
-          firstPaneUsed = true;
-        }
-        teammateSessionIds.push(paneId);
 
         // Run the visibility command (e.g. `tail -f <exec_log_path>`) inside the
         // freshly split pane. `it2 session run` takes the whole command as ONE arg
@@ -660,17 +735,9 @@ export function createITerm2PaneBackend(
         paneId
       ]);
 
-      // Clean up closure layout state REGARDLESS of the close result — even if the
-      // pane was already gone (user closed it), pruning the stale id is correct so
-      // a later split doesn't target a dead session. Empty -> reset firstPaneUsed
-      // so the next split re-targets the leader.
-      const idx = teammateSessionIds.indexOf(paneId);
-      if (idx !== -1) {
-        teammateSessionIds.splice(idx, 1);
-      }
-      if (teammateSessionIds.length === 0) {
-        firstPaneUsed = false;
-      }
+      // No closure layout state to prune: anchor candidates are derived fresh from
+      // the durable DB on each createPane, and a closed pane is marked unavailable
+      // there (markRunPaneClosed), so it is naturally excluded from future anchors.
 
       return {
         ok: result.ok,
@@ -679,6 +746,38 @@ export function createITerm2PaneBackend(
           ? undefined
           : sanitizePaneText(result.stderr || "iterm2 session close failed")
       };
+    },
+    sendToPane(pane, command) {
+      const paneId = sanitizePaneText(pane.pane_id ?? "").trim();
+      if (!paneId) {
+        return { ok: false, stdout: "", stderr: "pane_id_missing", exit_code: 1 };
+      }
+      if (!command || command.length === 0) {
+        return { ok: false, stdout: "", stderr: "empty_command", exit_code: 1 };
+      }
+
+      // Deliver a message into the teammate's LIVE codex TUI composer and SUBMIT it.
+      // Empirically the only reliable way (see research): wrap the body in an explicit
+      // BRACKETED PASTE (ESC[200~ … ESC[201~) so codex treats it as a paste-insert
+      // (never auto-submits) AND clears its paste-burst suppress window on the paste
+      // end; THEN a separate lone carriage return submits cleanly. A single
+      // `send "text\r"` is swallowed by codex's paste-burst heuristic and never
+      // submits. The body is RAW (sanitizePaneText strips ESC/other control bytes so
+      // it cannot break out of the paste or inject escapes); the ESC[200~/201~ markers
+      // and the CR are added by us, outside the sanitized body.
+      // The markers are the REAL bracketed-paste control bytes — ESC (0x1B, written
+      // `\x1b`) followed by `[200~` / `[201~`, matching the empirically-PASS script's
+      // `printf '\033[200~%s\033[201~'`. A literal `[200~` (no ESC) is NOT a paste
+      // sequence and would just type those characters into the composer. sanitizePaneText
+      // strips ESC/control bytes from the BODY, so only our markers carry ESC.
+      const body = command.map((token) => sanitizePaneText(token)).join(" ");
+      const paste = `\x1b[200~${body}\x1b[201~`;
+      const pasted = commandRunner.run("it2", ["session", "send", "-s", paneId, paste]);
+      if (!pasted.ok) {
+        return pasted;
+      }
+      sleep(PANE_SUBMIT_SETTLE_MS);
+      return commandRunner.run("it2", ["session", "send", "-s", paneId, "\r"]);
     }
   };
 }
@@ -938,6 +1037,39 @@ function reconcileTmuxPane(
   return stalePaneResult("tmux", "pane_metadata_unavailable", pane);
 }
 
+// Lists live iTerm2 session ids via the MACHINE-READABLE JSON form. The default
+// `it2 session list` renders a WIDTH-TRUNCATED table (Session ID shown as e.g.
+// `DD1441FC-0CE1-44…`), so matching a full session UUID against it ALWAYS fails —
+// which made reconcile see every LIVE pane as dead and wrongly fail completed
+// teammates. `--json` emits the full `id`. ok:false means the listing itself
+// failed (it2 API off / unparseable) — i.e. liveness is UNDETERMINABLE, NOT
+// "confirmed dead".
+function listITerm2SessionIds(
+  commandRunner: PaneBackendCommandRunner
+): { ok: boolean; ids: string[] } {
+  const result = commandRunner.run("it2", ["session", "list", "--json"]);
+  if (!result.ok) {
+    return { ok: false, ids: [] };
+  }
+  try {
+    const parsed = JSON.parse(result.stdout) as unknown;
+    if (!Array.isArray(parsed)) {
+      return { ok: true, ids: [] };
+    }
+    const ids = parsed
+      .map((entry) =>
+        entry && typeof entry === "object"
+          ? (entry as { id?: unknown }).id
+          : undefined
+      )
+      .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+      .map((id) => id.trim());
+    return { ok: true, ids };
+  } catch {
+    return { ok: false, ids: [] };
+  }
+}
+
 function reconcileITerm2Pane(
   commandRunner: PaneBackendCommandRunner,
   context: ExecutionRunContext
@@ -952,17 +1084,16 @@ function reconcileITerm2Pane(
 
   const paneId = sanitizePaneText(pane.pane_id ?? "").trim();
   const sessionName = sanitizePaneText(pane.session_name ?? "").trim();
-  const result = commandRunner.run("it2", ["session", "list"]);
-  if (!result.ok) {
+  const { ok, ids } = listITerm2SessionIds(commandRunner);
+  if (!ok) {
     return stalePaneResult("iterm2", "iterm2 session unavailable", pane);
   }
   if (
-    outputContainsExactToken(result.stdout, paneId) ||
-    outputContainsExactToken(result.stdout, sessionName)
+    (paneId && ids.includes(paneId)) ||
+    (sessionName && ids.includes(sessionName))
   ) {
     return { status: "active", pane, deleted: false };
   }
-
   return stalePaneResult("iterm2", "iterm2 pane not found", pane);
 }
 

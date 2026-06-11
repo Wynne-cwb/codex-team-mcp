@@ -147,6 +147,13 @@ export interface DeliveryLifecycleInput {
   recipient_status: string;
   teammate_id: string;
   summary?: string | null;
+  // Full SendMessage body text, threaded IN-MEMORY ONLY to the resume context so a
+  // pane-hosted backend can inject the real message into the teammate's pane
+  // (the "做法 1" escalation closed loop). Never persisted to runs.metadata_json /
+  // events / diagnostics — only `summary` ever was, and that stays unchanged.
+  // System lifecycle notices (resume_failure_notice / lifecycle_completion) leave
+  // this unset (they only carry a summary).
+  delivery_text?: string | null;
   task_id?: string | null;
   trigger_kind?: "message" | "task_assignment";
   run_id?: string | null;
@@ -161,6 +168,10 @@ export interface ResumeRunInput extends LifecycleRunContextInput {
   message_id: string;
   recipient_status: string;
   summary?: string | null;
+  // Full SendMessage body text — see DeliveryLifecycleInput.delivery_text. Flows
+  // into the in-memory resume context (buildResumeContextMetadata) only; never
+  // persisted.
+  delivery_text?: string | null;
   task_id?: string | null;
   trigger_kind?: "message" | "task_assignment" | "manual";
 }
@@ -516,6 +527,9 @@ export class LifecycleService {
         message_id: input.message_id,
         recipient_status: input.recipient_status,
         summary: input.summary,
+        // In-memory passthrough to the resume context so a pane-hosted backend
+        // injects the FULL body (not just the 5-word summary) into the pane.
+        delivery_text: input.delivery_text,
         task_id: input.task_id,
         trigger_kind: input.trigger_kind,
         identity: input.identity
@@ -603,6 +617,16 @@ export class LifecycleService {
     }
 
     const attemptedAt = new Date().toISOString();
+    // Layout determinism for a PANE-HOSTED execution backend: when the execution
+    // backend itself opens the teammate pane (full codex TUI), it needs the
+    // team's already-open pane ids BEFORE startRun so it anchors the new split off
+    // the latest live pane (panes stack vertically) instead of re-splitting the
+    // leader. DB-derived (most-recent first); harmless/ignored by the detached
+    // backend. The overlay path also computes this later for the detached case.
+    const previousTeammatePaneIds = this.collectPreviousTeammatePaneIds(
+      input.team_id,
+      input.run_id
+    );
     const startContext = {
       run_id: input.run_id,
       team_id: input.team_id,
@@ -614,6 +638,7 @@ export class LifecycleService {
       work_classification: classification,
       isolation_kind: safety.isolation_kind,
       workspace_path: safety.status === "ready" ? safety.workspace_path : null,
+      previousTeammatePaneIds,
       metadata: {
         prompt: input.prompt ?? null,
         prompt_present: input.prompt_present,
@@ -1466,6 +1491,7 @@ export class LifecycleService {
     let workspacePath = resolvedWorkspacePath;
     let baseRevision = normalizeOptionalText(input.base_revision);
     let worktreeBranch: string | null = null;
+    let worktreeRepoRoot: string | null = null;
     let worktreeBlockedReason: string | null = null;
 
     // EXEC-04/D-01 (tightened in Phase 12): for a workspaces-capable backend the
@@ -1496,6 +1522,7 @@ export class LifecycleService {
         workspacePath = created.workspace_path;
         baseRevision = created.base_revision;
         worktreeBranch = created.branch;
+        worktreeRepoRoot = created.repo_root;
         // ISOL-02: persist the worktree branch + resolved TARGET repo root on
         // the run row (targeted UPDATEs, never rewrite metadata_json) so the TL
         // merge flow (D-04) and diagnostics resolve them. Mirrors
@@ -1525,6 +1552,7 @@ export class LifecycleService {
         ),
         isolation: normalizeOptionalText(input.isolation),
         workspace_path: workspacePath,
+        worktree_repo_root: worktreeRepoRoot,
         review_diff_artifact_path: resolvedReviewDiff,
         declared_output_path: resolvedDeclaredOutput,
         base_revision: baseRevision
@@ -1569,7 +1597,18 @@ export class LifecycleService {
       // Resolve the per-run exec log so the visible pane tails it (PANE content).
       // Falls back to undefined (empty pane, prior behavior) when no path resolves.
       const command = this.resolvePaneCommand(context, actionResult);
-      const launch = this.safeCreateVisiblePane(context, command);
+      // Layout determinism (iTerm2): pass the team's already-open pane ids
+      // (DB-derived, most-recent first) so the backend anchors the new teammate
+      // split off the latest live pane and they stack vertically — instead of
+      // every teammate re-splitting the leader because in-process state reset.
+      const previousTeammatePaneIds = this.collectPreviousTeammatePaneIds(
+        context.team_id,
+        context.run_id
+      );
+      const launch = this.safeCreateVisiblePane(
+        { ...context, previousTeammatePaneIds },
+        command
+      );
       if (launch.ok) {
         this.mergePaneMetadata(actionResult, launch.pane);
         return;
@@ -1613,6 +1652,57 @@ export class LifecycleService {
       return null;
     }
     return extractPaneMetadata(parseJsonObject(run.metadata_json));
+  }
+
+  // Layout determinism (iTerm2): the ordered (most-recent first) list of this
+  // team's already-open iTerm2 pane ids, derived from the durable DB. Handed to
+  // the pane backend as context.previousTeammatePaneIds so it anchors a new
+  // teammate split off the latest LIVE pane (panes stack vertically) instead of
+  // re-splitting the leader. DB-sourced rather than in-process closure state
+  // because the backend is re-instantiated on every Agent tool call, which reset
+  // the old closure tracking and made every teammate split the leader. Only
+  // `available` panes are returned — closed panes are marked unavailable
+  // (markRunPaneClosed) and naturally excluded. Best-effort: any query failure
+  // yields an empty list so the overlay degrades to the leader split, never throws.
+  private collectPreviousTeammatePaneIds(
+    teamId: string,
+    currentRunId: string
+  ): string[] {
+    let rows: Array<{ run_id: string; metadata_json: string }>;
+    try {
+      rows = this.options.db
+        .prepare(
+          `
+            SELECT run_id, metadata_json
+            FROM ${TABLE_NAMES.runs}
+            WHERE team_id = ? AND run_id != ?
+            ORDER BY created_at DESC, run_id DESC
+          `
+        )
+        .all(teamId, currentRunId) as Array<{
+        run_id: string;
+        metadata_json: string;
+      }>;
+    } catch {
+      return [];
+    }
+
+    const paneIds: string[] = [];
+    const seen = new Set<string>();
+    for (const row of rows) {
+      const pane = extractPaneMetadata(parseJsonObject(row.metadata_json));
+      if (
+        pane &&
+        pane.backend_type === "iterm2" &&
+        pane.availability_status === "available" &&
+        pane.pane_id &&
+        !seen.has(pane.pane_id)
+      ) {
+        seen.add(pane.pane_id);
+        paneIds.push(pane.pane_id);
+      }
+    }
+    return paneIds;
   }
 
   private safeDescribePaneAvailability(): PaneBackendMetadata | null {
@@ -2756,15 +2846,27 @@ function buildResumeContextMetadata(
   input: ResumeRunInput,
   run: DeliveryRunRow
 ): Record<string, unknown> {
+  // Thread the run's persisted pane metadata into the resume context so a
+  // PANE-HOSTED execution backend can locate the teammate's already-open pane and
+  // deliver the resume nudge into it. Harmless/ignored by the detached backend.
+  const pane = extractPaneMetadata(parseJsonObject(run.metadata_json));
   return {
     message_id: input.message_id,
     task_id: normalizeOptionalText(input.task_id),
     summary: normalizeOptionalText(input.summary),
     summary_present: Boolean(normalizeOptionalText(input.summary)),
+    // D-02: this metadata object is the IN-MEMORY input to resumeRun only — it is
+    // never persisted (updateRunLifecycle writes only the returned
+    // actionResult.metadata, i.e. `{ pane }`). So the full body rides the resume
+    // context to sendToPane without ever touching runs.metadata_json / events /
+    // diagnostics. Falls back to undefined when no body text was supplied.
+    resume_delivery_text: normalizeOptionalText(input.delivery_text) ?? undefined,
     previous_status: input.recipient_status,
     backend_run_id: backendIdFromRunOrMetadata(run, "backend_run_id"),
     backend_thread_id: backendIdFromRunOrMetadata(run, "backend_thread_id"),
-    backend_process_id: backendIdFromRunOrMetadata(run, "backend_process_id")
+    backend_process_id: backendIdFromRunOrMetadata(run, "backend_process_id"),
+    pane: pane ?? undefined,
+    backend_metadata: pane ? { pane } : undefined
   };
 }
 

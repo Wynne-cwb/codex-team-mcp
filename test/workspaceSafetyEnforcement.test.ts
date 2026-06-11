@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -232,6 +232,75 @@ describe("WorkspaceSafetyService D-01 enforcement", () => {
     }
     expect(result.isolation_kind).toBe("review_diff");
     expect(result.review_status).toBe("pending_review");
+  });
+});
+
+describe("WorkspaceSafetyService D-01 isolation boundary is the TARGET repo, not the leader/container", () => {
+  const service = new WorkspaceSafetyService();
+
+  // A real git repo nested under a (non-git) CONTAINER parent — the production
+  // multi-repo layout where the leader/container is NOT itself a repo.
+  function createContainerWithChildRepo(): { container: string; childRepo: string } {
+    const container = createTempRoot("codex-team-enforce-container-");
+    const childRepo = path.join(container, "child-repo");
+    mkdirSync(childRepo);
+    execGit(childRepo, ["init"]);
+    execGit(childRepo, ["config", "user.email", "test@example.com"]);
+    execGit(childRepo, ["config", "user.name", "Codex Test"]);
+    writeFileSync(path.join(childRepo, "tracked.txt"), "base\n");
+    execGit(childRepo, ["add", "tracked.txt"]);
+    execGit(childRepo, ["commit", "-m", "base"]);
+    return { container, childRepo };
+  }
+
+  it("returns git_worktree when workspace_path is INSIDE the container but OUTSIDE the target repo", () => {
+    const { container, childRepo } = createContainerWithChildRepo();
+    // Managed worktree storage: inside the container (mirrors
+    // <container>/.codex-team/state/worktrees-root/...) but outside the repo.
+    const workspacePath = path.join(
+      container,
+      ".codex-team",
+      "state",
+      "worktrees-root",
+      "builder-run1"
+    );
+
+    const result = service.prepareWorkspace({
+      work_classification: "code_implementation",
+      // leaderWorkspaceRoot is the container parent (the old, wrong boundary).
+      leaderWorkspaceRoot: container,
+      backendCapabilities: { supportsWorkspaces: true },
+      workspace_path: workspacePath,
+      worktree_repo_root: childRepo,
+      base_revision: "abc123"
+    });
+
+    expect(result.status).toBe("ready");
+    if (result.status !== "ready") {
+      return;
+    }
+    expect(result.isolation_kind).toBe("git_worktree");
+    expect(result.workspace_path).toBe(path.resolve(workspacePath));
+  });
+
+  it("returns blocked when workspace_path is INSIDE the target repo (would write into its working tree)", () => {
+    const { childRepo } = createContainerWithChildRepo();
+    // A path inside the target repo itself — never a safe isolation.
+    const workspacePath = path.join(childRepo, "nested", "leak");
+
+    const result = service.prepareWorkspace({
+      work_classification: "code_implementation",
+      leaderWorkspaceRoot: path.dirname(childRepo),
+      backendCapabilities: { supportsWorkspaces: true },
+      workspace_path: workspacePath,
+      worktree_repo_root: childRepo,
+      base_revision: "abc123"
+    });
+
+    // prepareGitWorktree rejects (inside target repo) → no other isolation for a
+    // worktree-capable backend → blocked, never git_worktree.
+    expect(result.status).toBe("blocked");
+    expect(result.isolation_kind).not.toBe("git_worktree");
   });
 });
 

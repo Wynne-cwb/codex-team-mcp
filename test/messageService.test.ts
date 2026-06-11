@@ -718,7 +718,7 @@ describe("MessageService.sendMessage", () => {
     context.adapter.close();
   });
 
-  it("does not leak SECRET_PHASE5_MESSAGE in lifecycle failure events", () => {
+  it("does not leak SECRET_PHASE5_MESSAGE into persisted lifecycle state on resume failure", () => {
     const context = createTeam();
     const recipientMemberId = createTeammate({
       context,
@@ -739,9 +739,27 @@ describe("MessageService.sendMessage", () => {
       identity: context.identity
     });
 
+    // D-02: the raw body never lands in any PERSISTED surface — not events, not the
+    // run's metadata_json, not member metadata. (The body is lawfully stored only
+    // in the messages table.)
     const serializedEvents = JSON.stringify(events(context.adapter.getDatabase()));
     expect(serializedEvents).not.toContain(SECRET_PHASE5_MESSAGE);
-    expect(JSON.stringify(backend.resumeCalls)).not.toContain(SECRET_PHASE5_MESSAGE);
+    const run = readRunByMember(context.adapter.getDatabase(), recipientMemberId);
+    expect(run.metadata_json).not.toContain(SECRET_PHASE5_MESSAGE);
+    expect(run.metadata_json).not.toContain("resume_delivery_text");
+    expect(
+      JSON.stringify(
+        readMemberMetadata(context.adapter.getDatabase(), recipientMemberId)
+      )
+    ).not.toContain(SECRET_PHASE5_MESSAGE);
+
+    // "做法 1": the full body DOES ride the in-memory resume context (the transient
+    // delivery channel into the teammate's pane) as resume_delivery_text — this is
+    // intended delivery, never a persisted leak.
+    expect(backend.resumeCalls).toHaveLength(1);
+    expect(backend.resumeCalls[0]?.context.metadata?.resume_delivery_text).toBe(
+      SECRET_PHASE5_MESSAGE
+    );
 
     context.adapter.close();
   });

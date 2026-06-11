@@ -5,6 +5,8 @@ import {
   codexExecLogPath,
   extractCodexDeliverable
 } from "./adapters/codexCliExecutionBackend.js";
+import { locateRolloutSessionId } from "./adapters/codexRolloutLocator.js";
+import { readRolloutStatus } from "./adapters/codexRolloutReader.js";
 import {
   createExecutionBackendFromOptions,
   extractPaneMetadata
@@ -546,24 +548,56 @@ function readRunDeliverable(input: {
   maxLength: number;
 }): string | null {
   const metadata = parseJsonObject(input.metadataJson);
-  const backendMetadata = metadata.backend_metadata;
-  const persistedPath =
-    typeof backendMetadata === "object" &&
-    backendMetadata !== null &&
-    !Array.isArray(backendMetadata)
-      ? optionalText((backendMetadata as Record<string, unknown>).exec_log_path)
+  const backendMetadata =
+    typeof metadata.backend_metadata === "object" &&
+    metadata.backend_metadata !== null &&
+    !Array.isArray(metadata.backend_metadata)
+      ? (metadata.backend_metadata as Record<string, unknown>)
       : undefined;
+  const persistedPath = backendMetadata
+    ? optionalText(backendMetadata.exec_log_path)
+    : undefined;
   const logPath =
     persistedPath ?? codexExecLogPath(input.workspaceRoot, input.runId);
 
-  let content: string;
+  let raw: string | null = null;
   try {
-    content = readFileSync(logPath, "utf8");
+    raw = extractCodexDeliverable(readFileSync(logPath, "utf8"));
   } catch {
-    return null;
+    raw = null;
   }
 
-  const raw = extractCodexDeliverable(content);
+  // Pane-hosted runs (full codex TUI) write no `codex exec --json` log; their
+  // deliverable lives in the codex rollout transcript, whose path is persisted at
+  // start (backend_metadata.rollout_path). Fall back to it ONLY when a rollout
+  // path is recorded — detached runs never set it, so their behavior is unchanged.
+  if (!raw) {
+    const rolloutPath = backendMetadata
+      ? optionalText(backendMetadata.rollout_path)
+      : undefined;
+    if (rolloutPath) {
+      raw = readRolloutStatus({ rolloutPath }).deliverable ?? null;
+    }
+  }
+
+  // Final fallback: pane-hosted runs whose rollout_path was NOT captured at start
+  // (e.g. the FIRST teammate's cold-start codex wrote session_meta AFTER the bounded
+  // startRun poll window) have no persisted rollout_path — yet their transcript still
+  // exists. RELOCATE it by the run's UNIQUE worktree cwd (metadata.workspace_path,
+  // which IS persisted), the same way reconcile does, then read the deliverable.
+  // Privacy-preserving: the locator reads only each candidate's session_meta first
+  // line. Detached runs set no workspace_path under pane mode, so this is a no-op
+  // for them and their behavior is unchanged.
+  if (!raw) {
+    const workspaceCwd = optionalText(metadata.workspace_path);
+    if (workspaceCwd) {
+      const located = locateRolloutSessionId({ workspaceCwd });
+      if (located) {
+        raw = readRolloutStatus({ rolloutPath: located.rollout_path }).deliverable ?? null;
+      }
+    }
+  }
+
   if (!raw) {
     return null;
   }

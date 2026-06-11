@@ -4,7 +4,21 @@ import type {
   ExecutionRunContext,
   ExecutionTrigger
 } from "../src/adapters/execution.js";
-import { PaneExecutionBackend } from "../src/adapters/paneExecutionBackend.js";
+import {
+  PaneExecutionBackend,
+  TEAMMATE_PREAMBLE,
+  type PaneExecutionBackendOptions
+} from "../src/adapters/paneExecutionBackend.js";
+import {
+  createCapabilityRankedBackendChain,
+  selectExecutionBackend
+} from "../src/adapters/capabilityRankedBackendChain.js";
+import { CodexCliExecutionBackend } from "../src/adapters/codexCliExecutionBackend.js";
+import type {
+  PaneBackendCommandResult,
+  PaneBackendMetadata,
+  PaneReconcileResult
+} from "../src/adapters/paneBackend.js";
 
 const runContext: ExecutionRunContext = {
   run_id: "run:alpha:builder",
@@ -22,84 +36,99 @@ const runContext: ExecutionRunContext = {
   }
 };
 
+const availablePane: PaneBackendMetadata = {
+  mode: "pane",
+  backend_type: "tmux",
+  availability_status: "available",
+  pane_id: "%12",
+  session_name: "codex-team-alpha-team",
+  window_name: "teammates",
+  socket_name: "codex-team-alpha-team-run-alpha-builder",
+  is_native: false
+};
+
 function createFakePaneBackend(input?: {
   available?: boolean;
-  stale?: boolean;
+  reconcileStatus?: PaneReconcileResult["status"];
   paneId?: string;
 }) {
-  const commands: string[][] = [];
+  const createCommands: Array<readonly string[]> = [];
   const createCalls: ExecutionRunContext[] = [];
   const reconcileCalls: ExecutionRunContext[] = [];
-  const metadata = {
-    mode: "pane",
-    backend_type: "tmux",
+  const sendCalls: Array<{
+    pane: PaneBackendMetadata;
+    command: readonly string[];
+  }> = [];
+  const pane: PaneBackendMetadata = {
+    ...availablePane,
     availability_status: input?.available === false ? "unavailable" : "available",
     degradation_reason:
       input?.available === false ? "tmux command not found" : undefined,
-    pane_id: input?.paneId ?? "%12",
-    session_name: "codex-team-alpha-team",
-    window_name: "teammates",
-    socket_name: "codex-team-alpha-team-run-alpha-builder",
-    attach_command:
-      "tmux -L codex-team-alpha-team-run-alpha-builder attach-session -t codex-team-alpha-team",
-    is_native: false
+    pane_id: input?.paneId ?? availablePane.pane_id
   };
+  const reconcileStatus = input?.reconcileStatus ?? "active";
 
   return {
-    commands,
+    createCommands,
     createCalls,
     reconcileCalls,
-    describeAvailability() {
-      return metadata;
+    sendCalls,
+    describeAvailability(): PaneBackendMetadata {
+      return pane;
     },
-    createPane(context: ExecutionRunContext, command: string[]) {
+    createPane(context: ExecutionRunContext, command?: readonly string[]) {
       createCalls.push(context);
-      commands.push(command);
-      if (input?.available === false) {
-        return { ok: false, pane: metadata };
+      if (command) {
+        createCommands.push(command);
       }
-
-      return {
-        ok: true,
-        pane: metadata,
-        thread_id: "thread-pane-1",
-        process_id: metadata.pane_id
-      };
+      if (input?.available === false) {
+        return { ok: false, pane };
+      }
+      return { ok: true, pane, process_id: pane.pane_id };
     },
-    resumePane(context: ExecutionRunContext, trigger: ExecutionTrigger, command: string[]) {
-      commands.push(command);
-      return {
-        ok: true,
-        pane: metadata,
-        thread_id:
-          typeof context.metadata?.backend_thread_id === "string"
-            ? context.metadata.backend_thread_id
-            : "thread-pane-1",
-        process_id: metadata.pane_id,
-        trigger_kind: trigger.kind
-      };
+    resumePane() {
+      return { ok: true, pane };
     },
-    reconcilePane(context: ExecutionRunContext) {
+    reconcilePane(context: ExecutionRunContext): PaneReconcileResult {
       reconcileCalls.push(context);
       return {
-        status: input?.stale ? "stale" : "active",
+        status: reconcileStatus,
         pane: {
-          ...metadata,
-          availability_status: input?.stale ? "degraded" : "available",
-          degradation_reason: input?.stale
-            ? "pane metadata no longer maps to a live pane"
-            : undefined
+          ...pane,
+          availability_status:
+            reconcileStatus === "active" ? "available" : "degraded",
+          degradation_reason:
+            reconcileStatus === "active"
+              ? undefined
+              : "pane metadata no longer maps to a live pane"
         },
         deleted: false
       };
     },
     closePane() {
-      return { ok: true, pane_id: metadata.pane_id };
+      return { ok: true, pane_id: pane.pane_id };
+    },
+    sendToPane(
+      target: PaneBackendMetadata,
+      command: readonly string[]
+    ): PaneBackendCommandResult {
+      sendCalls.push({ pane: target, command });
+      return { ok: true, stdout: "", stderr: "", exit_code: 0 };
     }
   };
 }
 
-describe("PaneExecutionBackend", () => {
+const durableOptions = (
+  extra: Partial<PaneExecutionBackendOptions>
+): PaneExecutionBackendOptions => ({
+  executionClaim: "durable_start_resume_supported",
+  sleep: () => {},
+  now: () => 1000,
+  sessionPollTimeoutMs: 0,
+  ...extra
+});
+
+describe("PaneExecutionBackend (scaffold default)", () => {
   it("defaults to attach/status only and does not advertise durable start or resume", () => {
     const backend = new PaneExecutionBackend({
       paneBackend: createFakePaneBackend(),
@@ -130,214 +159,127 @@ describe("PaneExecutionBackend", () => {
       },
       limitation: "codex_session_metadata_unavailable"
     });
-    expect(startResult).toMatchObject({
-      status: "unsupported",
-      delivery_status: "backend_unavailable",
-      backend: "tmux",
-      backend_status: "not_started"
-    });
-    expect(resumeResult).toMatchObject({
-      status: "not_resumable",
-      delivery_status: "backend_unavailable",
-      backend: "tmux",
-      backend_status: "not_started"
-    });
+    expect(startResult).toMatchObject({ status: "unsupported" });
+    expect(resumeResult).toMatchObject({ status: "not_resumable" });
     expect(serializedResults).not.toContain("backend_start_attempted");
     expect(serializedResults).not.toContain("backend_resume_attempted");
   });
+});
 
-  it("starts a TeamMate run through ExecutionBackend and records pane metadata", () => {
-    const paneBackend = createFakePaneBackend();
-    const backend = new PaneExecutionBackend({
-      paneBackend,
-      executionClaim: "durable_start_resume_supported",
-      commandBuilder: {
-        buildStartCommand: () => ["codex", "exec", "--json", "bootstrap"],
-        buildResumeCommand: () => ["codex", "exec", "resume", "--json"]
+describe("PaneExecutionBackend (pane-hosted full TUI)", () => {
+  it("describes itself as available with durable start+resume when a pane backend is available", () => {
+    const backend = new PaneExecutionBackend(
+      durableOptions({ paneBackend: createFakePaneBackend() })
+    );
+
+    expect(backend.describeBackend()).toMatchObject({
+      status: "available",
+      teammateExecutionImplemented: true,
+      backend: "tmux",
+      backend_status: "running",
+      capabilities: {
+        canStart: true,
+        canResume: true,
+        canReconcile: true,
+        supportsWorkspaces: true,
+        supportsOsSandbox: true
       }
     });
+  });
 
-    const result = backend.startRun(runContext);
+  it("starts a teammate by launching the FULL codex TUI (not exec) and captures the rollout session id", () => {
+    const paneBackend = createFakePaneBackend();
+    const backend = new PaneExecutionBackend(
+      durableOptions({
+        paneBackend,
+        // Real default command builder is exercised (no commandBuilder injected).
+        locateRollout: () => ({
+          session_id: "sess-rollout-1",
+          rollout_path: "/codex/sessions/rollout-x.jsonl"
+        })
+      })
+    );
+
+    const result = backend.startRun({
+      ...runContext,
+      work_classification: "code_implementation",
+      isolation_kind: "git_worktree",
+      workspace_path: "/work/tree/run-a",
+      metadata: { prompt: "implement the feature" }
+    });
+
+    // Full interactive codex TUI: `codex -C <cwd> -a never -s workspace-write <prompt>`.
+    expect(paneBackend.createCommands).toHaveLength(1);
+    const command = paneBackend.createCommands[0];
+    expect(command).toHaveLength(8);
+    expect(command.slice(0, 7)).toEqual([
+      "codex",
+      "-C",
+      "/work/tree/run-a",
+      "-a",
+      "never",
+      "-s",
+      "workspace-write"
+    ]);
+    // The positional prompt is the behavior-contract preamble + the real task.
+    expect(command[7]).toBe(`${TEAMMATE_PREAMBLE}\n\nimplement the feature`);
+    expect(command).not.toContain("exec");
 
     expect(result).toMatchObject({
       status: "started",
       delivery_status: "backend_start_attempted",
       backend: "tmux",
       backend_status: "running",
-      thread_id: "thread-pane-1",
+      thread_id: "sess-rollout-1",
+      backend_run_id: "sess-rollout-1",
       process_id: "%12",
       metadata: {
-        pane: {
-          mode: "pane",
-          backend_type: "tmux",
-          availability_status: "available",
-          pane_id: "%12",
-          session_name: "codex-team-alpha-team",
-          window_name: "teammates",
-          socket_name: "codex-team-alpha-team-run-alpha-builder",
-          attach_command:
-            "tmux -L codex-team-alpha-team-run-alpha-builder attach-session -t codex-team-alpha-team"
-        }
-      }
-    });
-    expect(paneBackend.createCalls).toEqual([runContext]);
-  });
-
-  it("degrades to backend_unavailable when pane mode is enabled but no backend is available", () => {
-    const backend = new PaneExecutionBackend({
-      paneBackend: createFakePaneBackend({ available: false }),
-      commandBuilder: {
-        buildStartCommand: () => ["codex", "exec", "--json", "bootstrap"],
-        buildResumeCommand: () => ["codex", "exec", "resume", "--json"]
-      }
-    });
-
-    expect(backend.describeBackend()).toMatchObject({
-      status: "unavailable",
-      teammateExecutionImplemented: false,
-      backend: "tmux",
-      backend_status: "not_started",
-      capabilities: {
-        canStart: false,
-        canResume: false,
-        canReconcile: true,
-        supportsWorkspaces: true
-      },
-      limitation: expect.stringContaining("tmux")
-    });
-    expect(backend.startRun(runContext)).toMatchObject({
-      status: "unsupported",
-      delivery_status: "backend_unavailable",
-      backend: "tmux",
-      backend_status: "not_started",
-      metadata: {
-        pane: {
-          mode: "pane",
-          availability_status: "unavailable",
-          degradation_reason: "tmux command not found"
-        }
+        pane: { mode: "pane", availability_status: "available", pane_id: "%12" },
+        rollout_path: "/codex/sessions/rollout-x.jsonl"
       }
     });
   });
 
-  it("does not expose raw prompt message task description or transcript in action metadata", () => {
-    const backend = new PaneExecutionBackend({
-      paneBackend: createFakePaneBackend(),
-      commandBuilder: {
-        buildStartCommand: () => [
-          "codex",
-          "exec",
-          "--json",
-          "SECRET_PANE_PROMPT message task description transcript"
-        ],
-        buildResumeCommand: () => ["codex", "exec", "resume", "--json"]
-      }
-    });
+  it("starts WITHOUT a fabricated thread_id when no rollout session id is captured", () => {
+    const paneBackend = createFakePaneBackend();
+    const backend = new PaneExecutionBackend(
+      durableOptions({ paneBackend, locateRollout: () => null })
+    );
 
     const result = backend.startRun({
       ...runContext,
-      metadata: {
-        prompt: "SECRET_PANE_PROMPT",
-        message: "SECRET_PANE_MESSAGE",
-        task: "SECRET_PANE_TASK",
-        description: "SECRET_PANE_DESCRIPTION",
-        transcript: "SECRET_PANE_TRANSCRIPT"
-      }
+      workspace_path: "/work/tree/run-a",
+      metadata: { prompt: "do work" }
     });
-    const serialized = JSON.stringify(result.metadata);
 
-    expect(serialized).not.toContain("SECRET_PANE_PROMPT");
-    expect(serialized).not.toContain("SECRET_PANE_MESSAGE");
-    expect(serialized).not.toContain("SECRET_PANE_TASK");
-    expect(serialized).not.toContain("SECRET_PANE_DESCRIPTION");
-    expect(serialized).not.toContain("SECRET_PANE_TRANSCRIPT");
-    for (const redactedKey of [
-      "prompt",
-      "message",
-      "task",
-      "description",
-      "transcript"
-    ]) {
-      expect(result.metadata).not.toHaveProperty(redactedKey);
-    }
+    expect(result.status).toBe("started");
+    expect(result.backend_status).toBe("running");
+    expect(result.thread_id).toBeUndefined();
+    expect(result.backend_run_id).toBeUndefined();
+    // process_id still set to the pane id -> the run has durable resume metadata.
+    expect(result.process_id).toBe("%12");
   });
 
-  it("does not shell-send SendMessage content during resume", () => {
+  it("degrades to unsupported when no pane backend is available", () => {
+    const backend = new PaneExecutionBackend(
+      durableOptions({ paneBackend: createFakePaneBackend({ available: false }) })
+    );
+
+    expect(backend.describeBackend()).toMatchObject({
+      status: "unavailable",
+      capabilities: { canStart: false, canResume: false }
+    });
+    expect(backend.startRun(runContext)).toMatchObject({
+      status: "unsupported",
+      delivery_status: "backend_unavailable"
+    });
+  });
+
+  it("keeps file-modifying work behind workspace isolation", () => {
     const paneBackend = createFakePaneBackend();
-    const backend = new PaneExecutionBackend({
-      paneBackend,
-      executionClaim: "durable_start_resume_supported",
-      commandBuilder: {
-        buildStartCommand: () => ["codex", "exec", "--json", "bootstrap"],
-        buildResumeCommand: (context: ExecutionRunContext) => [
-          "codex",
-          "exec",
-          "resume",
-          "--json",
-          String(context.metadata?.backend_thread_id)
-        ]
-      }
-    });
-    const secretMessageBody = "SECRET_SENDMESSAGE_BODY";
-
-    const result = backend.resumeRun(runContext, {
-      kind: "message",
-      message_id: "message:alpha:1",
-      metadata: {
-        body: secretMessageBody
-      }
-    });
-    const commands = paneBackend.commands.flat().join(" ");
-
-    expect(result).toMatchObject({
-      status: "resumed",
-      delivery_status: "backend_resume_attempted",
-      metadata: {
-        pane: {
-          mode: "pane",
-          backend_type: "tmux"
-        }
-      }
-    });
-    expect(commands).toContain("codex exec resume --json thread-pane-1");
-    expect(commands).not.toContain(secretMessageBody);
-  });
-
-  it("reconciles stale pane metadata without deleting sessions", () => {
-    const paneBackend = createFakePaneBackend({ stale: true });
-    const backend = new PaneExecutionBackend({
-      paneBackend,
-      commandBuilder: {
-        buildStartCommand: () => ["codex", "exec", "--json", "bootstrap"],
-        buildResumeCommand: () => ["codex", "exec", "resume", "--json"]
-      }
-    });
-
-    expect(backend.reconcileRun(runContext)).toMatchObject({
-      status: "stale",
-      backend: "tmux",
-      backend_status: "stale",
-      metadata: {
-        pane: {
-          mode: "pane",
-          availability_status: "degraded",
-          degradation_reason: "pane metadata no longer maps to a live pane"
-        },
-        session_deleted: false
-      }
-    });
-    expect(paneBackend.reconcileCalls).toEqual([runContext]);
-  });
-
-  it("keeps file-modifying work behind workspace isolation or review diff requirements", () => {
-    const paneBackend = createFakePaneBackend();
-    const backend = new PaneExecutionBackend({
-      paneBackend,
-      commandBuilder: {
-        buildStartCommand: () => ["codex", "exec", "--json", "bootstrap"],
-        buildResumeCommand: () => ["codex", "exec", "resume", "--json"]
-      }
-    });
+    const backend = new PaneExecutionBackend(
+      durableOptions({ paneBackend })
+    );
 
     expect(
       backend.startRun({
@@ -349,13 +291,358 @@ describe("PaneExecutionBackend", () => {
     ).toMatchObject({
       status: "unsupported",
       delivery_status: "backend_unavailable",
-      last_error: expect.stringContaining("workspace isolation"),
+      last_error: expect.stringContaining("workspace isolation")
+    });
+    expect(paneBackend.createCommands).toHaveLength(0);
+  });
+
+  it("never exposes raw prompt / secrets in action metadata", () => {
+    const paneBackend = createFakePaneBackend();
+    const backend = new PaneExecutionBackend(
+      durableOptions({
+        paneBackend,
+        locateRollout: () => ({
+          session_id: "sess-1",
+          rollout_path: "/codex/sessions/rollout-x.jsonl"
+        })
+      })
+    );
+
+    const result = backend.startRun({
+      ...runContext,
+      work_classification: "code_implementation",
+      isolation_kind: "git_worktree",
+      workspace_path: "/work/tree/run-a",
       metadata: {
-        pane: {
-          availability_status: "degraded"
-        }
+        prompt: "SECRET_PANE_PROMPT",
+        message: "SECRET_PANE_MESSAGE",
+        task: "SECRET_PANE_TASK",
+        description: "SECRET_PANE_DESCRIPTION",
+        transcript: "SECRET_PANE_TRANSCRIPT"
       }
     });
-    expect(paneBackend.createCalls).toHaveLength(0);
+    const serialized = JSON.stringify(result.metadata);
+
+    for (const secret of [
+      "SECRET_PANE_PROMPT",
+      "SECRET_PANE_MESSAGE",
+      "SECRET_PANE_TASK",
+      "SECRET_PANE_DESCRIPTION",
+      "SECRET_PANE_TRANSCRIPT"
+    ]) {
+      expect(serialized).not.toContain(secret);
+    }
+    for (const key of ["prompt", "message", "task", "description", "transcript"]) {
+      expect(result.metadata).not.toHaveProperty(key);
+    }
+  });
+
+  it("prefixes the start prompt with the autonomous-teammate behavior contract", () => {
+    const paneBackend = createFakePaneBackend();
+    const backend = new PaneExecutionBackend(
+      durableOptions({ paneBackend, locateRollout: () => null })
+    );
+
+    backend.startRun({
+      ...runContext,
+      work_classification: "code_implementation",
+      isolation_kind: "git_worktree",
+      workspace_path: "/work/tree/run-a",
+      metadata: { prompt: "implement the feature" }
+    });
+
+    const command = paneBackend.createCommands[0];
+    const positionalPrompt = command[command.length - 1];
+    // The positional prompt opens with the preamble (escalation closed loop)...
+    expect(positionalPrompt.startsWith(TEAMMATE_PREAMBLE)).toBe(true);
+    // ...and still carries the original assigned task verbatim.
+    expect(positionalPrompt).toContain("implement the feature");
+    expect(positionalPrompt).toBe(`${TEAMMATE_PREAMBLE}\n\nimplement the feature`);
+  });
+
+  it("opens a blank TUI with no preamble when no prompt is present", () => {
+    const paneBackend = createFakePaneBackend();
+    const backend = new PaneExecutionBackend(
+      durableOptions({ paneBackend, locateRollout: () => null })
+    );
+
+    backend.startRun({
+      ...runContext,
+      work_classification: "read_only",
+      isolation_kind: "none",
+      workspace_path: "/work/tree/run-a",
+      // No `prompt` -> codex opens a blank interactive TUI, never a bare preamble.
+      metadata: {}
+    });
+
+    const command = paneBackend.createCommands[0];
+    expect(command).toEqual([
+      "codex",
+      "-C",
+      "/work/tree/run-a",
+      "-a",
+      "never",
+      "-s",
+      "read-only"
+    ]);
+    expect(command.join("\n")).not.toContain(TEAMMATE_PREAMBLE);
+  });
+});
+
+describe("PaneExecutionBackend reconcile (rollout turn-state x pane liveness)", () => {
+  const reconcileContext: ExecutionRunContext = {
+    ...runContext,
+    workspace_path: "/work/tree/run-a",
+    metadata: {
+      backend_thread_id: "sess-1",
+      backend_process_id: "%12",
+      backend_metadata: {
+        pane: availablePane,
+        rollout_path: "/codex/sessions/rollout-x.jsonl"
+      }
+    }
+  };
+
+  function backendFor(input: {
+    reconcileStatus: PaneReconcileResult["status"];
+    turn_state: "completed" | "failed" | "in_progress" | "unknown";
+    deliverable?: string;
+  }) {
+    const paneBackend = createFakePaneBackend({
+      reconcileStatus: input.reconcileStatus
+    });
+    const backend = new PaneExecutionBackend(
+      durableOptions({
+        paneBackend,
+        locateRollout: () => ({
+          session_id: "sess-1",
+          rollout_path: "/codex/sessions/rollout-x.jsonl"
+        }),
+        readRolloutStatus: () => ({
+          turn_state: input.turn_state,
+          deliverable: input.deliverable
+        })
+      })
+    );
+    return { backend, paneBackend };
+  }
+
+  it("maps a completed turn to idle and surfaces the deliverable", () => {
+    const { backend } = backendFor({
+      reconcileStatus: "active",
+      turn_state: "completed",
+      deliverable: "the final result"
+    });
+
+    expect(backend.reconcileRun(reconcileContext)).toMatchObject({
+      status: "idle",
+      backend_status: "idle",
+      thread_id: "sess-1",
+      metadata: { deliverable: "the final result", session_deleted: false }
+    });
+  });
+
+  it("maps a failed/aborted turn to failed", () => {
+    const { backend } = backendFor({
+      reconcileStatus: "active",
+      turn_state: "failed"
+    });
+
+    expect(backend.reconcileRun(reconcileContext)).toMatchObject({
+      status: "failed",
+      backend_status: "failed",
+      last_error: "codex_pane_turn_failed"
+    });
+  });
+
+  it("maps an in-progress turn with a live pane to active", () => {
+    const { backend } = backendFor({
+      reconcileStatus: "active",
+      turn_state: "in_progress"
+    });
+
+    expect(backend.reconcileRun(reconcileContext)).toMatchObject({
+      status: "active",
+      backend_status: "running"
+    });
+  });
+
+  it("maps an in-progress turn whose pane has died to failed", () => {
+    const { backend } = backendFor({
+      reconcileStatus: "stale",
+      turn_state: "in_progress"
+    });
+
+    expect(backend.reconcileRun(reconcileContext)).toMatchObject({
+      status: "failed",
+      backend_status: "failed",
+      last_error: "codex_pane_exited_without_completion"
+    });
+  });
+});
+
+describe("PaneExecutionBackend resume (text injection into the live pane)", () => {
+  const resumeContext: ExecutionRunContext = {
+    ...runContext,
+    workspace_path: "/work/tree/run-a",
+    metadata: {
+      backend_thread_id: "sess-1",
+      summary: "please continue your work",
+      backend_metadata: { pane: availablePane }
+    }
+  };
+
+  it("delivers the summary text into the existing pane via sendToPane", () => {
+    const paneBackend = createFakePaneBackend();
+    const backend = new PaneExecutionBackend(durableOptions({ paneBackend }));
+    const secretBody = "SECRET_SENDMESSAGE_BODY";
+
+    const result = backend.resumeRun(resumeContext, {
+      kind: "message",
+      message_id: "message:alpha:1",
+      metadata: { body: secretBody }
+    });
+
+    expect(result).toMatchObject({
+      status: "resumed",
+      delivery_status: "backend_resume_attempted",
+      backend: "tmux",
+      backend_status: "running",
+      thread_id: "sess-1",
+      process_id: "%12"
+    });
+    // The non-sensitive summary was typed into the pane...
+    expect(paneBackend.sendCalls).toHaveLength(1);
+    expect(paneBackend.sendCalls[0].pane.pane_id).toBe("%12");
+    expect(paneBackend.sendCalls[0].command).toEqual([
+      "please continue your work"
+    ]);
+    // ...and the raw SendMessage body was NEVER delivered.
+    const flat = JSON.stringify(paneBackend.sendCalls);
+    expect(flat).not.toContain(secretBody);
+  });
+
+  it("delivers the FULL body (resume_delivery_text) into the pane, not just the summary", () => {
+    const paneBackend = createFakePaneBackend();
+    const backend = new PaneExecutionBackend(durableOptions({ paneBackend }));
+    const fullBody =
+      "Please continue: here is the full multi-sentence answer from the human user.";
+
+    const result = backend.resumeRun(
+      {
+        ...runContext,
+        workspace_path: "/work/tree/run-a",
+        metadata: {
+          backend_thread_id: "sess-1",
+          // Both present -> the full body wins over the 5-word summary.
+          summary: "follow-up",
+          resume_delivery_text: fullBody,
+          backend_metadata: { pane: availablePane }
+        }
+      },
+      { kind: "message", message_id: "message:alpha:1" }
+    );
+
+    expect(result.status).toBe("resumed");
+    expect(paneBackend.sendCalls).toHaveLength(1);
+    // The FULL body was typed into the pane verbatim...
+    expect(paneBackend.sendCalls[0].command).toEqual([fullBody]);
+    // ...and the truncated summary was NOT what got delivered.
+    expect(paneBackend.sendCalls[0].command).not.toEqual(["follow-up"]);
+  });
+
+  it("falls back to the summary when no resume_delivery_text is present", () => {
+    const paneBackend = createFakePaneBackend();
+    const backend = new PaneExecutionBackend(durableOptions({ paneBackend }));
+
+    const result = backend.resumeRun(
+      {
+        ...runContext,
+        workspace_path: "/work/tree/run-a",
+        // Only a summary (e.g. a system lifecycle notice) -> summary is delivered.
+        metadata: {
+          backend_thread_id: "sess-1",
+          summary: "please continue your work",
+          backend_metadata: { pane: availablePane }
+        }
+      },
+      { kind: "message", message_id: "message:alpha:1" }
+    );
+
+    expect(result.status).toBe("resumed");
+    expect(paneBackend.sendCalls).toHaveLength(1);
+    expect(paneBackend.sendCalls[0].command).toEqual(["please continue your work"]);
+  });
+
+  it("gracefully reports not_resumable when the run has no live pane", () => {
+    const paneBackend = createFakePaneBackend();
+    const backend = new PaneExecutionBackend(durableOptions({ paneBackend }));
+
+    const result = backend.resumeRun(
+      {
+        ...runContext,
+        metadata: { backend_thread_id: "sess-1", summary: "continue" }
+      },
+      { kind: "message", message_id: "message:alpha:1" }
+    );
+
+    expect(result.status).toBe("not_resumable");
+    expect(paneBackend.sendCalls).toHaveLength(0);
+  });
+
+  it("gracefully reports not_resumable when no lawful resume text is available", () => {
+    const paneBackend = createFakePaneBackend();
+    const backend = new PaneExecutionBackend(durableOptions({ paneBackend }));
+
+    const result = backend.resumeRun(
+      {
+        ...runContext,
+        workspace_path: "/work/tree/run-a",
+        // pane present, but NO summary -> nothing lawful to type.
+        metadata: { backend_metadata: { pane: availablePane } }
+      },
+      { kind: "message", message_id: "message:alpha:1" }
+    );
+
+    expect(result.status).toBe("not_resumable");
+    expect(paneBackend.sendCalls).toHaveLength(0);
+  });
+});
+
+describe("execution backend selection wiring (pane-hosted rank-1, detached fallback)", () => {
+  const availableCodexRunner = {
+    run: () => ({ stdout: "", stderr: "", exitCode: 0 })
+  };
+
+  it("selects the pane-hosted backend when a pane backend is available", () => {
+    const chain = createCapabilityRankedBackendChain([
+      new PaneExecutionBackend({
+        paneBackend: createFakePaneBackend(),
+        executionClaim: "durable_start_resume_supported"
+      }),
+      new CodexCliExecutionBackend({ runner: availableCodexRunner })
+    ]);
+
+    expect(chain.describeBackend().backend).toBe("tmux");
+    expect(selectExecutionBackend(chain)).toMatchObject({
+      status: "selected",
+      backend: "tmux"
+    });
+  });
+
+  it("falls back to the detached codex backend when no pane backend is available", () => {
+    const chain = createCapabilityRankedBackendChain([
+      new PaneExecutionBackend({
+        paneBackend: createFakePaneBackend({ available: false }),
+        executionClaim: "durable_start_resume_supported"
+      }),
+      new CodexCliExecutionBackend({ runner: availableCodexRunner })
+    ]);
+
+    expect(chain.describeBackend().backend).toBe("codex_cli_exec");
+    expect(selectExecutionBackend(chain)).toMatchObject({
+      status: "selected",
+      backend: "codex_cli_exec"
+    });
   });
 });
