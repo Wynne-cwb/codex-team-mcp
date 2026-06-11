@@ -13,11 +13,14 @@ import type {
   ExecutionTrigger
 } from "../src/adapters/execution.js";
 import type {
+  PaneBackendCloseResult,
   PaneBackendMetadata,
   PaneBackendRegistry,
   PaneLaunchResult,
   PaneReconcileResult
 } from "../src/adapters/paneBackend.js";
+import { LifecycleService } from "../src/services/lifecycleService.js";
+import { createTeamDeleteHandler } from "../src/tools/teamHandlers.js";
 import { buildDiagnosticsPayload } from "../src/diagnostics.js";
 import { normalizeCallerMetadata } from "../src/context/caller.js";
 import { AgentService } from "../src/services/agentService.js";
@@ -112,20 +115,47 @@ class FakeRealExecutionBackend implements ExecutionBackend {
   }
 }
 
-// Fully featured fake pane backend with an available terminal.
+// Like FakeRealExecutionBackend, but the started run advertises the per-run codex
+// exec log path in its metadata — exactly as the real codex_cli_exec backend does.
+class FakeExecBackendWithLog extends FakeRealExecutionBackend {
+  constructor(private readonly execLogPath: string) {
+    super();
+  }
+
+  startRun(context: ExecutionRunContext): ExecutionBackendActionResult {
+    const base = super.startRun(context);
+    return {
+      ...base,
+      metadata: { ...(base.metadata ?? {}), exec_log_path: this.execLogPath }
+    };
+  }
+}
+
+// Fully featured fake pane backend with an available terminal. `closeBehavior`
+// controls closePane: "ok" -> success, "fail" -> ok:false, "throw" -> throws (to
+// exercise the best-effort teardown guard).
 class FakeAvailablePaneBackend implements PaneBackendRegistry {
   readonly createCalls: ExecutionRunContext[] = [];
+  readonly createCommands: Array<readonly string[] | undefined> = [];
   readonly resumeCalls: ExecutionRunContext[] = [];
   readonly reconcileCalls: ExecutionRunContext[] = [];
+  readonly closeCalls: PaneBackendMetadata[] = [];
 
-  constructor(private readonly pane: PaneBackendMetadata) {}
+  constructor(
+    private readonly pane: PaneBackendMetadata,
+    private readonly closeBehavior: "ok" | "fail" | "throw" = "ok"
+  ) {}
 
   describeAvailability(): PaneBackendMetadata {
     return { mode: "pane", backend_type: this.pane.backend_type, availability_status: "available" };
   }
 
-  createPane(context: ExecutionRunContext): PaneLaunchResult {
+  createPane(
+    context: ExecutionRunContext,
+    command?: readonly string[]
+  ): PaneLaunchResult {
     this.createCalls.push(context);
+    this.createCommands.push(command);
     return { ok: true, pane: this.pane };
   }
 
@@ -137,6 +167,21 @@ class FakeAvailablePaneBackend implements PaneBackendRegistry {
   reconcilePane(context: ExecutionRunContext): PaneReconcileResult {
     this.reconcileCalls.push(context);
     return { status: "active", pane: this.pane, deleted: false };
+  }
+
+  closePane(pane: PaneBackendMetadata): PaneBackendCloseResult {
+    this.closeCalls.push(pane);
+    if (this.closeBehavior === "throw") {
+      throw new Error("boom: it2 session close failed");
+    }
+    return {
+      ok: this.closeBehavior === "ok",
+      pane_id: pane.pane_id,
+      reason:
+        this.closeBehavior === "ok"
+          ? undefined
+          : "iterm2 session close failed"
+    };
   }
 }
 
@@ -166,6 +211,10 @@ class FakeUnavailablePaneBackend implements PaneBackendRegistry {
       deleted: false
     };
   }
+
+  closePane(): PaneBackendCloseResult {
+    return { ok: false, reason: "close_unsupported" };
+  }
 }
 
 // Terminal reports available, but createPane throws (PANE-02 error path).
@@ -188,6 +237,10 @@ class FakeThrowingPaneBackend implements PaneBackendRegistry {
       pane: this.describeAvailability(),
       deleted: false
     };
+  }
+
+  closePane(): PaneBackendCloseResult {
+    throw new Error("boom: tmux kill-pane failed");
   }
 }
 
@@ -603,5 +656,569 @@ describe("lifecycle pane visibility overlay", () => {
 
     expect(serialized).not.toContain(SECRET_PANE_VISIBILITY_PROMPT);
     expect(serialized).not.toContain("SECRET_PANE_SESSION_TOKEN");
+  });
+
+  it("tails the backend-reported exec log inside the visible pane (0.3.2)", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace/pane-visibility";
+    const identity = buildIdentity(workspaceRoot);
+    const execLogPath = "/tmp/custom-exec-log-location/run.jsonl";
+    const fakePane = new FakeAvailablePaneBackend({
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available",
+      pane_id: "%101",
+      session_name: "codex-team-alpha-team"
+    });
+
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    try {
+      const db = adapter.getDatabase();
+      const statePath = adapter.describeStateRoot().stateRoot;
+      new TeamService({ db, statePath }).createTeam({
+        teamName: "Alpha Team",
+        description: "Pane tail team",
+        identity
+      });
+      new AgentService({
+        db,
+        statePath,
+        executionBackend: new FakeExecBackendWithLog(execLogPath),
+        paneMode: { enabled: true },
+        paneBackend: fakePane
+      }).createAgent({
+        name: "Builder",
+        teamName: "alpha-team",
+        mode: "read",
+        prompt: SECRET_PANE_VISIBILITY_PROMPT,
+        description: "Pane tail Builder",
+        identity
+      });
+
+      // The overlay derived a `tail -f <exec_log_path>` command from the backend's
+      // reported log path and handed it to createPane.
+      expect(fakePane.createCommands).toEqual([["tail", "-f", execLogPath]]);
+    } finally {
+      adapter.close();
+    }
+  });
+
+  it("falls back to the canonical run log path when the backend reports none (0.3.2)", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace/pane-visibility";
+    const identity = buildIdentity(workspaceRoot);
+    const fakePane = new FakeAvailablePaneBackend({
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available",
+      pane_id: "%102",
+      session_name: "codex-team-alpha-team"
+    });
+
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    try {
+      const db = adapter.getDatabase();
+      const statePath = adapter.describeStateRoot().stateRoot;
+      new TeamService({ db, statePath }).createTeam({
+        teamName: "Alpha Team",
+        description: "Pane tail fallback team",
+        identity
+      });
+      // FakeRealExecutionBackend carries NO exec_log_path metadata.
+      new AgentService({
+        db,
+        statePath,
+        executionBackend: new FakeRealExecutionBackend(),
+        paneMode: { enabled: true },
+        paneBackend: fakePane
+      }).createAgent({
+        name: "Builder",
+        teamName: "alpha-team",
+        mode: "read",
+        prompt: SECRET_PANE_VISIBILITY_PROMPT,
+        description: "Pane tail fallback Builder",
+        identity
+      });
+
+      expect(fakePane.createCommands).toHaveLength(1);
+      const command = fakePane.createCommands[0];
+      expect(command?.[0]).toBe("tail");
+      expect(command?.[1]).toBe("-f");
+      // Derived from workspace_root + run_id via codexExecLogPath.
+      expect(command?.[2]).toContain(`${workspaceRoot}/.codex-team/runs/`);
+      expect(command?.[2]?.endsWith(".jsonl")).toBe(true);
+    } finally {
+      adapter.close();
+    }
+  });
+});
+
+interface RunIdsRow {
+  team_id: string;
+  member_id: string | null;
+  run_id: string;
+}
+
+// Reads a single run's identifiers. With a memberId, scopes to that member's run.
+function readRunIds(
+  db: ReturnType<DurableStateAdapter["getDatabase"]>,
+  memberId?: string
+): RunIdsRow {
+  const sql = memberId
+    ? `SELECT team_id, member_id, run_id FROM ${TABLE_NAMES.runs} WHERE member_id = ? LIMIT 1`
+    : `SELECT team_id, member_id, run_id FROM ${TABLE_NAMES.runs} LIMIT 1`;
+  const stmt = db.prepare(sql);
+  return (memberId ? stmt.get(memberId) : stmt.get()) as RunIdsRow;
+}
+
+// Pane availability for a specific member's run (null when no pane recorded).
+function readMemberPaneStatus(
+  db: ReturnType<DurableStateAdapter["getDatabase"]>,
+  memberId: string
+): string | null {
+  const row = db
+    .prepare(
+      `SELECT metadata_json FROM ${TABLE_NAMES.runs} WHERE member_id = ? LIMIT 1`
+    )
+    .get(memberId) as { metadata_json: string } | undefined;
+  if (!row) {
+    return null;
+  }
+  const pane = readPaneFromRun({
+    status: "",
+    backend_status: null,
+    backend_thread_id: null,
+    metadata_json: row.metadata_json
+  });
+  return typeof pane?.availability_status === "string"
+    ? pane.availability_status
+    : null;
+}
+
+describe("lifecycle pane teardown (TeamDelete / shutdown_request)", () => {
+  function seedAgent(input: {
+    db: ReturnType<DurableStateAdapter["getDatabase"]>;
+    statePath: string;
+    identity: ReturnType<typeof buildIdentity>;
+    paneBackend: PaneBackendRegistry;
+    name: string;
+  }): ScheduledAgentLike {
+    return new AgentService({
+      db: input.db,
+      statePath: input.statePath,
+      executionBackend: new FakeRealExecutionBackend(),
+      paneMode: { enabled: true },
+      paneBackend: input.paneBackend
+    }).createAgent({
+      name: input.name,
+      teamName: "alpha-team",
+      mode: "read",
+      prompt: SECRET_PANE_VISIBILITY_PROMPT,
+      description: `Teardown ${input.name}`,
+      identity: input.identity
+    }) as unknown as ScheduledAgentLike;
+  }
+
+  it("closePanesForTeam closes every available pane and marks each run closed", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace/pane-teardown";
+    const identity = buildIdentity(workspaceRoot);
+    const fakePane = new FakeAvailablePaneBackend({
+      mode: "pane",
+      backend_type: "iterm2",
+      availability_status: "available",
+      pane_id: "iterm-pane-1",
+      session_name: "w0t0p0:session"
+    });
+
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    try {
+      const db = adapter.getDatabase();
+      const statePath = adapter.describeStateRoot().stateRoot;
+      new TeamService({ db, statePath }).createTeam({
+        teamName: "Alpha Team",
+        description: "Teardown team",
+        identity
+      });
+      seedAgent({ db, statePath, identity, paneBackend: fakePane, name: "Builder" });
+      const { team_id } = readRunIds(db);
+
+      const summary = new LifecycleService({
+        db,
+        statePath,
+        paneBackend: fakePane
+      }).closePanesForTeam(team_id);
+
+      // The available pane was attempted and closed exactly once.
+      expect(summary).toEqual({ attempted: 1, closed: 1 });
+      expect(fakePane.closeCalls).toHaveLength(1);
+      expect(fakePane.closeCalls[0]?.pane_id).toBe("iterm-pane-1");
+
+      // The run's pane is now marked closed (unavailable + pane_closed reason).
+      const pane = readPaneFromRun(readRunRow(db));
+      expect(pane).toMatchObject({
+        availability_status: "unavailable",
+        degradation_reason: "pane_closed"
+      });
+    } finally {
+      adapter.close();
+    }
+  });
+
+  it("re-running closePanesForTeam skips already-closed panes (no double close)", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace/pane-teardown";
+    const identity = buildIdentity(workspaceRoot);
+    const fakePane = new FakeAvailablePaneBackend({
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available",
+      pane_id: "%55",
+      session_name: "codex-team-alpha-team",
+      socket_name: "codex-team-alpha-team-run"
+    });
+
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    try {
+      const db = adapter.getDatabase();
+      const statePath = adapter.describeStateRoot().stateRoot;
+      new TeamService({ db, statePath }).createTeam({
+        teamName: "Alpha Team",
+        description: "Teardown idempotency team",
+        identity
+      });
+      seedAgent({ db, statePath, identity, paneBackend: fakePane, name: "Builder" });
+      const { team_id } = readRunIds(db);
+
+      const lifecycle = new LifecycleService({ db, statePath, paneBackend: fakePane });
+      expect(lifecycle.closePanesForTeam(team_id)).toEqual({
+        attempted: 1,
+        closed: 1
+      });
+      // Second sweep finds the pane already unavailable -> nothing to do.
+      expect(lifecycle.closePanesForTeam(team_id)).toEqual({
+        attempted: 0,
+        closed: 0
+      });
+      expect(fakePane.closeCalls).toHaveLength(1);
+    } finally {
+      adapter.close();
+    }
+  });
+
+  it("closePanesForMember closes only the targeted member's pane", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace/pane-teardown";
+    const identity = buildIdentity(workspaceRoot);
+    const fakePane = new FakeAvailablePaneBackend({
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available",
+      pane_id: "%77",
+      session_name: "codex-team-alpha-team"
+    });
+
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    try {
+      const db = adapter.getDatabase();
+      const statePath = adapter.describeStateRoot().stateRoot;
+      new TeamService({ db, statePath }).createTeam({
+        teamName: "Alpha Team",
+        description: "Teardown per-member team",
+        identity
+      });
+      const builder = seedAgent({
+        db,
+        statePath,
+        identity,
+        paneBackend: fakePane,
+        name: "Builder"
+      });
+      const reviewer = seedAgent({
+        db,
+        statePath,
+        identity,
+        paneBackend: fakePane,
+        name: "Reviewer"
+      });
+      const builderMemberId = builder.debug.internal_member_id;
+      const reviewerMemberId = reviewer.debug.internal_member_id;
+      const teamId = readRunIds(db, builderMemberId).team_id;
+
+      const summary = new LifecycleService({
+        db,
+        statePath,
+        paneBackend: fakePane
+      }).closePanesForMember(teamId, builderMemberId);
+
+      expect(summary).toEqual({ attempted: 1, closed: 1 });
+      // Only the Builder's pane is now closed; the Reviewer's stays available.
+      expect(readMemberPaneStatus(db, builderMemberId)).toBe("unavailable");
+      expect(readMemberPaneStatus(db, reviewerMemberId)).toBe("available");
+    } finally {
+      adapter.close();
+    }
+  });
+
+  it("closePanesForTeam is best-effort: a throwing closePane never throws and leaves the run intact", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace/pane-teardown";
+    const identity = buildIdentity(workspaceRoot);
+    const paneMeta: PaneBackendMetadata = {
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available",
+      pane_id: "%88",
+      session_name: "codex-team-alpha-team"
+    };
+    const okPane = new FakeAvailablePaneBackend(paneMeta, "ok");
+    const throwingPane = new FakeAvailablePaneBackend(paneMeta, "throw");
+
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    try {
+      const db = adapter.getDatabase();
+      const statePath = adapter.describeStateRoot().stateRoot;
+      new TeamService({ db, statePath }).createTeam({
+        teamName: "Alpha Team",
+        description: "Teardown best-effort team",
+        identity
+      });
+      // Persist an available pane using the OK backend.
+      seedAgent({ db, statePath, identity, paneBackend: okPane, name: "Builder" });
+      const { team_id } = readRunIds(db);
+
+      // Tear down with a backend whose closePane THROWS.
+      const lifecycle = new LifecycleService({
+        db,
+        statePath,
+        paneBackend: throwingPane
+      });
+      let summary: { attempted: number; closed: number } | undefined;
+      expect(() => {
+        summary = lifecycle.closePanesForTeam(team_id);
+      }).not.toThrow();
+
+      // Attempted but not closed; the run's pane is untouched (still available).
+      expect(summary).toEqual({ attempted: 1, closed: 0 });
+      const pane = readPaneFromRun(readRunRow(db));
+      expect(pane).toMatchObject({ availability_status: "available", pane_id: "%88" });
+    } finally {
+      adapter.close();
+    }
+  });
+
+  it("SendMessage with a structured shutdown_request closes the recipient pane and reports pane_teardown", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace/pane-teardown";
+    const identity = buildIdentity(workspaceRoot);
+    const fakeExec = new FakeRealExecutionBackend();
+    const fakePane = new FakeAvailablePaneBackend({
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available",
+      pane_id: "%91",
+      session_name: "codex-team-alpha-team"
+    });
+
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    try {
+      const db = adapter.getDatabase();
+      const statePath = adapter.describeStateRoot().stateRoot;
+      new TeamService({ db, statePath }).createTeam({
+        teamName: "Alpha Team",
+        description: "Shutdown teardown team",
+        identity
+      });
+      const builder = seedAgent({
+        db,
+        statePath,
+        identity,
+        paneBackend: fakePane,
+        name: "Builder"
+      });
+
+      const result = new MessageService({
+        db,
+        statePath,
+        executionBackend: fakeExec,
+        paneMode: { enabled: true },
+        paneBackend: fakePane
+      }).sendMessage({
+        teamName: "alpha-team",
+        to: "Builder",
+        message: { type: "shutdown_request" },
+        summary: "shutdown",
+        identity
+      });
+
+      // The message is STILL persisted/queued (shutdown never skips persistence)
+      // and the teardown summary is attached.
+      expect(result.persisted).toBe(true);
+      expect(
+        (result as { pane_teardown?: { attempted: number; closed: number } })
+          .pane_teardown
+      ).toEqual({ attempted: 1, closed: 1 });
+      expect(fakePane.closeCalls).toHaveLength(1);
+      expect(readMemberPaneStatus(db, builder.debug.internal_member_id)).toBe(
+        "unavailable"
+      );
+    } finally {
+      adapter.close();
+    }
+  });
+
+  it("a normal (non-shutdown) SendMessage never tears down the pane", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace/pane-teardown";
+    const identity = buildIdentity(workspaceRoot);
+    const fakeExec = new FakeRealExecutionBackend();
+    const fakePane = new FakeAvailablePaneBackend({
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available",
+      pane_id: "%92",
+      session_name: "codex-team-alpha-team"
+    });
+
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    try {
+      const db = adapter.getDatabase();
+      const statePath = adapter.describeStateRoot().stateRoot;
+      new TeamService({ db, statePath }).createTeam({
+        teamName: "Alpha Team",
+        description: "No-teardown team",
+        identity
+      });
+      const builder = seedAgent({
+        db,
+        statePath,
+        identity,
+        paneBackend: fakePane,
+        name: "Builder"
+      });
+
+      const result = new MessageService({
+        db,
+        statePath,
+        executionBackend: fakeExec,
+        paneMode: { enabled: true },
+        paneBackend: fakePane
+      }).sendMessage({
+        teamName: "alpha-team",
+        to: "Builder",
+        message: "Please continue your work",
+        identity
+      });
+
+      expect(result.persisted).toBe(true);
+      expect(
+        (result as { pane_teardown?: unknown }).pane_teardown
+      ).toBeUndefined();
+      expect(fakePane.closeCalls).toHaveLength(0);
+      expect(readMemberPaneStatus(db, builder.debug.internal_member_id)).toBe(
+        "available"
+      );
+    } finally {
+      adapter.close();
+    }
+  });
+
+  it("shutdown teardown is best-effort: a throwing closePane still returns a persisted send", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace/pane-teardown";
+    const identity = buildIdentity(workspaceRoot);
+    const fakeExec = new FakeRealExecutionBackend();
+    const paneMeta: PaneBackendMetadata = {
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available",
+      pane_id: "%93",
+      session_name: "codex-team-alpha-team"
+    };
+    const okPane = new FakeAvailablePaneBackend(paneMeta, "ok");
+    const throwingPane = new FakeAvailablePaneBackend(paneMeta, "throw");
+
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    try {
+      const db = adapter.getDatabase();
+      const statePath = adapter.describeStateRoot().stateRoot;
+      new TeamService({ db, statePath }).createTeam({
+        teamName: "Alpha Team",
+        description: "Shutdown best-effort team",
+        identity
+      });
+      // Persist the pane with the OK backend so a live pane exists to target.
+      seedAgent({ db, statePath, identity, paneBackend: okPane, name: "Builder" });
+
+      // Send the shutdown with a backend whose closePane throws.
+      let result: ReturnType<MessageService["sendMessage"]> | undefined;
+      expect(() => {
+        result = new MessageService({
+          db,
+          statePath,
+          executionBackend: fakeExec,
+          paneMode: { enabled: true },
+          paneBackend: throwingPane
+        }).sendMessage({
+          teamName: "alpha-team",
+          to: "Builder",
+          message: { type: "shutdown_request" },
+          identity
+        });
+      }).not.toThrow();
+
+      // The send still succeeded and was persisted; the per-run close failure was
+      // swallowed (attempted but not closed) and never surfaced to the caller.
+      expect(result?.persisted).toBe(true);
+      expect(
+        (result as { pane_teardown?: { attempted: number; closed: number } })
+          .pane_teardown
+      ).toEqual({ attempted: 1, closed: 0 });
+      // The pane stays available because the close failed.
+      expect(
+        readMemberPaneStatus(
+          db,
+          readRunIds(db).member_id ?? ""
+        )
+      ).toBe("available");
+    } finally {
+      adapter.close();
+    }
+  });
+
+  it("TeamDelete archives the team and includes a best-effort pane_teardown summary", async () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = path.join(stateRoot, "workspace");
+    const identity = buildIdentity(workspaceRoot);
+
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    try {
+      const db = adapter.getDatabase();
+      const statePath = adapter.describeStateRoot().stateRoot;
+      new TeamService({ db, statePath }).createTeam({
+        teamName: "Alpha Team",
+        description: "TeamDelete teardown team",
+        identity
+      });
+    } finally {
+      adapter.close();
+    }
+
+    const handler = createTeamDeleteHandler({ stateRoot, workspaceRoot });
+    const raw = await handler(
+      { team_name: "Alpha Team" },
+      { sessionId: "session-1", clientName: "codex" }
+    );
+    const first = raw.content[0];
+    const response = JSON.parse(
+      first?.type === "text" ? first.text : "{}"
+    ) as Record<string, unknown>;
+
+    // Archive succeeded (no error) and the response carries the teardown summary.
+    expect(response.implemented_now).toBe(true);
+    expect(response.error_code).toBeUndefined();
+    // Pane mode is off in this handler path, so teardown is a clean no-op — its
+    // mere presence proves the wiring runs before archive without breaking it.
+    expect(response.pane_teardown).toEqual({ attempted: 0, closed: 0 });
   });
 });

@@ -68,6 +68,9 @@ function createAvailableTmuxRegistry() {
     },
     reconcilePane(_context: ExecutionRunContext) {
       return { status: "active", pane: metadata, deleted: false };
+    },
+    closePane(_pane: unknown) {
+      return { ok: true, pane_id: metadata.pane_id };
     }
   };
 }

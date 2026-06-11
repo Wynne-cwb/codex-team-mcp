@@ -88,6 +88,9 @@ function seedPaneModeState(stateRoot: string, workspaceRoot: string): void {
               },
               deleted: false
             };
+          },
+          closePane() {
+            return { ok: true, pane_id: "%3" };
           }
         }
       })

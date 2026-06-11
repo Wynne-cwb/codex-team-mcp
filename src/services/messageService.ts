@@ -11,7 +11,8 @@ import {
   LifecycleService,
   type LifecycleBackendResult,
   type LifecycleDeliveryResult,
-  type LifecycleMetadataResult
+  type LifecycleMetadataResult,
+  type PaneTeardownSummary
 } from "./lifecycleService.js";
 import { MemberResolver } from "./memberResolver.js";
 import type { MemberResolutionResult, ResolvedMember } from "./memberResolver.js";
@@ -78,6 +79,9 @@ export interface PersistedMessageResult {
   // to completion (member finalized to idle).
   turn_completed?: boolean;
   final_status?: "idle";
+  // Pane teardown summary, present only when a structured shutdown_request closed
+  // the recipient's pane(s). Best-effort and additive: absent on normal messages.
+  pane_teardown?: PaneTeardownSummary;
   backend: LifecycleBackendResult;
   lifecycle: LifecycleMetadataResult;
   debug: {
@@ -216,7 +220,7 @@ export class MessageService {
       });
     }
 
-    return this.persistResolvedMessage({
+    const result = this.persistResolvedMessage({
       teamId: team.teamId,
       teamName: team.teamName,
       sender: sender.member,
@@ -226,6 +230,25 @@ export class MessageService {
       metadata: input.metadata,
       identity: input.identity
     });
+
+    // Best-effort, non-gating pane teardown on a structured shutdown_request.
+    // The message itself is ALREADY persisted/queued above (we never skip
+    // persistence for shutdowns — the TL may want the audit trail), and member
+    // status / resume semantics are deliberately left untouched. Closing the
+    // recipient's pane is a pure side effect; any failure is swallowed so the
+    // send still returns success exactly as before.
+    if (result.persisted && isShutdownRequest(input.message)) {
+      try {
+        result.pane_teardown = this.createLifecycleService().closePanesForMember(
+          team.teamId,
+          recipient.member.member_id
+        );
+      } catch {
+        // Swallow: shutdown teardown must never fail the SendMessage.
+      }
+    }
+
+    return result;
   }
 
   persistResolvedMessage(
@@ -622,6 +645,19 @@ function triggerKindFromMetadata(
   return metadata?.message_type === "task_assignment"
     ? "task_assignment"
     : "message";
+}
+
+// A structured shutdown request: an object body whose `type` is
+// "shutdown_request". The notification helper paths (resume_failure_notice /
+// lifecycle_completion) carry a string/template body, so they can never match
+// this — confirmed: their bodies are plain strings, not {type:"shutdown_request"}.
+function isShutdownRequest(message: unknown): boolean {
+  return (
+    typeof message === "object" &&
+    message !== null &&
+    !Array.isArray(message) &&
+    (message as Record<string, unknown>).type === "shutdown_request"
+  );
 }
 
 // System lifecycle notices (Phase 10): these are MessageService-generated and

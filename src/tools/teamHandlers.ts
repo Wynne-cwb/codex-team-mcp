@@ -5,6 +5,11 @@ import { z, ZodError } from "zod";
 
 import { normalizeCallerMetadata } from "../context/caller.js";
 import { buildWorkspaceScopedCallerIdentity } from "../services/callerIdentity.js";
+import { ContextResolver } from "../services/contextResolver.js";
+import {
+  LifecycleService,
+  type PaneTeardownSummary
+} from "../services/lifecycleService.js";
 import {
   TeamArchiveResolutionError,
   TeamService
@@ -129,6 +134,19 @@ export function createTeamDeleteHandler(
         db: adapter.getDatabase(),
         statePath: state.stateRoot
       });
+
+      // Best-effort, non-gating pane teardown BEFORE archive: resolve the team
+      // while it is still active (archive flips its status, after which resolve
+      // would fail), then close every pane for the team. Any failure is swallowed
+      // so archiveTeam below always runs and returns exactly as before.
+      const paneTeardown = closeTeamPanesBestEffort({
+        db: adapter.getDatabase(),
+        statePath: state.stateRoot,
+        teamName: input.teamName,
+        identity,
+        options
+      });
+
       const result = service.archiveTeam({
         teamName: input.teamName,
         reason: input.reason,
@@ -137,7 +155,8 @@ export function createTeamDeleteHandler(
 
       return jsonResponse({
         implemented_now: true,
-        ...result
+        ...result,
+        ...(paneTeardown ? { pane_teardown: paneTeardown } : {})
       });
     } catch (error) {
       if (isTeamDeleteValidationFailure(error)) {
@@ -174,6 +193,37 @@ export function createTeamDeleteHandler(
       adapter.close();
     }
   };
+}
+
+// Best-effort pane teardown for TeamDelete. Returns the {attempted, closed}
+// summary on success, or undefined when the team could not be resolved or the
+// teardown threw — in which case the caller simply omits pane_teardown. This
+// NEVER throws: pane teardown is a pure side effect and must not change archive
+// behavior.
+function closeTeamPanesBestEffort(input: {
+  db: Database.Database;
+  statePath: string;
+  teamName?: string;
+  identity: WorkspaceScopedCallerIdentity;
+  options: CodexTeamServerOptions;
+}): PaneTeardownSummary | undefined {
+  try {
+    const resolved = new ContextResolver(input.db).resolveTeam({
+      teamName: input.teamName,
+      identity: input.identity
+    });
+    if (!resolved.ok) {
+      return undefined;
+    }
+
+    return new LifecycleService({
+      db: input.db,
+      statePath: input.statePath,
+      paneMode: input.options.paneMode
+    }).closePanesForTeam(resolved.team.teamId);
+  } catch {
+    return undefined;
+  }
 }
 
 function parseTeamDeleteInput(args: unknown): {

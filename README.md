@@ -227,7 +227,22 @@ TeamMerge({ "action": "merge",  "run_id": "<run>" })
 
 Pane mode adds an optional, backend-dependent visibility layer over real runs. When enabled and a supported terminal backend is available, an `Agent`-started run automatically creates or attaches a visible tmux/iTerm2-style pane and persists its attach metadata. The pane is a visibility approximation — Codex does not run *inside* the pane, and the overlay never changes the run's status, backend, or thread id. If panes are unavailable, the run degrades to an `unavailable` pane marker and core team behavior is untouched.
 
-By default, diagnostics show only an attach hint and session label; the full, copy-pasteable attach command appears under `include_debug`. Idle/stopped panes stay open so scrollback is preserved; there is no user-facing force-kill control.
+By default, diagnostics show only an attach hint and session label; the full, copy-pasteable attach command appears under `include_debug`. Idle/stopped panes stay open so scrollback is preserved. Each pane tails the TeamMate's live run log (`tail -f` of the codex exec log), and in iTerm2 the leader stays on the left while TeamMates stack vertically on the right.
+
+### Pane cleanup (teardown)
+
+Panes are closed on two explicit triggers, both best-effort and non-gating (a failed close never fails the originating call): `TeamDelete` closes every pane belonging to that team, and sending a structured `{ "type": "shutdown_request" }` message to a TeamMate (via `SendMessage`) closes that TeamMate's pane. The shutdown message is still persisted/queued as usual — closing the pane is an additional side effect and does not change member status or resume semantics. Closed panes are marked `unavailable` (`degradation_reason: "pane_closed"`) in run metadata.
+
+### iTerm2 pane setup (when running Codex CLI)
+
+The iTerm2 backend detects its terminal context from `TERM_PROGRAM` / `ITERM_SESSION_ID` and stacks TeamMate panes off the leader session. Codex does **not** forward these variables to the MCP server by default, so add them to `env_vars` for the codex-team server in `~/.codex/config.toml` (and `TMUX` / `TMUX_PANE` so the tmux backend can detect a native session too):
+
+```toml
+[mcp_servers.codex-team]
+env_vars = ["AM_API_KEY", "TERM_PROGRAM", "ITERM_SESSION_ID", "TMUX", "TMUX_PANE"]
+```
+
+Without `TERM_PROGRAM` / `ITERM_SESSION_ID`, the iTerm2 backend reports unavailable and pane mode falls back to a detached tmux session (attach-only).
 
 ## Runtime state and safety
 

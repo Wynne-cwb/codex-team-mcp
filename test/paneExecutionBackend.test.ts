@@ -92,6 +92,9 @@ function createFakePaneBackend(input?: {
         },
         deleted: false
       };
+    },
+    closePane() {
+      return { ok: true, pane_id: metadata.pane_id };
     }
   };
 }

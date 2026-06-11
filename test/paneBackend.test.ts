@@ -58,6 +58,48 @@ function createFakeCommandRunner(
   return runner;
 }
 
+// Like createFakeCommandRunner but each key maps to a QUEUE of results consumed in
+// order (the cursor caps at the last entry so over-reads reuse the final result).
+// Needed for at-fault recovery, where the SAME split target is hit twice (the
+// original spawn and the post-prune retry) yet must return different pane ids.
+function createSequencedCommandRunner(
+  responsesByKey: Record<string, CommandResult[]>
+): PaneBackendCommandRunner & { calls: CommandCall[] } {
+  const calls: CommandCall[] = [];
+  const cursors: Record<string, number> = {};
+  const runner: PaneBackendCommandRunner & { calls: CommandCall[] } = {
+    calls,
+    run(command: string, args: string[], options?: { cwd?: string }) {
+      calls.push({ command, args, cwd: options?.cwd });
+      const key = [command, ...args].join(" ");
+      const queue = responsesByKey[key];
+      let result: CommandResult | undefined;
+      if (queue && queue.length > 0) {
+        const cursor = cursors[key] ?? 0;
+        result = queue[Math.min(cursor, queue.length - 1)];
+        cursors[key] = cursor + 1;
+      }
+      if (!result || result.exitCode === 1) {
+        return {
+          ok: false,
+          stdout: result?.stdout ?? "",
+          stderr: result?.stderr ?? "command not found",
+          exit_code: result?.exitCode ?? 127
+        };
+      }
+
+      return {
+        ok: true,
+        stdout: result.stdout,
+        stderr: result.stderr ?? "",
+        exit_code: result.exitCode ?? 0
+      };
+    }
+  };
+
+  return runner;
+}
+
 const paneContext = {
   run_id: "run:alpha:builder",
   team_name: "alpha-team",
@@ -316,9 +358,12 @@ describe("pane backend detection and metadata", () => {
 
   it("claim downgrade keeps tmux attach metadata status-only without executing Codex", () => {
     const socketName = buildTmuxSocketName("alpha-team", "run-alpha-builder");
+    // 0.3.2: the command is now appended to `new-session` as a single shell-quoted
+    // `[shell-command]` arg (tmux runs it in the pane). Codex still never runs as a
+    // direct subprocess of the MCP server — only `tmux` is invoked.
     const commandRunner = createFakeCommandRunner({
       tmux: { stdout: "tmux 3.6a\n" },
-      [`tmux -L ${socketName} new-session -d -s codex-team-alpha-team -n teammates -P -F #{pane_id}`]:
+      [`tmux -L ${socketName} new-session -d -s codex-team-alpha-team -n teammates -P -F #{pane_id} 'codex' 'exec' '--json' 'SENTINEL_TMUX'`]:
         { stdout: "%12\n" }
     });
     const backend = createTmuxPaneBackend({
@@ -794,5 +839,520 @@ describe("tmux socket name bounding", () => {
       buildExternalTmuxAttachCommand({ socketName: expectedSocket, sessionName })
     );
     expect(result.pane.attach_command).toContain(`-L '${expectedSocket}'`);
+  });
+});
+
+describe("pane command execution and iTerm2 layout (0.3.2)", () => {
+  const ITERM2_ENV = {
+    TERM_PROGRAM: "iTerm.app",
+    ITERM_SESSION_ID: "w0t0p0:session"
+  };
+
+  it("stacks iTerm2 teammates: first split is `-v -s <leader>`, the next stacks off the prior teammate without -v", () => {
+    const commandRunner = createFakeCommandRunner({
+      "it2 session list": { stdout: "iTerm2 Sessions\n" },
+      "it2 session split -v -s session": {
+        stdout: "Created new pane: pane-1\n"
+      },
+      "it2 session split -s pane-1": { stdout: "Created new pane: pane-2\n" }
+    });
+    const backend = createITerm2PaneBackend({
+      env: ITERM2_ENV,
+      commandRunner
+    });
+
+    const first = backend.createPane(paneContext);
+    const second = backend.createPane(paneContext);
+
+    expect(first.pane.pane_id).toBe("pane-1");
+    expect(second.pane.pane_id).toBe("pane-2");
+
+    const splitCalls = commandRunner.calls.filter(
+      (call) =>
+        call.command === "it2" &&
+        call.args[0] === "session" &&
+        call.args[1] === "split"
+    );
+    // First teammate splits the leader vertically (leader on the left).
+    expect(splitCalls[0]?.args).toEqual([
+      "session",
+      "split",
+      "-v",
+      "-s",
+      "session"
+    ]);
+    // Second teammate stacks off the FIRST teammate session and is NOT vertical —
+    // this is the fix for the v1 bug where every teammate re-split the leader and
+    // piled up horizontally.
+    expect(splitCalls[1]?.args).toEqual(["session", "split", "-s", "pane-1"]);
+    expect(splitCalls[1]?.args).not.toContain("-v");
+  });
+
+  it("runs the visibility command inside the new iTerm2 pane via `it2 session run`", () => {
+    const logPath = "/workspace/.codex-team/runs/run.jsonl";
+    const cmdStr = `'tail' '-f' '${logPath}'`;
+    const commandRunner = createFakeCommandRunner({
+      "it2 session list": { stdout: "iTerm2 Sessions\n" },
+      "it2 session split -v -s session": {
+        stdout: "Created new pane: pane-1\n"
+      },
+      [`it2 session run -s pane-1 ${cmdStr}`]: { stdout: "" }
+    });
+    const backend = createITerm2PaneBackend({
+      env: ITERM2_ENV,
+      commandRunner
+    });
+
+    const result = backend.createPane(paneContext, ["tail", "-f", logPath]);
+
+    expect(result.ok).toBe(true);
+    expect(result.pane).toMatchObject({
+      backend_type: "iterm2",
+      availability_status: "available",
+      pane_id: "pane-1"
+    } satisfies Partial<PaneBackendMetadata>);
+    const runCall = commandRunner.calls.find(
+      (call) =>
+        call.command === "it2" &&
+        call.args[0] === "session" &&
+        call.args[1] === "run"
+    );
+    // The command is one shell-quoted string arg targeting the new pane.
+    expect(runCall?.args).toEqual(["session", "run", "-s", "pane-1", cmdStr]);
+  });
+
+  it("keeps the iTerm2 pane available (with a degradation reason) when `session run` fails", () => {
+    const commandRunner = createFakeCommandRunner({
+      "it2 session list": { stdout: "iTerm2 Sessions\n" },
+      "it2 session split -v -s session": {
+        stdout: "Created new pane: pane-1\n"
+      }
+      // No response for `session run` -> the run fails.
+    });
+    const backend = createITerm2PaneBackend({
+      env: ITERM2_ENV,
+      commandRunner
+    });
+
+    const result = backend.createPane(paneContext, [
+      "tail",
+      "-f",
+      "/workspace/.codex-team/runs/run.jsonl"
+    ]);
+
+    // Split succeeded, so the pane is still available — only the content failed.
+    expect(result.ok).toBe(true);
+    expect(result.pane).toMatchObject({
+      backend_type: "iterm2",
+      availability_status: "available",
+      pane_id: "pane-1"
+    } satisfies Partial<PaneBackendMetadata>);
+    expect(typeof result.pane.degradation_reason).toBe("string");
+  });
+
+  it("prunes a dead iTerm2 teammate session and retries off the prior one (at-fault recovery)", () => {
+    const commandRunner = createSequencedCommandRunner({
+      // `session list` serves both availability and the recovery probe; it omits
+      // pane-2 so the probe confirms pane-2 is dead.
+      "it2 session list": [{ stdout: "iTerm2 Sessions\nsession\npane-1\n" }],
+      "it2 session split -v -s session": [
+        { stdout: "Created new pane: pane-1\n" }
+      ],
+      // First call -> pane-2 (teammate #2); second call (post-prune retry) -> pane-3.
+      "it2 session split -s pane-1": [
+        { stdout: "Created new pane: pane-2\n" },
+        { stdout: "Created new pane: pane-3\n" }
+      ],
+      // Splitting off the dead teammate fails.
+      "it2 session split -s pane-2": [
+        { exitCode: 1, stderr: "no such session" }
+      ]
+    });
+    const backend = createITerm2PaneBackend({
+      env: ITERM2_ENV,
+      commandRunner
+    });
+
+    const first = backend.createPane(paneContext);
+    const second = backend.createPane(paneContext);
+    const third = backend.createPane(paneContext);
+
+    expect(first.pane.pane_id).toBe("pane-1");
+    expect(second.pane.pane_id).toBe("pane-2");
+    // Third spawn: split off pane-2 fails -> prune -> retry off pane-1 -> pane-3.
+    expect(third.ok).toBe(true);
+    expect(third.pane.pane_id).toBe("pane-3");
+
+    // The recovery sequence: a failed `-s pane-2` split, then a `session list`
+    // confirmation, then a retry `-s pane-1`.
+    const it2Steps = commandRunner.calls
+      .filter((call) => call.command === "it2")
+      .map((call) => call.args.join(" "));
+    const failedIdx = it2Steps.lastIndexOf("session split -s pane-2");
+    const listIdx = it2Steps.indexOf("session list", failedIdx);
+    const retryIdx = it2Steps.indexOf("session split -s pane-1", failedIdx);
+    expect(failedIdx).toBeGreaterThanOrEqual(0);
+    expect(listIdx).toBeGreaterThan(failedIdx);
+    expect(retryIdx).toBeGreaterThan(listIdx);
+  });
+
+  it("runs the visibility command in a native tmux pane via `split-window [shell-command]`", () => {
+    const logPath = "/workspace/.codex-team/runs/run.jsonl";
+    const cmdStr = `'tail' '-f' '${logPath}'`;
+    const commandRunner = createFakeCommandRunner({
+      tmux: { stdout: "tmux 3.6a\n" },
+      "tmux display-message -p #{session_name}": { stdout: "leader-session\n" },
+      "tmux display-message -p #{window_name}": { stdout: "leader-window\n" },
+      [`tmux split-window -d -P -F #{pane_id} ${cmdStr}`]: { stdout: "%42\n" }
+    });
+    const backend = createTmuxPaneBackend({
+      env: {
+        TMUX: "/tmp/tmux-501/default,123,0",
+        TMUX_PANE: "%1"
+      },
+      commandRunner
+    });
+
+    const result = backend.createPane(paneContext, ["tail", "-f", logPath]);
+
+    expect(result.ok).toBe(true);
+    expect(result.pane.pane_id).toBe("%42");
+    const splitCall = commandRunner.calls.find(
+      (call) => call.command === "tmux" && call.args[0] === "split-window"
+    );
+    expect(splitCall?.args).toEqual([
+      "split-window",
+      "-d",
+      "-P",
+      "-F",
+      "#{pane_id}",
+      cmdStr
+    ]);
+  });
+
+  it("runs the visibility command in an external tmux session via `new-session [shell-command]`", () => {
+    const socketName = buildTmuxSocketName("alpha-team", "run-alpha-builder");
+    const logPath = "/workspace/.codex-team/runs/run.jsonl";
+    const cmdStr = `'tail' '-f' '${logPath}'`;
+    const commandRunner = createFakeCommandRunner({
+      tmux: { stdout: "tmux 3.6a\n" },
+      [`tmux -L ${socketName} new-session -d -s codex-team-alpha-team -n teammates -P -F #{pane_id} ${cmdStr}`]:
+        { stdout: "%12\n" }
+    });
+    const backend = createTmuxPaneBackend({
+      env: {},
+      commandRunner,
+      stableId: "run-alpha-builder"
+    });
+
+    const result = backend.createPane(paneContext, ["tail", "-f", logPath]);
+
+    expect(result.ok).toBe(true);
+    expect(result.pane.pane_id).toBe("%12");
+    const newSessionCall = commandRunner.calls.find(
+      (call) => call.command === "tmux" && call.args.includes("new-session")
+    );
+    // The command is the LAST argv element (a single shell-command string).
+    expect(newSessionCall?.args.at(-1)).toBe(cmdStr);
+  });
+
+  it("shell-quotes a workspace log path that contains spaces as one argv element", () => {
+    const socketName = buildTmuxSocketName("alpha-team", "run-alpha-builder");
+    const spacedPath =
+      "/Users/me/Automizely Marketing/.codex-team/runs/run.jsonl";
+    const cmdStr = `'tail' '-f' '${spacedPath}'`;
+    const commandRunner = createFakeCommandRunner({
+      tmux: { stdout: "tmux 3.6a\n" },
+      [`tmux -L ${socketName} new-session -d -s codex-team-alpha-team -n teammates -P -F #{pane_id} ${cmdStr}`]:
+        { stdout: "%21\n" }
+    });
+    const backend = createTmuxPaneBackend({
+      env: {},
+      commandRunner,
+      stableId: "run-alpha-builder"
+    });
+
+    const result = backend.createPane(paneContext, ["tail", "-f", spacedPath]);
+
+    expect(result.ok).toBe(true);
+    const newSessionCall = commandRunner.calls.find(
+      (call) => call.command === "tmux" && call.args.includes("new-session")
+    );
+    const lastArg = newSessionCall?.args.at(-1);
+    // The spaced path stays inside ONE quoted token (no word-splitting).
+    expect(lastArg).toBe(cmdStr);
+    expect(lastArg).toContain(`'${spacedPath}'`);
+  });
+});
+
+describe("pane teardown (closePane)", () => {
+  const ITERM2_ENV = {
+    TERM_PROGRAM: "iTerm.app",
+    ITERM_SESSION_ID: "w0t0p0:session"
+  };
+
+  it("iTerm2 closePane closes the session via `it2 session close -f -s <id>`", () => {
+    const commandRunner = createFakeCommandRunner({
+      "it2 session list": { stdout: "iTerm2 Sessions\n" },
+      "it2 session split -v -s session": {
+        stdout: "Created new pane: pane-1\n"
+      },
+      "it2 session close -f -s pane-1": { stdout: "" }
+    });
+    const backend = createITerm2PaneBackend({ env: ITERM2_ENV, commandRunner });
+
+    const created = backend.createPane(paneContext);
+    const result = backend.closePane?.(created.pane);
+
+    expect(result).toMatchObject({ ok: true, pane_id: "pane-1" });
+    const closeCall = commandRunner.calls.find(
+      (call) =>
+        call.command === "it2" &&
+        call.args[0] === "session" &&
+        call.args[1] === "close"
+    );
+    expect(closeCall?.args).toEqual(["session", "close", "-f", "-s", "pane-1"]);
+  });
+
+  it("iTerm2 closePane prunes the tracked session so the next split re-targets the leader", () => {
+    const commandRunner = createFakeCommandRunner({
+      "it2 session list": { stdout: "iTerm2 Sessions\n" },
+      "it2 session split -v -s session": {
+        stdout: "Created new pane: pane-1\n"
+      },
+      "it2 session close -f -s pane-1": { stdout: "" }
+    });
+    const backend = createITerm2PaneBackend({ env: ITERM2_ENV, commandRunner });
+
+    const first = backend.createPane(paneContext);
+    expect(first.pane.pane_id).toBe("pane-1");
+
+    const closeResult = backend.closePane?.(first.pane);
+    expect(closeResult?.ok).toBe(true);
+
+    // After close+prune the tracked teammate list is empty, so the next split
+    // starts fresh from the leader (`-v -s session`) and never tries to stack off
+    // the now-closed pane-1.
+    const second = backend.createPane(paneContext);
+    expect(second.pane.pane_id).toBe("pane-1");
+
+    const stackedOffClosed = commandRunner.calls.filter(
+      (call) =>
+        call.command === "it2" &&
+        call.args.join(" ") === "session split -s pane-1"
+    );
+    expect(stackedOffClosed).toHaveLength(0);
+
+    const splitCalls = commandRunner.calls.filter(
+      (call) =>
+        call.command === "it2" &&
+        call.args[0] === "session" &&
+        call.args[1] === "split"
+    );
+    expect(splitCalls[0]?.args).toEqual([
+      "session",
+      "split",
+      "-v",
+      "-s",
+      "session"
+    ]);
+    expect(splitCalls[1]?.args).toEqual([
+      "session",
+      "split",
+      "-v",
+      "-s",
+      "session"
+    ]);
+  });
+
+  it("iTerm2 closePane prunes even when the close command fails (pane already gone)", () => {
+    const commandRunner = createFakeCommandRunner({
+      "it2 session list": { stdout: "iTerm2 Sessions\n" },
+      "it2 session split -v -s session": {
+        stdout: "Created new pane: pane-1\n"
+      }
+      // No response for `session close` -> the close fails.
+    });
+    const backend = createITerm2PaneBackend({ env: ITERM2_ENV, commandRunner });
+
+    const first = backend.createPane(paneContext);
+    const result = backend.closePane?.(first.pane);
+
+    // Failure is reported with a sanitized reason, but the id is still pruned.
+    expect(result?.ok).toBe(false);
+    expect(typeof result?.reason).toBe("string");
+
+    const second = backend.createPane(paneContext);
+    const stackedOffClosed = commandRunner.calls.filter(
+      (call) =>
+        call.command === "it2" &&
+        call.args.join(" ") === "session split -s pane-1"
+    );
+    expect(stackedOffClosed).toHaveLength(0);
+    expect(second.pane.pane_id).toBe("pane-1");
+  });
+
+  it("iTerm2 closePane reports pane_id_missing when the pane has no id", () => {
+    const commandRunner = createFakeCommandRunner({
+      "it2 session list": { stdout: "iTerm2 Sessions\n" }
+    });
+    const backend = createITerm2PaneBackend({ env: ITERM2_ENV, commandRunner });
+
+    const result = backend.closePane?.({
+      mode: "pane",
+      backend_type: "iterm2",
+      availability_status: "available"
+    });
+
+    expect(result).toEqual({ ok: false, reason: "pane_id_missing" });
+    expect(
+      commandRunner.calls.some(
+        (call) => call.command === "it2" && call.args[1] === "close"
+      )
+    ).toBe(false);
+  });
+
+  it("tmux closePane kills a native pane via `kill-pane -t <id>`", () => {
+    const commandRunner = createFakeCommandRunner({
+      tmux: { stdout: "tmux 3.6a\n" },
+      "tmux kill-pane -t %42": { stdout: "" }
+    });
+    const backend = createTmuxPaneBackend({ env: {}, commandRunner });
+
+    const result = backend.closePane?.({
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available",
+      pane_id: "%42",
+      session_name: "leader-session",
+      is_native: true
+    });
+
+    expect(result).toMatchObject({ ok: true, pane_id: "%42" });
+    const killCall = commandRunner.calls.find(
+      (call) => call.command === "tmux" && call.args[0] === "kill-pane"
+    );
+    expect(killCall?.args).toEqual(["kill-pane", "-t", "%42"]);
+  });
+
+  it("tmux closePane kills an external-session pane via `-L <socket> kill-pane -t <id>`", () => {
+    const commandRunner = createFakeCommandRunner({
+      tmux: { stdout: "tmux 3.6a\n" },
+      "tmux -L codex-team-sock kill-pane -t %12": { stdout: "" }
+    });
+    const backend = createTmuxPaneBackend({ env: {}, commandRunner });
+
+    const result = backend.closePane?.({
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available",
+      pane_id: "%12",
+      session_name: "codex-team-alpha",
+      socket_name: "codex-team-sock",
+      is_native: false
+    });
+
+    expect(result).toMatchObject({ ok: true, pane_id: "%12" });
+    const killCall = commandRunner.calls.find(
+      (call) => call.command === "tmux" && call.args.includes("kill-pane")
+    );
+    expect(killCall?.args).toEqual([
+      "-L",
+      "codex-team-sock",
+      "kill-pane",
+      "-t",
+      "%12"
+    ]);
+  });
+
+  it("tmux closePane falls back to `-L <socket> kill-session -t <session>` when an external pane has no id", () => {
+    const commandRunner = createFakeCommandRunner({
+      tmux: { stdout: "tmux 3.6a\n" },
+      "tmux -L codex-team-sock kill-session -t codex-team-alpha": { stdout: "" }
+    });
+    const backend = createTmuxPaneBackend({ env: {}, commandRunner });
+
+    const result = backend.closePane?.({
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available",
+      session_name: "codex-team-alpha",
+      socket_name: "codex-team-sock",
+      is_native: false
+    });
+
+    expect(result?.ok).toBe(true);
+    const killCall = commandRunner.calls.find(
+      (call) => call.command === "tmux" && call.args.includes("kill-session")
+    );
+    expect(killCall?.args).toEqual([
+      "-L",
+      "codex-team-sock",
+      "kill-session",
+      "-t",
+      "codex-team-alpha"
+    ]);
+  });
+
+  it("tmux closePane reports pane_id_missing for a native pane without an id", () => {
+    const commandRunner = createFakeCommandRunner({
+      tmux: { stdout: "tmux 3.6a\n" }
+    });
+    const backend = createTmuxPaneBackend({ env: {}, commandRunner });
+
+    const result = backend.closePane?.({
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available"
+    });
+
+    expect(result).toEqual({ ok: false, reason: "pane_id_missing" });
+  });
+
+  it("registry.closePane routes by the pane's backend_type, not the current terminal", () => {
+    // The current terminal is plain (neither tmux nor iTerm2 env), yet we tear
+    // down panes of BOTH types — each must reach its own backend's close command.
+    const commandRunner = createFakeCommandRunner({
+      tmux: { stdout: "tmux 3.6a\n" },
+      "it2 session list": { stdout: "iTerm2 Sessions\n" },
+      "tmux kill-pane -t %42": { stdout: "" },
+      "it2 session close -f -s iterm-pane-1": { stdout: "" }
+    });
+    const registry = createPaneBackendRegistry({
+      preferredBackend: "auto",
+      env: {},
+      commandRunner
+    });
+
+    const tmuxResult = registry.closePane({
+      mode: "pane",
+      backend_type: "tmux",
+      availability_status: "available",
+      pane_id: "%42"
+    });
+    const itermResult = registry.closePane({
+      mode: "pane",
+      backend_type: "iterm2",
+      availability_status: "available",
+      pane_id: "iterm-pane-1"
+    });
+
+    expect(tmuxResult).toMatchObject({ ok: true, pane_id: "%42" });
+    expect(itermResult).toMatchObject({ ok: true, pane_id: "iterm-pane-1" });
+    // tmux pane -> tmux kill-pane
+    expect(
+      commandRunner.calls.some(
+        (call) => call.command === "tmux" && call.args[0] === "kill-pane"
+      )
+    ).toBe(true);
+    // iterm2 pane -> it2 session close
+    expect(
+      commandRunner.calls.some(
+        (call) =>
+          call.command === "it2" &&
+          call.args[0] === "session" &&
+          call.args[1] === "close"
+      )
+    ).toBe(true);
   });
 });

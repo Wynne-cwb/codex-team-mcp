@@ -12,6 +12,7 @@ import {
   ScaffoldExecutionBackend
 } from "../adapters/execution.js";
 import { extractPaneMetadata } from "../adapters/paneExecutionBackend.js";
+import { codexExecLogPath } from "../adapters/codexCliExecutionBackend.js";
 import {
   createDefaultPaneBackendRegistry,
   type PaneBackendMetadata,
@@ -230,6 +231,25 @@ export interface LifecycleDebugResult {
 interface RunMetadataRow {
   metadata_json: string;
 }
+
+// Projection for the pane-teardown sweep: only the columns needed to locate the
+// pane and to write back the closed marker via a metadata_json-only UPDATE.
+interface PaneTeardownRunRow {
+  run_id: string;
+  member_id: string | null;
+  metadata_json: string;
+}
+
+// Best-effort pane teardown summary. `attempted` counts available panes we tried
+// to close; `closed` counts the ones whose close command succeeded.
+export interface PaneTeardownSummary {
+  attempted: number;
+  closed: number;
+}
+
+// Marker written to backend_metadata.pane.degradation_reason after a successful
+// teardown so diagnostics / reconcile see the pane as intentionally closed.
+const PANE_CLOSED_REASON = "pane_closed";
 
 interface MemberMetadataRow {
   metadata_json: string;
@@ -1546,7 +1566,10 @@ export class LifecycleService {
     const availability = this.safeDescribePaneAvailability();
 
     if (availability && availability.availability_status === "available") {
-      const launch = this.safeCreateVisiblePane(context);
+      // Resolve the per-run exec log so the visible pane tails it (PANE content).
+      // Falls back to undefined (empty pane, prior behavior) when no path resolves.
+      const command = this.resolvePaneCommand(context, actionResult);
+      const launch = this.safeCreateVisiblePane(context, command);
       if (launch.ok) {
         this.mergePaneMetadata(actionResult, launch.pane);
         return;
@@ -1600,14 +1623,154 @@ export class LifecycleService {
     }
   }
 
-  private safeCreateVisiblePane(context: {
-    run_id: string;
-    team_id: string;
-    member_id: string | null;
-  } & Record<string, unknown>): { ok: boolean; pane: PaneBackendMetadata } {
+  // Best-effort teardown of every available pane belonging to a team. Used by
+  // TeamDelete. NON-GATING: any failure (no pane backend, a dead pane, a close
+  // command error) is swallowed per-run so the originating TeamDelete is never
+  // affected. Returns how many panes were attempted vs. successfully closed.
+  closePanesForTeam(teamId: string): PaneTeardownSummary {
+    return this.closePanesForRows(
+      `SELECT run_id, member_id, metadata_json FROM ${TABLE_NAMES.runs} WHERE team_id = ?`,
+      [teamId]
+    );
+  }
+
+  // Best-effort teardown of a single member's panes. Used when the TL sends a
+  // structured shutdown_request to a teammate. Same non-gating guarantees as
+  // closePanesForTeam — the SendMessage persistence is never affected.
+  closePanesForMember(teamId: string, memberId: string): PaneTeardownSummary {
+    return this.closePanesForRows(
+      `SELECT run_id, member_id, metadata_json FROM ${TABLE_NAMES.runs} WHERE team_id = ? AND member_id = ?`,
+      [teamId, memberId]
+    );
+  }
+
+  private closePanesForRows(
+    query: string,
+    params: ReadonlyArray<string>
+  ): PaneTeardownSummary {
+    // No pane backend -> nothing to tear down (pane mode off / not injected).
+    if (!this.paneBackend) {
+      return { attempted: 0, closed: 0 };
+    }
+
+    let attempted = 0;
+    let closed = 0;
+    let rows: PaneTeardownRunRow[];
+    try {
+      rows = this.options.db
+        .prepare(query)
+        .all(...params) as PaneTeardownRunRow[];
+    } catch {
+      // A failed query must not bubble up — teardown is purely additive.
+      return { attempted: 0, closed: 0 };
+    }
+
+    for (const row of rows) {
+      try {
+        const metadata = parseJsonObject(row.metadata_json);
+        const pane = extractPaneMetadata(metadata);
+        // Skip rows with no live pane: missing pane, missing id, or already
+        // marked unavailable (closed earlier / never opened).
+        if (
+          !pane ||
+          !pane.pane_id ||
+          pane.availability_status === "unavailable"
+        ) {
+          continue;
+        }
+        attempted += 1;
+        const result = this.paneBackend.closePane(pane);
+        if (result.ok) {
+          closed += 1;
+          this.markRunPaneClosed(row.run_id, metadata, pane);
+        }
+      } catch {
+        // Best-effort: a single run's failure never affects the others.
+      }
+    }
+
+    return { attempted, closed };
+  }
+
+  // Targeted, metadata_json-ONLY update marking a run's pane as closed. Touches
+  // no other column (workspace_path / review_status / merge_* are untouched so
+  // the merge-audit flow keeps working). Mirrors the canonical pane location
+  // (backend_metadata.pane); also rewrites a top-level metadata.pane if present.
+  private markRunPaneClosed(
+    runId: string,
+    metadata: Record<string, unknown>,
+    pane: PaneBackendMetadata
+  ): void {
+    const closedPane: PaneBackendMetadata = {
+      ...pane,
+      availability_status: "unavailable",
+      degradation_reason: PANE_CLOSED_REASON
+    };
+
+    const backendMetadata = isRecord(metadata.backend_metadata)
+      ? metadata.backend_metadata
+      : {};
+    const updatedMetadata: Record<string, unknown> = {
+      ...metadata,
+      backend_metadata: {
+        ...backendMetadata,
+        pane: closedPane
+      }
+    };
+    if (isRecord(metadata.pane)) {
+      updatedMetadata.pane = closedPane;
+    }
+
+    try {
+      this.options.db
+        .prepare(
+          `UPDATE ${TABLE_NAMES.runs} SET metadata_json = ? WHERE run_id = ?`
+        )
+        .run(JSON.stringify(updatedMetadata), runId);
+    } catch {
+      // The pane is already closed in the terminal; failing to persist the
+      // marker is non-fatal and must not surface to the caller.
+    }
+  }
+
+  // Resolve the visibility command for a new pane: tail the run's codex exec log
+  // so the pane shows live output. Prefers the path the backend already recorded
+  // (actionResult.metadata.exec_log_path, then backend_metadata.exec_log_path),
+  // and otherwise derives the canonical path from workspace_root + run_id. All
+  // sources are validated to non-empty strings; unresolved -> undefined (the pane
+  // opens empty, exactly as before — still best-effort).
+  private resolvePaneCommand(
+    context: { run_id: string } & Record<string, unknown>,
+    actionResult: ExecutionBackendActionResult
+  ): readonly string[] | undefined {
+    const metadata = actionResult.metadata;
+    const direct = optionalStringValue(metadata?.exec_log_path);
+    const nested =
+      metadata && isRecord(metadata.backend_metadata)
+        ? optionalStringValue(metadata.backend_metadata.exec_log_path)
+        : null;
+    const runId = optionalStringValue(context.run_id);
+    const logPath =
+      direct ??
+      nested ??
+      (runId
+        ? codexExecLogPath(optionalStringValue(context.workspace_root), runId)
+        : null);
+    return logPath ? ["tail", "-f", logPath] : undefined;
+  }
+
+  private safeCreateVisiblePane(
+    context: {
+      run_id: string;
+      team_id: string;
+      member_id: string | null;
+    } & Record<string, unknown>,
+    command?: readonly string[]
+  ): { ok: boolean; pane: PaneBackendMetadata } {
     try {
       const launch = this.paneBackend!.createPane(
-        context as unknown as Parameters<PaneBackendRegistry["createPane"]>[0]
+        context as unknown as Parameters<PaneBackendRegistry["createPane"]>[0],
+        command
       );
       return { ok: launch.ok, pane: launch.pane };
     } catch (error) {
@@ -2792,6 +2955,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function normalizeOptionalText(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
   return trimmed && trimmed.length > 0 ? trimmed : null;
+}
+
+// Coerces an unknown metadata/context value to a trimmed non-empty string, else
+// null. Used to safely read exec_log_path (typed unknown) and context fields.
+function optionalStringValue(value: unknown): string | null {
+  return typeof value === "string" ? normalizeOptionalText(value) : null;
 }
 
 function parseIsoMs(value: string | null | undefined): number | null {

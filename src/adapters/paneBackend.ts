@@ -56,6 +56,17 @@ export interface PaneBackendCommandResult {
   exit_code: number;
 }
 
+// Result of a best-effort pane teardown. `ok` reflects whether the underlying
+// close command exited 0; `reason` carries a sanitized failure note (or a
+// structural marker like "pane_id_missing" / "close_unsupported") when not ok.
+// Teardown is non-gating: callers must never let a false `ok` fail the
+// originating TeamDelete / SendMessage.
+export interface PaneBackendCloseResult {
+  ok: boolean;
+  pane_id?: string;
+  reason?: string;
+}
+
 export interface PaneBackendCommandRunner {
   run(
     command: string,
@@ -76,6 +87,10 @@ export interface PaneBackend {
     command: readonly string[]
   ): PaneLaunchResult;
   reconcilePane?(context: ExecutionRunContext): PaneReconcileResult;
+  // Optional teardown of a specific pane. Individual backends may not support
+  // it; the registry routes to the right one and reports "close_unsupported"
+  // when absent.
+  closePane?(pane: PaneBackendMetadata): PaneBackendCloseResult;
 }
 
 export interface PaneBackendRegistry {
@@ -90,6 +105,9 @@ export interface PaneBackendRegistry {
     command: readonly string[]
   ): PaneLaunchResult;
   reconcilePane(context: ExecutionRunContext): PaneReconcileResult;
+  // Best-effort pane teardown, routed by pane.backend_type so a pane created in
+  // a different terminal context than the current one is still closed correctly.
+  closePane(pane: PaneBackendMetadata): PaneBackendCloseResult;
 }
 
 export interface PaneBackendRegistryOptions {
@@ -327,6 +345,16 @@ export function createPaneBackendRegistry(
         pane,
         deleted: false
       };
+    },
+    closePane(pane) {
+      // Route by the pane's OWN backend_type, NOT selectBackend(): the pane being
+      // torn down (e.g. on TeamDelete) may have been created under a different
+      // terminal context than the one the MCP server currently runs in.
+      const target = pane.backend_type === "iterm2" ? iterm2 : tmux;
+      if (!target.closePane) {
+        return { ok: false, reason: "close_unsupported" };
+      }
+      return target.closePane(pane);
     }
   };
 }
@@ -361,7 +389,7 @@ export function createTmuxPaneBackend(
 
   return {
     describeAvailability,
-    createPane(context) {
+    createPane(context, command) {
       const availability = describeAvailability();
       if (availability.availability_status !== "available") {
         return {
@@ -371,16 +399,73 @@ export function createTmuxPaneBackend(
       }
 
       if (env.TMUX && env.TMUX_PANE) {
-        return createNativeTmuxPane(commandRunner, context, env);
+        return createNativeTmuxPane(commandRunner, context, env, command);
       }
 
       return createExternalTmuxPane(commandRunner, context, {
         sessionPrefix,
-        stableId: options.stableId
+        stableId: options.stableId,
+        command
       });
     },
     reconcilePane(context) {
       return reconcileTmuxPane(commandRunner, context);
+    },
+    closePane(pane) {
+      const paneId = sanitizePaneText(pane.pane_id ?? "").trim();
+      const socketName = sanitizePaneText(pane.socket_name ?? "").trim();
+      const sessionName = sanitizePaneText(pane.session_name ?? "").trim();
+
+      // External (detached) tmux session: target the dedicated `-L <socket>`.
+      // Prefer kill-pane on the exact pane; fall back to kill-session when the
+      // pane id is unknown but the session is.
+      if (socketName) {
+        if (paneId) {
+          const result = commandRunner.run("tmux", [
+            "-L",
+            socketName,
+            "kill-pane",
+            "-t",
+            paneId
+          ]);
+          return {
+            ok: result.ok,
+            pane_id: paneId,
+            reason: result.ok
+              ? undefined
+              : sanitizePaneText(result.stderr || "tmux kill-pane failed")
+          };
+        }
+        if (sessionName) {
+          const result = commandRunner.run("tmux", [
+            "-L",
+            socketName,
+            "kill-session",
+            "-t",
+            sessionName
+          ]);
+          return {
+            ok: result.ok,
+            reason: result.ok
+              ? undefined
+              : sanitizePaneText(result.stderr || "tmux kill-session failed")
+          };
+        }
+        return { ok: false, reason: "pane_id_missing" };
+      }
+
+      // Native tmux pane (we run inside tmux): plain kill-pane on the user server.
+      if (!paneId) {
+        return { ok: false, reason: "pane_id_missing" };
+      }
+      const result = commandRunner.run("tmux", ["kill-pane", "-t", paneId]);
+      return {
+        ok: result.ok,
+        pane_id: paneId,
+        reason: result.ok
+          ? undefined
+          : sanitizePaneText(result.stderr || "tmux kill-pane failed")
+      };
     }
   };
 }
@@ -390,6 +475,14 @@ export function createITerm2PaneBackend(
 ): PaneBackend {
   const commandRunner = options.commandRunner ?? createCommandRunner();
   const env = options.env ?? process.env;
+
+  // Instance-level (closure) teammate-session tracking. Kept per backend INSTANCE
+  // (never module-level) so the layout state survives across createPane calls
+  // within one registry yet stays isolated between independent backends and tests.
+  // commandRunner.run is synchronous (execFileSync-style), so the reference's async
+  // lock is unnecessary — the state below is mutated strictly in call order.
+  let teammateSessionIds: string[] = [];
+  let firstPaneUsed = false;
 
   function describeAvailability(): PaneBackendMetadata {
     // Require the iTerm2 env context first so we never probe it2 outside iTerm2.
@@ -422,7 +515,7 @@ export function createITerm2PaneBackend(
 
   return {
     describeAvailability,
-    createPane(context) {
+    createPane(context, command) {
       const availability = describeAvailability();
       if (availability.availability_status !== "available") {
         return {
@@ -431,49 +524,161 @@ export function createITerm2PaneBackend(
         };
       }
 
-      const runSuffix = sanitizePaneIdentifier(
-        options.stableId ?? context.run_id,
-        "run"
-      );
-      // Mirror restored-src ITermBackend.ts: split with `it2 session split` and a
-      // vertical (`-v`) split. Target the leader session via `-s <sessionId>`
-      // (parsed from ITERM_SESSION_ID) when available so the new pane lands in the
-      // same window and its returned UUID is valid; otherwise split the active
-      // session. NOTE (v1): teammate sessions are not tracked here, so every
-      // teammate splits from the leader rather than stacking off the prior
-      // teammate — acceptable per the backend's best-effort, non-gating contract.
-      const result = commandRunner.run("it2", buildITerm2SplitArgs(env), {
-        cwd: context.workspace_path ?? context.workspace_root
-      });
-      if (!result.ok) {
+      const cwd = context.workspace_path ?? context.workspace_root;
+
+      // Layout (mirrors restored-src ITermBackend.ts): leader on the left, each
+      // teammate stacked vertically on the right. The FIRST teammate splits the
+      // leader session vertically (`-v -s <leader>`, via buildITerm2SplitArgs);
+      // SUBSEQUENT teammates split OFF the previous teammate session (no `-v`) so
+      // they stack instead of re-splitting the leader (the v1 bug where every
+      // teammate piled up horizontally). `-s` targets the exact session so the
+      // layout is correct no matter which pane the user last clicked.
+      //
+      // At-fault recovery: if a targeted teammate session is dead (user closed it),
+      // `it2 session list` confirms death before we prune and retry with the next
+      // teammate (or leader). We never prune on a systemic it2 failure (Python API
+      // off, it2 gone, transient socket error), which would drain all live ids.
+      // Bounded at O(N+1) iterations: each `continue` shrinks teammateSessionIds by
+      // one; empty → firstPaneUsed resets → next iteration targets the leader.
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const isFirstTeammate = !firstPaneUsed;
+        let splitArgs: string[];
+        let targetedTeammateId: string | undefined;
+        if (isFirstTeammate) {
+          splitArgs = buildITerm2SplitArgs(env);
+        } else {
+          targetedTeammateId =
+            teammateSessionIds[teammateSessionIds.length - 1];
+          splitArgs = targetedTeammateId
+            ? ["session", "split", "-s", targetedTeammateId]
+            : ["session", "split"];
+        }
+
+        const splitResult = commandRunner.run("it2", splitArgs, { cwd });
+
+        if (!splitResult.ok) {
+          if (targetedTeammateId) {
+            const listResult = commandRunner.run("it2", ["session", "list"]);
+            if (
+              listResult.ok &&
+              !listResult.stdout.includes(targetedTeammateId)
+            ) {
+              // Confirmed dead — prune and retry with the next-to-last teammate.
+              const idx = teammateSessionIds.indexOf(targetedTeammateId);
+              if (idx !== -1) {
+                teammateSessionIds.splice(idx, 1);
+              }
+              if (teammateSessionIds.length === 0) {
+                firstPaneUsed = false;
+              }
+              continue;
+            }
+            // Target alive or undeterminable — don't corrupt state; degrade below.
+          }
+          // Best-effort, non-gating: degrade rather than throw.
+          return {
+            ok: false,
+            pane: degradedPaneMetadata(
+              "iterm2",
+              sanitizePaneText(splitResult.stderr || "iterm2 split pane failed")
+            )
+          };
+        }
+
+        const paneId = sanitizePaneText(parseITerm2SplitOutput(splitResult.stdout));
+        if (!paneId) {
+          return {
+            ok: false,
+            pane: degradedPaneMetadata(
+              "iterm2",
+              "iterm2 split pane returned no session id"
+            )
+          };
+        }
+
+        if (isFirstTeammate) {
+          firstPaneUsed = true;
+        }
+        teammateSessionIds.push(paneId);
+
+        // Run the visibility command (e.g. `tail -f <exec_log_path>`) inside the
+        // freshly split pane. `it2 session run` takes the whole command as ONE arg
+        // that it2 hands to a shell, so we pass a single shell-quoted string (paths
+        // may contain spaces). A failed `session run` keeps the (successfully
+        // split) pane and only records a degradation_reason — the split succeeded,
+        // so the pane is available; content failure must not flip it to failed.
+        let degradationReason: string | undefined;
+        if (command && command.length > 0) {
+          const runResult = commandRunner.run(
+            "it2",
+            ["session", "run", "-s", paneId, buildTailCommandString(command)],
+            { cwd }
+          );
+          if (!runResult.ok) {
+            degradationReason = sanitizePaneText(
+              runResult.stderr || "iterm2 session run failed"
+            );
+          }
+        }
+
         return {
-          ok: false,
-          pane: degradedPaneMetadata(
-            "iterm2",
-            sanitizePaneText(result.stderr || "iterm2 split pane failed")
-          )
+          ok: true,
+          pane: {
+            mode: "pane",
+            backend_type: "iterm2",
+            availability_status: "available",
+            ...(degradationReason
+              ? { degradation_reason: degradationReason }
+              : {}),
+            pane_id: paneId,
+            session_name: sanitizePaneText(env.ITERM_SESSION_ID ?? ""),
+            window_name: "iTerm2",
+            is_native: true
+          },
+          process_id: paneId
         };
       }
-
-      const paneId = sanitizePaneText(
-        parseITerm2SplitOutput(result.stdout) || result.stdout.trim() || runSuffix
-      );
-      return {
-        ok: true,
-        pane: {
-          mode: "pane",
-          backend_type: "iterm2",
-          availability_status: "available",
-          pane_id: paneId,
-          session_name: sanitizePaneText(env.ITERM_SESSION_ID ?? ""),
-          window_name: "iTerm2",
-          is_native: true
-        },
-        process_id: paneId
-      };
     },
     reconcilePane(context) {
       return reconcileITerm2Pane(commandRunner, context);
+    },
+    closePane(pane) {
+      const paneId = sanitizePaneText(pane.pane_id ?? "").trim();
+      if (!paneId) {
+        return { ok: false, reason: "pane_id_missing" };
+      }
+
+      // Mirror restored-src ITermBackend.killPane: `-f` (force) is required so
+      // iTerm2 closes without honoring the "Confirm before closing" prompt that
+      // would otherwise refuse while the pane's shell still runs.
+      const result = commandRunner.run("it2", [
+        "session",
+        "close",
+        "-f",
+        "-s",
+        paneId
+      ]);
+
+      // Clean up closure layout state REGARDLESS of the close result — even if the
+      // pane was already gone (user closed it), pruning the stale id is correct so
+      // a later split doesn't target a dead session. Empty -> reset firstPaneUsed
+      // so the next split re-targets the leader.
+      const idx = teammateSessionIds.indexOf(paneId);
+      if (idx !== -1) {
+        teammateSessionIds.splice(idx, 1);
+      }
+      if (teammateSessionIds.length === 0) {
+        firstPaneUsed = false;
+      }
+
+      return {
+        ok: result.ok,
+        pane_id: paneId,
+        reason: result.ok
+          ? undefined
+          : sanitizePaneText(result.stderr || "iterm2 session close failed")
+      };
     }
   };
 }
@@ -495,6 +700,21 @@ export function sanitizePaneIdentifier(
 
 function shellQuoteAttachArg(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * Builds a single shell-command string from a command argv by shell-quoting each
+ * token and joining with spaces. The result is passed as ONE argv element to
+ * `it2 session run` and tmux's trailing `[shell-command]` — both hand that element
+ * to `sh -c`. Quoting every token keeps workspace paths that contain spaces (e.g.
+ * "Automizely Marketing") intact and prevents word-splitting / injection when sh
+ * re-parses the string. The argv array itself reaches execFile without a shell, so
+ * passing one already-quoted string is safe.
+ */
+function buildTailCommandString(command: readonly string[]): string {
+  return command
+    .map((token) => shellQuoteAttachArg(sanitizePaneText(token)))
+    .join(" ");
 }
 
 function buildTmuxAttachCommand(input: {
@@ -525,7 +745,11 @@ export function buildExternalTmuxAttachCommand(input: {
 function createExternalTmuxPane(
   commandRunner: PaneBackendCommandRunner,
   context: ExecutionRunContext,
-  options: { sessionPrefix: string; stableId?: string }
+  options: {
+    sessionPrefix: string;
+    stableId?: string;
+    command?: readonly string[];
+  }
 ): PaneLaunchResult {
   const teamName = sanitizePaneIdentifier(context.team_name ?? "team", "team");
   const runSuffix = sanitizePaneIdentifier(
@@ -535,6 +759,10 @@ function createExternalTmuxPane(
   const socketName = buildTmuxSocketName(teamName, runSuffix);
   const sessionName = `${options.sessionPrefix}-${teamName}`;
   const windowName = DEFAULT_WINDOW_NAME;
+  // tmux runs the trailing `[shell-command]` arg in the new session's pane. Mirror
+  // restored-src TmuxBackend: append the visibility command (e.g. `tail -f <log>`)
+  // as a SINGLE shell-quoted string so paths with spaces stay intact. Omitted when
+  // no command is given, preserving the original empty-shell behavior.
   const result = commandRunner.run(
     "tmux",
     [
@@ -548,7 +776,10 @@ function createExternalTmuxPane(
       windowName,
       "-P",
       "-F",
-      "#{pane_id}"
+      "#{pane_id}",
+      ...(options.command && options.command.length > 0
+        ? [buildTailCommandString(options.command)]
+        : [])
     ],
     {
       cwd: context.workspace_path ?? context.workspace_root
@@ -589,7 +820,8 @@ function createExternalTmuxPane(
 function createNativeTmuxPane(
   commandRunner: PaneBackendCommandRunner,
   context: ExecutionRunContext,
-  env: NodeJS.ProcessEnv
+  env: NodeJS.ProcessEnv,
+  command?: readonly string[]
 ): PaneLaunchResult {
   const socketName = tmuxSocketNameFromEnv(env.TMUX);
   const sessionName = sanitizePaneText(
@@ -598,9 +830,20 @@ function createNativeTmuxPane(
   const windowName = sanitizePaneText(
     commandRunner.run("tmux", ["display-message", "-p", "#{window_name}"]).stdout.trim()
   );
+  // tmux runs the trailing `[shell-command]` arg in the new pane. Mirror
+  // restored-src TmuxBackend: append the visibility command (e.g. `tail -f <log>`)
+  // as a SINGLE shell-quoted string so paths with spaces stay intact. Omitted when
+  // no command is given, preserving the original empty-shell behavior.
   const split = commandRunner.run(
     "tmux",
-    ["split-window", "-d", "-P", "-F", "#{pane_id}"],
+    [
+      "split-window",
+      "-d",
+      "-P",
+      "-F",
+      "#{pane_id}",
+      ...(command && command.length > 0 ? [buildTailCommandString(command)] : [])
+    ],
     {
       cwd: context.workspace_path ?? context.workspace_root
     }

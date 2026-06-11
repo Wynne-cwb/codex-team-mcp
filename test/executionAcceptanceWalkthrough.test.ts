@@ -27,6 +27,7 @@ import type {
 } from "../src/adapters/execution.js";
 import { ScaffoldExecutionBackend } from "../src/adapters/execution.js";
 import type {
+  PaneBackendCloseResult,
   PaneBackendMetadata,
   PaneBackendRegistry,
   PaneLaunchResult,
@@ -163,6 +164,10 @@ class FakeUnavailablePaneBackend implements PaneBackendRegistry {
 
   reconcilePane(context: ExecutionRunContext): PaneReconcileResult {
     return { status: "unsupported", pane: this.describeAvailability(), deleted: false };
+  }
+
+  closePane(): PaneBackendCloseResult {
+    return { ok: false, reason: "close_unsupported" };
   }
 }
 
