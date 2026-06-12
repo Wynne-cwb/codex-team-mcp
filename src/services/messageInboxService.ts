@@ -272,6 +272,27 @@ export class MessageInboxService {
       .run(messageId);
   }
 
+  // Item 1 (§2a): the caller's own unread COUNT — the SAME single selection gate the
+  // unread read-model uses (`read_at IS NULL`), but a COUNT not a row fetch, so it
+  // reads NO body (D-02 safe: counts a timestamp column only). Served sub-ms by the v8
+  // covering index `idx_messages_recipient_pending`
+  // `(team_id, recipient_member_id, delivered_at, read_at)`; no new migration. Powers
+  // the `inbox_pending` field attached to every codex-team tool result.
+  countUnreadForMember(teamId: string, recipientMemberId: string): number {
+    const row = this.db
+      .prepare(
+        `
+          SELECT COUNT(*) AS unread
+          FROM ${TABLE_NAMES.messages} m
+          WHERE m.team_id = ?
+            AND m.recipient_member_id = ?
+            AND m.read_at IS NULL
+        `
+      )
+      .get(teamId, recipientMemberId) as { unread: number };
+    return typeof row?.unread === "number" ? row.unread : 0;
+  }
+
   // Atomically claim-and-stamp read_at for the unread rows addressed to a member
   // (TL auto-surface + non-peek CheckInbox, next step). Returns the rows flipped to
   // read by THIS txn so concurrent callers cannot double-surface.
@@ -334,6 +355,28 @@ export interface InboxEnvelopeMessage {
   read_at: string | null;
 }
 
+// Item 1 (§2b): compact-digest row for the size-aware TL auto-surface. Carries NO
+// full body — only `from`, `summary`, `created_at`, `message_id`, and a `preview`
+// capped at INBOX_DIGEST_PREVIEW_CHARS so the inbox block stays bounded for a large
+// backlog. The TL pulls the full bodies on demand with `CheckInbox` /
+// `CheckInbox(include_read)`. `truncated` is always true (a digest row by definition
+// elides the body).
+export interface InboxDigestMessage {
+  message_id: string;
+  from: string | null;
+  summary: string | null;
+  created_at: string;
+  preview: string;
+  truncated: true;
+}
+
+// Item 1 (§2b) canonical size-aware threshold. Full-body-inline ONLY when BOTH bounds
+// hold (count <= MAX AND total body bytes <= MAX); compact-digest when EITHER is
+// exceeded (OR semantics).
+export const INBOX_FULL_BODY_MAX_COUNT = 5;
+export const INBOX_FULL_BODY_MAX_TOTAL_BYTES = 8192; // 8 KiB
+export const INBOX_DIGEST_PREVIEW_CHARS = 200;
+
 // Extract the human-readable body text from messages.body_json (the normalized
 // {type:"text",text} shape, messageService.ts:810-819). Falls back to the raw JSON
 // string for any other shape so no content is silently dropped. Read-only on
@@ -368,6 +411,41 @@ export function toInboxEnvelopeMessage(
     created_at: row.created_at,
     read_at: row.read_at
   };
+}
+
+// Item 1 (§2b): shape an unread/history row into the compact digest message. The
+// `preview` is the first INBOX_DIGEST_PREVIEW_CHARS chars of the SAME body text the
+// full envelope would carry — read-only on body_json, never persisted (D-02 safe).
+export function toInboxDigestMessage(
+  row: UnreadInboxRow,
+  teamName: string
+): InboxDigestMessage {
+  const body = extractInboxBodyText(row.body_json);
+  return {
+    message_id: row.message_id,
+    from: inboxSenderPublicId(row, teamName),
+    summary: row.summary,
+    created_at: row.created_at,
+    preview: body.slice(0, INBOX_DIGEST_PREVIEW_CHARS),
+    truncated: true
+  };
+}
+
+// Item 1 (§2b): decide full-body-inline vs compact-digest for a claimed unread batch.
+// Full-body ONLY when BOTH bounds hold; digest when EITHER is exceeded (OR semantics).
+// Body bytes = sum of Buffer.byteLength of each row's extracted body text.
+export function shouldUseInboxDigest(rows: readonly UnreadInboxRow[]): boolean {
+  if (rows.length > INBOX_FULL_BODY_MAX_COUNT) {
+    return true;
+  }
+  let totalBytes = 0;
+  for (const row of rows) {
+    totalBytes += Buffer.byteLength(extractInboxBodyText(row.body_json));
+    if (totalBytes > INBOX_FULL_BODY_MAX_TOTAL_BYTES) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Resolve a sender row's public id, mirroring memberResolver.resolvePublicId so the

@@ -3,6 +3,30 @@
 All notable changes to `codex-team-mcp` are documented here. This project
 follows [semantic versioning](https://semver.org/).
 
+## v0.5.0 — TL 收件箱拉取优化 + 使用最佳实践 skill + 中文 README
+
+### 新增 (Features)
+- **TL 收件箱拉取优化**:每个 codex-team 工具结果新增 `inbox_pending: N` 计数(leader
+  未读数,在自动浮现 claim 之后计算,恒存在含 0);leader 自动浮现(auto-surface)改为
+  **size-aware**——小/短批量内联全文,大/重批量给紧凑 digest(发件人 + summary + 预览
+  ≤200 字 + message_id),全文按需经 `CheckInbox` 拉取。
+- **可选 `UserPromptSubmit` 收件箱提示 hook**:作为**只读、不自动安装**的仓库工件随包
+  发布(`hooks/`),在 TL 提交 prompt 时注入未读提示(仅 N>0;绝不标记已读;teammate
+  会话 / 空收件箱 no-op;绝不抛进 prompt 路径)。
+- **新增 `codex-team-best-practices` skill**:任务无关的使用最佳实践指南,覆盖 Team Lead
+  与 TeamMate 两个角色(投递心智模型、状态解码、何时建 team、隔离=合并门、收件箱纪律、
+  沟通规范),含 `references/delivery-model.md` 与 `references/troubleshooting.md`。可用
+  `npx skills add` 安装(README 有说明)。
+- **3 条核心 norm 蒸馏进工具描述**:`SendMessage`(turn-boundary 非同步)、`CheckInbox`
+  (pull-not-push + `inbox_pending` 语义)、`Agent`(隔离=合并门)——always-on 的可靠通道。
+- **新增 `README.zh-CN.md`**(简体中文全量翻译)+ 首页语言切换。
+
+### 变更 (Changes)
+- 移除旧 skill `agent-team-compatibility`,内容迁入新 skill(词汇映射)与
+  `references/troubleshooting.md`("layer unavailable" 排障)。
+- 向后兼容、无破坏性变更:`inbox_pending` 为新增字段,size-aware 仅改变渲染量,不改变
+  消息选择 / 投递语义 / D-02。
+
 ## v0.4.0 — 双向消息 + CheckInbox + turn-boundary 投递模型 + UAT 修复
 
 ### 新增 (Features)

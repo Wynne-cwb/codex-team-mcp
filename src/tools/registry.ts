@@ -16,6 +16,8 @@ import { LifecycleService } from "../services/lifecycleService.js";
 import { MemberResolver } from "../services/memberResolver.js";
 import {
   MessageInboxService,
+  shouldUseInboxDigest,
+  toInboxDigestMessage,
   toInboxEnvelopeMessage
 } from "../services/messageInboxService.js";
 import { DurableStateAdapter } from "../state/durableState.js";
@@ -70,9 +72,9 @@ const targetToolDescriptions: Record<(typeof TARGET_CLAUDE_TOOLS)[number], strin
   TeamDelete:
     "Codex Team compatibility equivalent of Claude TeamDelete. Archives durable teams and invalidates active bindings in Phase 2.",
   Agent:
-    "Codex Team compatibility equivalent of Claude Agent. Creates durable TeamMates, records lifecycle/isolation metadata, and attempts backend-dependent start and resume in Phase 5 when supported.",
+    "Codex Team compatibility equivalent of Claude Agent. Creates durable TeamMates, records lifecycle/isolation metadata, and attempts backend-dependent start and resume in Phase 5 when supported. Isolation = merge-gate: file-modifying teammate work runs in an isolated worktree (or a reviewable diff); it is NOT in the leader tree until the Team Lead reviews and merges it via TeamMerge. Treat pending_review / needs_review as gates, not as merged work.",
   SendMessage:
-    "Codex Team compatibility equivalent of Claude SendMessage. Stores persisted explicit TeamMate messages, queues running recipients for the next turn boundary, and reports Phase 5 backend start/resume outcomes.",
+    "Codex Team compatibility equivalent of Claude SendMessage. Stores persisted explicit TeamMate messages, queues running recipients for the next turn boundary, and reports Phase 5 backend start/resume outcomes. Delivery is at a turn boundary, not synchronous: the message is persisted now and delivered when the recipient is idle between turns (queued_for_next_turn while it is running, queued_while_idle while idle — both normal, neither an error). It is never injected mid-turn.",
   TaskCreate:
     "Codex Team compatibility equivalent of Claude TaskCreate. Creates durable team-scoped tasks and routes assignment notifications through Phase 5 lifecycle-aware messaging.",
   TaskUpdate:
@@ -140,7 +142,7 @@ const teamMergeDescription =
   "codex-team extension (NOT a native Claude tool): TL-driven review/merge/escalate of an isolated worktree branch back into the leader working tree. Auditable and explicit — never a silent background auto-merge. On conflict the leader is rolled back clean and the worktree is preserved; unresolved conflicts can be escalated to a human.";
 
 const checkInboxDescription =
-  "codex-team extension (NOT a native Claude tool): pull messages addressed to you (the caller) over the reliable MCP/JSON channel — full bodies, oldest first. Teammates call it after a 📬 pane nudge; the Team Lead uses it to re-read auto-surfaced messages. peek leaves messages unread; include_read returns read history; limit caps the batch. Reading marks the returned unread messages read (writes only a timestamp). Available to all roles.";
+  "codex-team extension (NOT a native Claude tool): pull messages addressed to you (the caller) over the reliable MCP/JSON channel — full bodies, oldest first. Message bodies are pulled, never pushed: you are nudged that mail exists (a 📬 pane line for teammates; an inbox_pending count + an auto-surfaced inbox block for the Team Lead), then call CheckInbox to pull the full bodies. inbox_pending is the count of your own unread messages on every codex-team tool result — pull when it is > 0. Do not poll CheckInbox speculatively — call it when nudged or at a checkpoint, never on a loop. peek leaves messages unread; include_read returns read history; limit caps the batch. Reading marks the returned unread messages read (writes only a timestamp). Available to all roles.";
 
 export const COMPATIBILITY_TOOLS: readonly CompatibilityToolDefinition[] = [
   ...TARGET_CLAUDE_TOOLS.map(createTargetToolDefinition),
@@ -363,19 +365,33 @@ function runDeliveryBackstop(
 }
 
 const LEADER_ROLE_TEAMMATE = "teammate";
+// Item 1 (§2c, SECONDARY/fallback owner): the auto-surface `inbox` block `note`
+// carries a ONE-CLAUSE version of the anti-speculative-poll hint. The PRIMARY home
+// of the full §2c text is the UserPromptSubmit hook nudge (hooks/README.md); per the
+// ownership map this note must NOT restate the full hook/`inbox_pending` mechanics,
+// only the short "don't poll on a loop" clause.
 const LEADER_INBOX_NOTE =
-  "Unread teammate→TL messages, oldest first. Now marked read.";
+  "Unread teammate→TL messages, oldest first. Now marked read. Do not poll CheckInbox on a loop — you are nudged when mail arrives.";
+// Item 1 (§2b): digest-mode note. Full bodies were elided to keep the block bounded;
+// the TL pulls them on demand. Same one-clause anti-poll hint.
+const LEADER_INBOX_DIGEST_NOTE =
+  "Unread teammate→TL messages (compact digest, oldest first). Now marked read. Pull full bodies with CheckInbox(include_read). Do not poll CheckInbox on a loop — you are nudged when mail arrives.";
 
-// Phase 16 (T6 / §3): shared post-processor. When the caller is the LEADER — i.e. the
-// env-derived role is NOT "teammate" AND the resolved caller member is leader:<teamId>
-// (memberResolver.ts:85-90,248-250) — claim & stamp read_at for the leader's unread
-// rows in ONE atomic BEGIN IMMEDIATE txn and append an `inbox` block to the tool's
-// JSON result. Teammate-role callers get NO inbox block (they receive pane nudges +
-// pull via CheckInbox). Applied to ALL codex-team tool results via this ONE wrapper.
-// Concurrent leader calls cannot double-surface: the second atomic claim flips zero
-// rows. NON-GATING: any failure leaves the originating tool result untouched. D-02:
-// writes ONLY read_at — the body shown is lawful delivery to its intended recipient
-// (the leader), never persisted into events/metadata.
+// Phase 16 (T6 / §3) + Item 1 (§2a/§2b): shared post-processor. When the caller is the
+// LEADER — i.e. the env-derived role is NOT "teammate" AND the resolved caller member
+// is leader:<teamId> (memberResolver.ts:85-90,248-250) — claim & stamp read_at for the
+// leader's unread rows in ONE atomic BEGIN IMMEDIATE txn and append an `inbox` block to
+// the tool's JSON result. Item 1 folds two behaviors into this SAME db open (no third
+// wrapper): (§2a) attach a top-level `inbox_pending` COUNT of the leader's
+// remaining-unread mail (computed POST-claim, always present incl. 0); (§2b) render the
+// `inbox` block size-aware — full bodies for a small/short batch, a compact digest
+// (capped previews, no full body) for a large/heavy one. Teammate-role callers get NO
+// inbox block and NO `inbox_pending` (they receive pane nudges + pull via CheckInbox).
+// Applied to ALL codex-team tool results via this ONE wrapper. Concurrent leader calls
+// cannot double-surface: the second atomic claim flips zero rows. NON-GATING: any
+// failure leaves the originating tool result untouched. D-02: writes ONLY read_at — the
+// body/preview shown is lawful delivery to its intended recipient (the leader), never
+// persisted into events/metadata.
 export function withLeaderInboxSurface(
   handler: RegisteredToolHandler,
   options: CodexTeamServerOptions
@@ -434,32 +450,83 @@ function surfaceLeaderInbox(
       return result;
     }
 
-    const claimed = new MessageInboxService(db).claimRead(
+    const inboxService = new MessageInboxService(db);
+    const claimed = inboxService.claimRead(
       resolved.team.teamId,
       leaderMemberId,
       new Date().toISOString()
     );
+
+    // Item 1 (§2a): compute `inbox_pending` from the POST-claim state — what remains
+    // unread for the leader AFTER this surface claimed its rows — so the counter never
+    // disagrees with the `inbox` block shown in this same result. Reuses THIS db open
+    // (no third wrapper). A COUNT only; reads no body (D-02 safe).
+    const inboxPending = inboxService.countUnreadForMember(
+      resolved.team.teamId,
+      leaderMemberId
+    );
+
     if (claimed.length === 0) {
-      return result;
+      // No new mail to surface, but still emit `inbox_pending` (typically 0) so the TL
+      // can always trust the field's presence on a leader tool result.
+      return appendInboxPending(result, inboxPending);
     }
 
-    return appendInboxBlock(result, {
-      unread_count: claimed.length,
-      messages: claimed.map((row) =>
-        toInboxEnvelopeMessage(row, resolved.team.teamName)
-      ),
-      note: LEADER_INBOX_NOTE
-    });
+    // Item 1 (§2b): size-aware rendering. Full-body inline for a small/short batch;
+    // compact digest (no body, capped preview) when the batch is large/heavy. The
+    // claim above marked the SAME rows read in either mode — digest only changes how
+    // much of each claimed row is rendered inline; the TL pulls full bodies on demand
+    // via CheckInbox(include_read).
+    const useDigest = shouldUseInboxDigest(claimed);
+    const inboxBlock: Record<string, unknown> = useDigest
+      ? {
+          unread_count: claimed.length,
+          digest: true,
+          messages: claimed.map((row) =>
+            toInboxDigestMessage(row, resolved.team.teamName)
+          ),
+          note: LEADER_INBOX_DIGEST_NOTE
+        }
+      : {
+          unread_count: claimed.length,
+          messages: claimed.map((row) =>
+            toInboxEnvelopeMessage(row, resolved.team.teamName)
+          ),
+          note: LEADER_INBOX_NOTE
+        };
+
+    return appendInboxBlock(result, inboxBlock, inboxPending);
   } finally {
     adapter.close();
   }
 }
 
-// Parse the handler's JSON result, attach the `inbox` block, re-serialize. Any
-// non-JSON / non-object payload is left exactly as the handler produced it.
+// Parse the handler's JSON result, attach the `inbox` block + the top-level
+// `inbox_pending` counter (Item 1 §2a), re-serialize. Any non-JSON / non-object
+// payload is left exactly as the handler produced it.
 function appendInboxBlock(
   result: { content: Array<{ type: "text"; text: string }> },
-  inbox: Record<string, unknown>
+  inbox: Record<string, unknown>,
+  inboxPending: number
+): { content: Array<{ type: "text"; text: string }> } {
+  return mergeTopLevel(result, { inbox, inbox_pending: inboxPending });
+}
+
+// Item 1 (§2a): attach ONLY the top-level `inbox_pending` counter (no `inbox` block)
+// — used when the leader has no newly-claimed mail this call but the counter must
+// still be present (typically 0) so the TL can always trust the field.
+function appendInboxPending(
+  result: { content: Array<{ type: "text"; text: string }> },
+  inboxPending: number
+): { content: Array<{ type: "text"; text: string }> } {
+  return mergeTopLevel(result, { inbox_pending: inboxPending });
+}
+
+// Merge top-level keys into the handler's JSON result and re-serialize. Any
+// non-JSON / non-object payload is left exactly as the handler produced it.
+function mergeTopLevel(
+  result: { content: Array<{ type: "text"; text: string }> },
+  extra: Record<string, unknown>
 ): { content: Array<{ type: "text"; text: string }> } {
   const first = result.content[0];
   if (!first || first.type !== "text") {
@@ -474,7 +541,7 @@ function appendInboxBlock(
   if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
     return result;
   }
-  const augmented = { ...(payload as Record<string, unknown>), inbox };
+  const augmented = { ...(payload as Record<string, unknown>), ...extra };
   return {
     ...result,
     content: [

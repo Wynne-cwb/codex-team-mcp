@@ -128,25 +128,68 @@ function parseCompatibilityTable(markdown: string): Map<string, Record<string, s
 }
 
 describe("docs and compatibility skill", () => {
-  it("keeps required Agent Team skill guidance", async () => {
-    const skill = await readPackageFile("skills/agent-team-compatibility/SKILL.md");
+  it("keeps required codex-team-best-practices skill guidance", async () => {
+    const skill = await readPackageFile(
+      "skills/codex-team-best-practices/SKILL.md"
+    );
+    const delivery = await readPackageFile(
+      "skills/codex-team-best-practices/references/delivery-model.md"
+    );
+    const troubleshooting = await readPackageFile(
+      "skills/codex-team-best-practices/references/troubleshooting.md"
+    );
 
+    // Frontmatter trigger (skill-creator standard): name + a pushy description
+    // that carries the "when to use" and lists the codex-team tools.
+    expect(skill).toContain("name: codex-team-best-practices");
+    expect(skill).toContain("description:");
+    expect(skill).toContain("Team Lead");
+    expect(skill).toContain("TeamMate");
     expect(skill).toContain("TeamCreate");
     expect(skill).toContain("SendMessage");
-    expect(skill).toContain("Agent Team compatibility layer unavailable");
-    expect(skill).toContain("Do not silently substitute generic subagents");
-    expect(skill).toContain("queued for the next turn boundary");
-    expect(skill).toContain("backend-dependent start and resume");
-    expect(skill).toContain("workspace review");
+    expect(skill).toContain("CheckInbox");
+    expect(skill).toContain("TeamDiagnostics");
+    expect(skill).toContain("TeamMerge");
+
+    // §1 mental model — the three load-bearing norms (also distilled into the
+    // tool descriptions as an always-on backstop).
+    expect(skill).toContain("Turn-boundary, not sync");
+    expect(skill).toContain("Pull, not push");
+    expect(skill).toContain("queued_for_next_turn");
+    expect(skill).toContain("queued_while_idle");
+
+    // §3 FINAL — subagent-first default + the 5 anchors + user-request override.
+    expect(skill).toContain("is a plain subagent enough");
+    expect(skill).toContain("User-request override");
+
+    // §6 isolation = merge-gate.
     expect(skill).toContain("needs_review");
     expect(skill).toContain("pending_review");
-    expect(skill).toContain("pane-style approximation");
-    expect(skill).toContain("terminal scrollback");
-    expect(skill).toContain("not exact Claude tmux/iTerm2 pane parity");
-    expect(skill).toContain("not exact Claude runtime parity");
-    expect(skill).toContain("default backend reports unsupported execution");
-    expect(skill).toContain("docs/compatibility.md");
-    expect(skill).toContain("docs/validation.md");
+    expect(skill).toContain("merge gate");
+
+    // Migrated vocab mapping + the layer-unavailable repair path moved to refs.
+    expect(skill).toContain("Vocabulary mapping");
+    expect(skill).toContain("Do not silently substitute");
+
+    // References are wired up and progressive-disclosure points are present.
+    expect(skill).toContain("references/delivery-model.md");
+    expect(skill).toContain("references/troubleshooting.md");
+
+    // delivery-model.md consumes the canonical pull model and tracks Item 1.
+    expect(delivery).toContain("pull details track Item 1");
+    expect(delivery).toContain("inbox_pending");
+    expect(delivery).toContain("Turn-boundary, not sync");
+    expect(delivery).toContain("Pull, not push");
+
+    // troubleshooting.md carries the migrated repair path + new entries.
+    expect(troubleshooting).toContain("Agent Team compatibility layer unavailable");
+    expect(troubleshooting).toContain("Do not silently substitute generic subagents");
+    expect(troubleshooting).toContain("docs/startup.md");
+    expect(troubleshooting).toContain("docs/compatibility.md");
+    expect(troubleshooting).toContain("docs/validation.md");
+    expect(troubleshooting).toContain("changed_files");
+    expect(troubleshooting).toContain("cross_team_recipient");
+    expect(troubleshooting).toContain("TeamDiagnostics");
   });
 
   it("documents startup diagnostics and all mapped tools", async () => {
@@ -242,8 +285,8 @@ describe("docs and compatibility skill", () => {
     const fixture = await readPackageFile(
       "test/fixtures/synthetic-claude-team-workflow.md"
     );
-    const skill = await readPackageFile(
-      "skills/agent-team-compatibility/SKILL.md"
+    const troubleshooting = await readPackageFile(
+      "skills/codex-team-best-practices/references/troubleshooting.md"
     );
 
     expect(validation).toContain(
@@ -278,10 +321,12 @@ describe("docs and compatibility skill", () => {
     }
     expect(fixture).toContain("Agent Team compatibility layer unavailable");
     expect(fixture).toContain("Do not silently substitute generic subagents");
-    expect(skill).toContain(
-      "docs/compatibility.md` and `docs/validation.md` for Phase 7 support labels"
-    );
-    expect(skill).not.toContain("Phase 6 support labels");
+    // The layer-unavailable repair path now lives in the new skill's
+    // troubleshooting reference and still points at the Phase 7 support docs.
+    expect(troubleshooting).toContain("docs/compatibility.md");
+    expect(troubleshooting).toContain("docs/validation.md");
+    expect(troubleshooting).toContain("Agent Team compatibility layer unavailable");
+    expect(troubleshooting).not.toContain("Phase 6 support labels");
   });
 
   it("documents the Phase 12 worktree merge model, TeamMerge tool, and four execution categories", async () => {

@@ -1,14 +1,16 @@
 # codex-team-mcp
 
+English | [简体中文](README.zh-CN.md)
+
 [![npm package](https://img.shields.io/npm/v/codex-team-mcp.svg)](https://www.npmjs.com/package/codex-team-mcp)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D22-43853d.svg)](package.json)
 
 Unofficial Claude Agent Team compatibility for Codex, packaged as a stdio MCP server.
 
-`codex-team-mcp` exposes Claude-style team tools — `TeamCreate`, `Agent`, `SendMessage`, team-scoped task tools, `TeamDiagnostics`, and `TeamMerge` — to Codex. It gives Team-oriented skills a durable, auditable coordination layer with a real, opt-in execution backend, without modifying Codex CLI internals.
+`codex-team-mcp` exposes Claude-style team tools — `TeamCreate`, `Agent`, `SendMessage`, team-scoped task tools, `TeamDiagnostics`, and the `TeamMerge` / `CheckInbox` extensions — to Codex. It gives Team-oriented skills a durable, auditable coordination layer with a real, opt-in execution backend, without modifying Codex CLI internals.
 
 > [!IMPORTANT]
-> This is an external compatibility layer, not exact Claude runtime parity. It provides durable team state, addressable TeamMates, persisted messages, team tasks, lifecycle diagnostics, an opt-in real execution backend (worktree-isolated, read **and** write), durable resume, and optional pane visibility. It does **not** provide true Claude in-process execution, guaranteed mid-turn message injection, approval-bridge parity, or exact Claude tmux/iTerm2 panes.
+> This is an external compatibility layer, not exact Claude runtime parity. It provides durable team state, addressable TeamMates, persisted messages, team tasks, lifecycle diagnostics, an opt-in real execution backend (worktree-isolated, read **and** write), durable resume, and optional pane visibility. Message delivery is **turn-boundary pull, not synchronous push**: a `SendMessage` is persisted immediately and delivered when the recipient is idle between turns; bodies are pulled with `CheckInbox`, never injected mid-turn. It does **not** provide true Claude in-process execution, guaranteed mid-turn message injection, approval-bridge parity, or exact Claude tmux/iTerm2 panes.
 
 ## What it provides
 
@@ -17,6 +19,7 @@ Unofficial Claude Agent Team compatibility for Codex, packaged as a stdio MCP se
 | Durable team creation and active-team binding | Supported |
 | Addressable TeamMate identities through named `Agent` calls | Supported |
 | Explicit persisted `SendMessage` inbox messages | Supported |
+| Turn-boundary delivery with `CheckInbox` pull (bodies pulled, never pushed) | Supported |
 | Team-scoped `TaskCreate`, `TaskUpdate`, `TaskList`, `TaskGet` | Supported |
 | Restart-safe SQLite runtime state | Supported |
 | Per-TeamMate real backend status + sanitized debug diagnostics | Supported |
@@ -74,6 +77,7 @@ TaskList
 TaskGet
 TeamDiagnostics
 TeamMerge
+CheckInbox
 ```
 
 If anything looks off, call `TeamDiagnostics` first. It reports package version, registered tools, state root, active bindings, per-TeamMate lifecycle status, pane metadata, queued messages, task summaries, and workspace review/merge state.
@@ -94,6 +98,22 @@ If you only want durable team state, messages, tasks, and diagnostics — withou
 ```
 
 Minimal mode creates teams and TeamMate identities, persists messages, and manages tasks, but TeamMates remain `scheduled` with `backend_unavailable` until an execution backend is enabled.
+
+## Companion skill
+
+`codex-team-mcp` ships a companion skill, **`codex-team-best-practices`**, that teaches an agent to use the team layer *well* — the turn-boundary pull-not-push delivery model, inbox discipline, isolated-worktree review-before-merge, and coordinating without busy-polling or message ping-pong. It is task-agnostic (it guides *how* to use the tools, never *what* to build) and covers both the Team Lead and TeamMate roles.
+
+The MCP server gives Codex the tools; the skill teaches it how to drive them. Install it with the open-source [`skills`](https://github.com/vercel-labs/skills) CLI (it supports Codex, Claude Code, Cursor, OpenCode, and more):
+
+```bash
+# preview the skill(s) bundled in the repo
+npx skills add Wynne-cwb/codex-team-mcp --list
+
+# install it (auto-detects your installed agents; add -g for user-global, -a <agent> to target one)
+npx skills add Wynne-cwb/codex-team-mcp --skill codex-team-best-practices
+```
+
+The skill source also ships inside this package under [`skills/codex-team-best-practices/`](skills/codex-team-best-practices/SKILL.md) — install from that local path or just read it directly.
 
 ## Configuration
 
@@ -117,15 +137,16 @@ All configuration is through environment variables.
 | `TeamCreate` | Creates a durable team, leader identity, and scoped active binding. |
 | `TeamDelete` | Archives a team and invalidates active bindings without hard-deleting state. |
 | `Agent` | Creates addressable TeamMates such as `builder@alpha-team`; records lifecycle/isolation metadata and attempts backend-dependent start. |
-| `SendMessage` | Persists explicit messages before delivery; resumes idle/stopped TeamMates when durable backend metadata exists. |
+| `SendMessage` | Persists explicit messages, then queues delivery at the recipient's next turn boundary; resumes idle/stopped TeamMates when durable backend metadata exists. Never injected mid-turn. |
 | `TaskCreate` | Creates team-scoped tasks in SQLite. |
 | `TaskUpdate` | Updates task status, owner, notes, metadata, and blockers. |
 | `TaskList` | Lists concise task projections by status or owner. |
 | `TaskGet` | Reads full task detail and task history. |
 | `TeamDiagnostics` | Reports tool, state, per-TeamMate lifecycle, message, task, pane, and workspace review/merge summaries (with a sanitized `include_debug` view). |
 | `TeamMerge` | **codex-team extension** — TL-driven `review` / `merge` / `escalate` of an isolated worktree branch back into the leader tree. |
+| `CheckInbox` | **codex-team extension** — pull messages addressed to the caller (full bodies, oldest first) over the reliable MCP/JSON channel. Bodies are pulled, never pushed: call it when nudged (an `inbox_pending` count on every tool result, or a 📬 line), not on a loop. |
 
-`TeamCreate`, `TeamDelete`, `Agent`, `SendMessage`, and the four task tools mirror Claude Agent Team tools one-to-one. `TeamDiagnostics` and `TeamMerge` are explicit codex-team extensions, not native Claude tools.
+`TeamCreate`, `TeamDelete`, `Agent`, `SendMessage`, and the four task tools mirror Claude Agent Team tools one-to-one. `TeamDiagnostics`, `TeamMerge`, and `CheckInbox` are explicit codex-team extensions, not native Claude tools.
 
 ## Real execution backend
 
@@ -217,6 +238,22 @@ TeamMerge({ "action": "merge",  "run_id": "<run>" })
 > [!NOTE]
 > Ordinary chat text is not a teammate inbox message. Use `SendMessage` whenever user text should be delivered to a TeamMate.
 
+## Message delivery: turn-boundary pull, not push
+
+Delivery is **turn-boundary, not synchronous**. A `SendMessage` is *persisted* to the shared SQLite `messages` table immediately, but it is *delivered* only at a turn boundary — when the recipient is idle or stopped between turns, never injected mid-turn (you cannot interrupt a model mid-thought). A running recipient's message is `queued_for_next_turn`; an idle/stopped one is `queued_while_idle`. Neither status is an error.
+
+Bodies are **pulled, never pushed**. The only thing that travels toward a live runtime is a SHORT, length-bounded nudge (a count plus sender ids), never the body. Recipients pull the full bodies over the reliable MCP/JSON channel with `CheckInbox`. Concretely:
+
+- **TeamMates** (pane-hosted) get a `📬 N new message(s) — run CheckInbox to read.` line injected into their pane, then call `CheckInbox` to read the bodies.
+- **The Team Lead** has no pane, so it *pulls*: unread teammate→TL messages are auto-surfaced as an `inbox` block on codex-team tool results (full bodies for a small batch, a compact digest for a large one), and every tool result carries an `inbox_pending: N` counter. The TL calls `CheckInbox` when `inbox_pending > 0` or when nudged — not on a loop.
+
+> [!NOTE]
+> This is still pull. Surfacing to the interactive TL is bound to model-driven actions (a user prompt or any codex-team tool call). There is no "message arrives → idle TL wakes immediately" push; resume/inject outcomes are *attempted*, never a guarantee of mid-turn injection.
+
+### Optional `UserPromptSubmit` inbox-nudge hook
+
+A small, **read-only** Codex CLI hook ships as a repo artifact under [`hooks/`](hooks/README.md) — it is **not** installed automatically and nothing is written into `~/.codex`. When wired up, it runs on Codex's `UserPromptSubmit` event, counts the leader's unread messages, and (only if `N > 0`) injects a `📬 You have N new teammate message(s) — call CheckInbox before responding.` line on the same turn the TL submits a prompt. It is read-only (one indexed `COUNT`, never marks messages read), no-ops for teammate sessions and an empty inbox, and never throws into the prompt path. See [`hooks/README.md`](hooks/README.md) for the contract and manual install snippet.
+
 ## Diagnostics and resume
 
 - **Per-TeamMate status:** default `TeamDiagnostics` adds a `teammates[]` row per TeamMate with its real, durable status (`unavailable` / `starting` / `running` / `idle` / `stopped` / `failed` / `stale`) plus `attached` / `needs_review` flags. Rows carry only name + status + flags.
@@ -266,7 +303,7 @@ npm run smoke:list-tools
 npm run pack:dry-run
 ```
 
-The smoke test starts the built stdio MCP server and verifies all ten compatibility tools are visible.
+The smoke test starts the built stdio MCP server and verifies the core compatibility tools are visible.
 
 ## Documentation
 
@@ -274,4 +311,5 @@ The smoke test starts the built stdio MCP server and verifies all ten compatibil
 - [Claude-to-Codex tool mapping](docs/tool-mapping.md)
 - [Compatibility matrix](docs/compatibility.md)
 - [Validation evidence](docs/validation.md)
-- [Agent Team compatibility skill](skills/agent-team-compatibility/SKILL.md)
+- [codex-team best-practices skill](skills/codex-team-best-practices/SKILL.md)
+- [Optional `UserPromptSubmit` inbox-nudge hook](hooks/README.md)
