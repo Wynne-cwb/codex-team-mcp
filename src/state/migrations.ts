@@ -435,6 +435,36 @@ export const MIGRATIONS: readonly MigrationDefinition[] = [
       // existing workspace_path — never diff content / prompt / body.
       addColumnIfMissing(db, TABLE_NAMES.runs, "worktree_repo_root", "TEXT");
     }
+  },
+  {
+    version: 8,
+    name: "add turn-boundary delivery marker",
+    up(db) {
+      // Phase 16 (turn-boundary delivery drain): the "delivered" marker. Set when
+      // the recipient's runtime was nudged (a short pane inbox nudge injected) so
+      // the at-most-once drain never re-nudges an already-delivered row. NULL for
+      // every pre-Phase-16 row and for the TL (no pane). `read_at` already exists
+      // (v3) and is reused for the "body consumed" marker — no new read column.
+      // D-02: BOTH markers are timestamps only; the message body NEVER leaves
+      // messages.body_json. Idempotent additive add (addColumnIfMissing, same
+      // pattern as v3-v7).
+      addColumnIfMissing(db, TABLE_NAMES.messages, "delivered_at", "TEXT");
+
+      // Covering index for the two derived read-model queries: pending-nudge
+      // (delivered_at IS NULL) and unread (read_at IS NULL), both keyed by recipient.
+      // SQLite indexes implicitly carry the rowid as the row reference, so the FIFO
+      // `ORDER BY rowid ASC` is served by this index without listing rowid explicitly
+      // (an explicit `rowid` column in CREATE INDEX is rejected). Idempotent.
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_messages_recipient_pending
+          ON ${TABLE_NAMES.messages}(
+            team_id,
+            recipient_member_id,
+            delivered_at,
+            read_at
+          );
+      `);
+    }
   }
 ];
 

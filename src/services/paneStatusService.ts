@@ -73,6 +73,10 @@ interface RunPaneRow {
 interface ReadPaneStatusSummaryOptions {
   paneModeEnabled?: boolean;
   includeDebug?: boolean;
+  // Phase 17 focus filters: when set, restrict panes to one team / one teammate
+  // (member id). Omitted = workspace-wide (the pre-Phase-17 behavior).
+  teamId?: string;
+  teammateMemberId?: string;
 }
 
 const sensitiveFragments = [
@@ -94,6 +98,13 @@ export function readPaneStatusSummary(
   workspaceRoot: string,
   options: ReadPaneStatusSummaryOptions = {}
 ): PaneStatusSummary {
+  const teamClause = options.teamId ? " AND teams.team_id = ?" : "";
+  const memberClause = options.teammateMemberId ? " AND runs.member_id = ?" : "";
+  const params: string[] = [
+    workspaceRoot,
+    ...(options.teamId ? [options.teamId] : []),
+    ...(options.teammateMemberId ? [options.teammateMemberId] : [])
+  ];
   const rows = db
     .prepare(
       `
@@ -112,11 +123,11 @@ export function readPaneStatusSummary(
           ON teams.team_id = runs.team_id
         LEFT JOIN ${TABLE_NAMES.members} AS members
           ON members.member_id = runs.member_id
-        WHERE teams.workspace_root = ?
+        WHERE teams.workspace_root = ?${teamClause}${memberClause}
         ORDER BY runs.updated_at DESC, runs.run_id DESC
       `
     )
-    .all(workspaceRoot) as RunPaneRow[];
+    .all(...params) as RunPaneRow[];
 
   const allPanes = rows
     .map(toPaneStatusRow)

@@ -110,8 +110,38 @@ export const taskGetSchema = {
   taskId: z.string().optional()
 };
 
+// Phase 17 (UAT focus filters): TeamDiagnostics defaults to the caller's ACTIVE
+// team only. All params optional. snake_case is primary; camelCase aliases mirror
+// the task_id/taskId convention already used elsewhere in this file. Int caps are
+// validated as positive here and additionally clamped (≥1, ≤500) in the handler.
 export const diagnosticsSchema = {
-  include_debug: z.boolean().optional()
+  include_debug: z.boolean().optional(),
+  // Explicitly select a team by name (overrides the current-team default).
+  team_name: optionalCanonicalTeamNameSchema,
+  teamName: optionalCanonicalTeamNameSchema,
+  // DEFAULT true: show ONLY the caller's active-binding team.
+  current_team_only: z.boolean().optional(),
+  currentTeamOnly: z.boolean().optional(),
+  // DEFAULT false: include archived teams/teammates.
+  include_archived: z.boolean().optional(),
+  includeArchived: z.boolean().optional(),
+  // DEFAULT false: include non-active/older teams' detail (multi-team output).
+  include_history: z.boolean().optional(),
+  includeHistory: z.boolean().optional(),
+  // Caps (newest first). Defaults applied in the handler: events 20, runs 10,
+  // messages 20.
+  max_events: z.number().int().positive().optional(),
+  maxEvents: z.number().int().positive().optional(),
+  max_runs: z.number().int().positive().optional(),
+  maxRuns: z.number().int().positive().optional(),
+  max_messages: z.number().int().positive().optional(),
+  maxMessages: z.number().int().positive().optional(),
+  // ISO-8601 lower bound for the message listing.
+  messages_since: z.string().optional(),
+  messagesSince: z.string().optional(),
+  // Restrict teammate/run/message detail to one teammate (public id or member id).
+  teammate_id: z.string().optional(),
+  teammateId: z.string().optional()
 };
 
 // Phase 12 (D-04): codex-team extension tool. TL-driven review / merge / escalate
@@ -123,4 +153,15 @@ export const teamMergeSchema = {
   member_id: z.string().optional(),
   run_id: z.string().optional(),
   team_name: z.string().optional()
+};
+
+// Phase 16 (D-? / §3.3): codex-team extension tool. Pull unread (and optionally
+// read-history) messages addressed to the caller. `peek` leaves rows unread;
+// otherwise the returned unread rows are marked read. `include_read` adds prior
+// read history; `limit` caps the batch. Available to ALL roles.
+export const checkInboxSchema = {
+  team_name: z.string().optional(),
+  peek: z.boolean().optional(),
+  include_read: z.boolean().optional(),
+  limit: z.number().int().positive().optional()
 };

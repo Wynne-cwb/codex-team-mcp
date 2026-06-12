@@ -5,6 +5,7 @@ import { z, ZodError } from "zod";
 
 import { createExecutionBackendFromOptions } from "../adapters/paneExecutionBackend.js";
 import { normalizeCallerMetadata } from "../context/caller.js";
+import { enforceTeammateCapability } from "./capabilityGuard.js";
 import { AgentService } from "../services/agentService.js";
 import { buildWorkspaceScopedCallerIdentity } from "../services/callerIdentity.js";
 import { canonicalizeTeamName } from "../services/teamNames.js";
@@ -69,6 +70,27 @@ export function createAgentHandler(
         workspaceRoot: state.workspaceRoot,
         caller: normalizeCallerMetadata(extra)
       });
+      // Phase 13 (D-Q2): teammate-role fast path — deny BEFORE schema parse /
+      // service construction so no prompt text is touched. The agentService
+      // nested guard stays as defense-in-depth for direct-service callers.
+      const denial = enforceTeammateCapability({
+        tool: "Agent",
+        identity,
+        db: adapter.getDatabase()
+      });
+      if (denial) {
+        // Preserve the established Agent denial contract: surface the canonical
+        // team_name (a non-sensitive identifier read directly from args — never the
+        // prompt body) so the response matches the pre-Phase-13 agentService guard.
+        const teamName = canonicalTeamNameFromArgs(args);
+        return jsonResponse({
+          implemented_now: true,
+          status: "error",
+          error_code: denial.error_code,
+          message: denial.message,
+          ...(teamName ? { team_name: teamName } : {})
+        });
+      }
       const input = agentInputSchema.parse(args);
       const service = new AgentService({
         db: adapter.getDatabase(),
@@ -121,6 +143,25 @@ export function createAgentHandler(
       adapter.close();
     }
   };
+}
+
+// Best-effort, identifier-only extraction of the canonical team_name from raw
+// args for the teammate-capability denial response. Reads ONLY the team_name
+// identifier (never the prompt/description body) and canonicalizes it the same
+// way the Agent input schema does; returns undefined when absent or invalid.
+function canonicalTeamNameFromArgs(args: unknown): string | undefined {
+  if (typeof args !== "object" || args === null) {
+    return undefined;
+  }
+  const raw = (args as Record<string, unknown>).team_name;
+  if (typeof raw !== "string" || raw.trim().length === 0) {
+    return undefined;
+  }
+  try {
+    return canonicalizeTeamName(raw);
+  } catch {
+    return undefined;
+  }
 }
 
 function describeDurableState(

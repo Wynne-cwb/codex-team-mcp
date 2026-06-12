@@ -1,3 +1,14 @@
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  statSync
+} from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -504,18 +515,22 @@ describe("pane backend detection and metadata", () => {
   });
 
   it("claim downgrade keeps iTerm2 attach metadata status-only without executing Codex", () => {
+    const bootstrapDir = mkdtempSync(path.join(tmpdir(), "codex-team-bs-"));
     const commandRunner = createFakeCommandRunner({
       "it2 session list": { stdout: "iTerm2 Sessions\n" },
       "it2 session split -v -s session": {
         stdout: "Created new pane: iterm-pane-1\n"
-      }
+      },
+      // Catch-all so the short `. '<bootstrap>'` source line (random path) succeeds.
+      it2: { stdout: "" }
     });
     const backend = createITerm2PaneBackend({
       env: {
         TERM_PROGRAM: "iTerm.app",
         ITERM_SESSION_ID: "w0t0p0:session"
       },
-      commandRunner
+      commandRunner,
+      bootstrapDir
     });
 
     const result = backend.createPane(paneContext, [
@@ -997,19 +1012,21 @@ describe("pane command execution and iTerm2 layout (0.3.2)", () => {
     expect(splitCall?.args).toEqual(["session", "split", "-s", "pane-2"]);
   });
 
-  it("runs the visibility command inside the new iTerm2 pane via `it2 session run`", () => {
+  it("launches the command in the new iTerm2 pane via a short `. '<bootstrap>'` source line, not the raw command", () => {
+    const bootstrapDir = mkdtempSync(path.join(tmpdir(), "codex-team-bs-"));
     const logPath = "/workspace/.codex-team/runs/run.jsonl";
-    const cmdStr = `'tail' '-f' '${logPath}'`;
     const commandRunner = createFakeCommandRunner({
       "it2 session list": { stdout: "iTerm2 Sessions\n" },
       "it2 session split -v -s session": {
         stdout: "Created new pane: pane-1\n"
       },
-      [`it2 session run -s pane-1 ${cmdStr}`]: { stdout: "" }
+      // Catch-all so the (random-path) bootstrap source line succeeds.
+      it2: { stdout: "" }
     });
     const backend = createITerm2PaneBackend({
       env: ITERM2_ENV,
-      commandRunner
+      commandRunner,
+      bootstrapDir
     });
 
     const result = backend.createPane(paneContext, ["tail", "-f", logPath]);
@@ -1026,21 +1043,34 @@ describe("pane command execution and iTerm2 layout (0.3.2)", () => {
         call.args[0] === "session" &&
         call.args[1] === "run"
     );
-    // The command is one shell-quoted string arg targeting the new pane.
-    expect(runCall?.args).toEqual(["session", "run", "-s", "pane-1", cmdStr]);
+    // The typed payload is a SHORT single-line source command, NOT the raw command.
+    expect(runCall?.args.slice(0, 4)).toEqual(["session", "run", "-s", "pane-1"]);
+    const payload = runCall?.args[4] ?? "";
+    expect(payload).toMatch(/^\. '.+\/launch-[0-9a-f]+\.sh'$/);
+    expect(payload).not.toMatch(/[\n\r]/);
+
+    // The bootstrap script reconstructs the exact command for codex's argv.
+    const files = readdirSync(bootstrapDir);
+    expect(files).toHaveLength(1);
+    const scriptPath = path.join(bootstrapDir, files[0]);
+    expect(payload).toBe(`. '${scriptPath}'`);
+    const content = readFileSync(scriptPath, "utf8");
+    expect(content).toContain(`exec 'tail' '-f' '${logPath}'`);
   });
 
   it("keeps the iTerm2 pane available (with a degradation reason) when `session run` fails", () => {
+    const bootstrapDir = mkdtempSync(path.join(tmpdir(), "codex-team-bs-"));
     const commandRunner = createFakeCommandRunner({
       "it2 session list": { stdout: "iTerm2 Sessions\n" },
       "it2 session split -v -s session": {
         stdout: "Created new pane: pane-1\n"
       }
-      // No response for `session run` -> the run fails.
+      // No response for the `. '<bootstrap>'` source run -> the run fails.
     });
     const backend = createITerm2PaneBackend({
       env: ITERM2_ENV,
-      commandRunner
+      commandRunner,
+      bootstrapDir
     });
 
     const result = backend.createPane(paneContext, [
@@ -1657,5 +1687,165 @@ describe("sendToPane (resume nudge into a live pane)", () => {
         (call) => call.command === "tmux" && call.args.includes("send-keys")
       )
     ).toBe(true);
+  });
+});
+
+// Phase 15 P0 fix: the iTerm2 create path must NOT type the long codex launch
+// command into the freshly-split interactive shell (it2 = `send_text(cmd+"\r")`,
+// which drops tail bytes on a ~1.5KB multi-line line -> codex never launches).
+// Instead it writes the full argv to a per-launch 0600 bootstrap script under the
+// state dir and types only a short, single-line, newline-free `. '<script>'`.
+describe("iTerm2 bootstrap-script command delivery (Phase 15 P0 fix)", () => {
+  const ITERM2_ENV = {
+    TERM_PROGRAM: "iTerm.app",
+    ITERM_SESSION_ID: "w0t0p0:session"
+  };
+
+  // Mirrors the real buildStartCommand argv shape: codex + flags + `-c` env
+  // overrides + a long, MULTI-LINE positional prompt (preamble + \n\n + body).
+  function buildLongCodexCommand(): { command: string[]; prompt: string } {
+    const preamble =
+      "You are an autonomous teammate. Approvals are auto-skipped — keep working. " +
+      "Find teammates with TeamDiagnostics. End your turn after one focused message.";
+    // ~5 KB, multi-line body. No single quotes so single-quoting is a clean wrap.
+    const body = `${"task ".repeat(900)}\nstep one\nstep two\nstep three`;
+    const prompt = `${preamble}\n\n${body}`;
+    const command = [
+      "codex",
+      "-C",
+      "/work/tree/run-a",
+      "-a",
+      "never",
+      "-s",
+      "workspace-write",
+      "-c",
+      'mcp_servers.codex-team.env.CODEX_TEAM_WORKSPACE_ROOT="/workspace"',
+      "-c",
+      'mcp_servers.codex-team.env.CODEX_TEAM_MEMBER_ID="teammate:team-alpha:builder"',
+      "-c",
+      'mcp_servers.codex-team.env.CODEX_TEAM_MEMBER_ROLE="teammate"',
+      prompt
+    ];
+    return { command, prompt };
+  }
+
+  function launch(bootstrapDir: string) {
+    const commandRunner = createFakeCommandRunner({
+      "it2 session list": { stdout: "iTerm2 Sessions\n" },
+      "it2 session split -v -s session": {
+        stdout: "Created new pane: pane-1\n"
+      },
+      // Catch-all so the (random-path) bootstrap source line succeeds.
+      it2: { stdout: "" }
+    });
+    const backend = createITerm2PaneBackend({
+      env: ITERM2_ENV,
+      commandRunner,
+      bootstrapDir
+    });
+    const { command, prompt } = buildLongCodexCommand();
+    const result = backend.createPane(paneContext, command);
+    const runCall = commandRunner.calls.find(
+      (call) =>
+        call.command === "it2" &&
+        call.args[0] === "session" &&
+        call.args[1] === "run"
+    );
+    return { result, runCall, prompt, command };
+  }
+
+  it("types a single physical line whose length is bounded and independent of the (5 KB) prompt", () => {
+    const bootstrapDir = mkdtempSync(path.join(tmpdir(), "codex-team-bs-"));
+    const { result, runCall, prompt } = launch(bootstrapDir);
+
+    expect(result.ok).toBe(true);
+    const payload = runCall?.args[4] ?? "";
+    // Single physical line: no embedded newline or carriage return.
+    expect(payload).not.toMatch(/[\n\r]/);
+    // It is a POSIX source command, not the raw codex line: none of the command's
+    // flags or prompt body bytes appear in the typed payload (they live in the FILE).
+    expect(payload.startsWith(". '")).toBe(true);
+    expect(payload).not.toContain("workspace-write");
+    expect(payload).not.toContain("step one");
+    expect(payload).not.toContain("CODEX_TEAM_WORKSPACE_ROOT");
+    // Bounded + independent of prompt length: the 5 KB prompt lives in the FILE.
+    expect(prompt.length).toBeGreaterThan(4096);
+    expect(payload.length).toBeLessThan(512);
+    expect(payload.length).toBeLessThan(prompt.length / 4);
+  });
+
+  it("reconstructs the exact multi-line prompt + `-C/-a/-s/-c…` flag order byte-for-byte in the script", () => {
+    const bootstrapDir = mkdtempSync(path.join(tmpdir(), "codex-team-bs-"));
+    const { runCall, prompt } = launch(bootstrapDir);
+
+    const files = readdirSync(bootstrapDir);
+    expect(files).toHaveLength(1);
+    const scriptPath = path.join(bootstrapDir, files[0]);
+    expect(runCall?.args[4]).toBe(`. '${scriptPath}'`);
+
+    const content = readFileSync(scriptPath, "utf8");
+    // Flags preserved in order, then the env overrides, then the positional prompt.
+    expect(content).toContain(
+      "exec 'codex' '-C' '/work/tree/run-a' '-a' 'never' '-s' 'workspace-write' " +
+        "'-c' 'mcp_servers.codex-team.env.CODEX_TEAM_WORKSPACE_ROOT=\"/workspace\"' " +
+        "'-c' 'mcp_servers.codex-team.env.CODEX_TEAM_MEMBER_ID=\"teammate:team-alpha:builder\"' " +
+        "'-c' 'mcp_servers.codex-team.env.CODEX_TEAM_MEMBER_ROLE=\"teammate\"'"
+    );
+    // The full multi-line prompt is reconstructed byte-for-byte (incl. the \n\n
+    // separator and every embedded newline) inside a single-quoted argv token.
+    expect(content).toContain(`'${prompt}'`);
+    expect(prompt).toContain("\n\n");
+  });
+
+  it("writes the script 0600 under the state dir and self-deletes before exec (cleanup)", () => {
+    const bootstrapDir = mkdtempSync(path.join(tmpdir(), "codex-team-bs-"));
+    launch(bootstrapDir);
+
+    const files = readdirSync(bootstrapDir);
+    expect(files).toHaveLength(1);
+    const scriptPath = path.join(bootstrapDir, files[0]);
+
+    // Mode is exactly 0600 (owner read/write only) regardless of umask.
+    expect(statSync(scriptPath).mode & 0o777).toBe(0o600);
+
+    const lines = readFileSync(scriptPath, "utf8").split("\n");
+    expect(lines[0]).toBe("#!/bin/sh");
+    // Self-delete is the FIRST command and precedes `exec` (after exec nothing runs).
+    expect(lines[1]).toBe(`rm -f -- '${scriptPath}'`);
+    expect(lines[2].startsWith("exec ")).toBe(true);
+
+    // Running that self-delete command actually removes the script (no codex exec).
+    expect(existsSync(scriptPath)).toBe(true);
+    execFileSync("/bin/sh", ["-c", lines[1]]);
+    expect(existsSync(scriptPath)).toBe(false);
+  });
+
+  it("defaults the bootstrap dir to the codex-team state root (pane-bootstrap subdir)", () => {
+    const stateRoot = mkdtempSync(path.join(tmpdir(), "codex-team-state-"));
+    const commandRunner = createFakeCommandRunner({
+      "it2 session list": { stdout: "iTerm2 Sessions\n" },
+      "it2 session split -v -s session": {
+        stdout: "Created new pane: pane-1\n"
+      },
+      it2: { stdout: "" }
+    });
+    // No bootstrapDir injected -> derived from env via resolveStateRoot. Point the
+    // state root at a temp dir through CODEX_TEAM_STATE_ROOT so nothing lands in the repo.
+    const backend = createITerm2PaneBackend({
+      env: {
+        ...ITERM2_ENV,
+        CODEX_TEAM_WORKSPACE_ROOT: stateRoot,
+        CODEX_TEAM_STATE_ROOT: "."
+      } as NodeJS.ProcessEnv,
+      commandRunner
+    });
+
+    backend.createPane(paneContext, ["codex", "-a", "never", "hello"]);
+
+    const expectedDir = path.join(stateRoot, "pane-bootstrap");
+    expect(existsSync(expectedDir)).toBe(true);
+    const files = readdirSync(expectedDir);
+    expect(files).toHaveLength(1);
+    expect(files[0]).toMatch(/^launch-[0-9a-f]+\.sh$/);
   });
 });

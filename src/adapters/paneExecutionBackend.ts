@@ -622,7 +622,23 @@ export function extractPaneMetadata(
 export const TEAMMATE_PREAMBLE =
   "You are an autonomous teammate. Approvals are auto-skipped — do not stop to wait for approval; keep working through your assigned task. " +
   "If you hit something only the human user can decide (product direction, scope, a clarification, or an irreversible action), clearly write that question into your reply and end your turn — do not block waiting. The Team Lead will relay it to the human user and send the answer back so you can continue. " +
+  "You can message teammates directly — find them with TeamDiagnostics. When you message a peer or the Team Lead, send one focused message and end your turn; do not keep replying back and forth. " +
+  "When you see a 📬 inbox nudge in your pane (e.g. \"N new message(s) — run CheckInbox to read\"), call the CheckInbox tool to read the full message bodies; the nudge itself is only a short notification. " +
   "Keep your output focused on the task you were assigned.";
+
+// Phase 13 (D-Q3): TOML basic string for a `-c` value. Escape `\` then `"` and
+// wrap in double quotes. Control chars are already stripped by sanitizeText in
+// startRun's sanitizeCommandArgs, so only these two need escaping here.
+function tomlBasicString(value: string): string {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+// One per-launch `-c` override as TWO raw argv tokens. Targets the codex-team MCP
+// child's env block via `mcp_servers.codex-team.env.<KEY>` so `-c` both adds and
+// overrides the shared global block value for this launch only.
+function envOverride(key: string, value: string): [string, string] {
+  return ["-c", `mcp_servers.codex-team.env.${key}=${tomlBasicString(value)}`];
+}
 
 function createDefaultCommandBuilder(
   codexCommand: string | undefined
@@ -643,6 +659,24 @@ function createDefaultCommandBuilder(
       const positionalPrompt = prompt
         ? `${TEAMMATE_PREAMBLE}\n\n${prompt}`
         : null;
+      // Phase 13 (SC1 / BIDIR-01 / D-Q3): per-launch `-c` env overrides bind this
+      // teammate's co-located codex-team MCP to the TL container DB (WORKSPACE_ROOT
+      // = container root, NOT the worktree) and self-identify it (MEMBER_ID/ROLE).
+      // RAW tokens only — paneBackend.buildTailCommandString single-quotes each
+      // token for `sh -c`, so we must NOT pre-shell-quote; the inner value is a TOML
+      // basic string (KEY="value"). Deterministic order: WORKSPACE_ROOT, MEMBER_ID,
+      // MEMBER_ROLE. Resume never re-injects (buildResumeCommand is unchanged).
+      const envTokens: string[] = [];
+      const workspaceRoot = normalizeOptionalText(context.workspace_root);
+      if (workspaceRoot) {
+        envTokens.push(...envOverride("CODEX_TEAM_WORKSPACE_ROOT", workspaceRoot));
+      }
+      const memberId = normalizeOptionalText(context.member_id);
+      if (memberId) {
+        // Role is meaningless without identity — only emitted alongside MEMBER_ID.
+        envTokens.push(...envOverride("CODEX_TEAM_MEMBER_ID", memberId));
+        envTokens.push(...envOverride("CODEX_TEAM_MEMBER_ROLE", "teammate"));
+      }
       return [
         command,
         ...(workspacePath ? ["-C", workspacePath] : []),
@@ -650,12 +684,15 @@ function createDefaultCommandBuilder(
         "never",
         "-s",
         mode,
+        ...envTokens,
         ...(positionalPrompt ? [positionalPrompt] : [])
       ];
     },
-    // Resume nudge text for the live TUI. Only the non-sensitive `summary` is
-    // surfaced (D-02 — the raw SendMessage body is never threaded here). Empty
-    // when absent -> resumeRun degrades to not_resumable.
+    // Resume nudge text for the live TUI. Phase 16 (notify + pull): this is a SHORT,
+    // length-bounded inbox nudge (the drain / message-arrival path threads it as
+    // resume_delivery_text) — NEVER the full body, which would be an unbounded
+    // terminal write (the long-body hazard). Falls back to the non-sensitive
+    // `summary`. Empty when absent -> resumeRun degrades to not_resumable.
     buildResumeCommand(context) {
       const text = resumeTextFromContext(context);
       return text ? [text] : [];
@@ -812,17 +849,17 @@ function promptFromContext(context: ExecutionRunContext): string | null {
   return stringFromMetadata(context.metadata, "prompt");
 }
 
-// Resume nudge text injected into the live TUI. Prefer the full SendMessage body
-// (`resume_delivery_text`, threaded in-memory only via the resume context — see
-// the D-02 note below), falling back to the non-sensitive `summary` when no body
-// text was supplied (e.g. system lifecycle notices, which only carry a summary).
+// Resume nudge text injected into the live TUI. Phase 16 (notify + pull):
+// `resume_delivery_text` now carries the SHORT, length-bounded inbox NUDGE (count +
+// distinct senders), NOT the full body — the recipient pulls bodies over MCP/JSON via
+// CheckInbox. Falls back to the non-sensitive `summary` when no nudge was supplied
+// (e.g. system lifecycle notices, which only carry a summary).
 //
 // D-02: `resume_delivery_text` lives ONLY on the in-memory resume context
 // (lifecycle buildResumeContextMetadata -> resumeRun -> sendToPane). It is NEVER
 // written back into runs.metadata_json, events, or diagnostics — resumeRun's
-// returned actionResult.metadata carries only `{ pane }`. The body itself is
-// lawfully stored in the `messages` table; injecting it into the recipient's pane
-// is its intended delivery, not a leak.
+// returned actionResult.metadata carries only `{ pane }`. The full message body is
+// lawfully stored in the `messages` table and never rides the resume context at all.
 function resumeTextFromContext(context: ExecutionRunContext): string | null {
   return (
     stringFromMetadata(context.metadata, "resume_delivery_text") ??

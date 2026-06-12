@@ -49,7 +49,16 @@ export type RunBackendStatus =
   (typeof RUN_BACKEND_STATUSES)[keyof typeof RUN_BACKEND_STATUSES];
 
 export const MESSAGE_ROW_STATUSES = {
-  queued: "queued"
+  // Newly INSERTED rows always start `queued`. `delivered` / `read` are TERMINAL
+  // OBSERVABILITY states the inbox claim advances a row to once it has actually
+  // been delivered (delivered_at stamped) / pulled (read_at stamped). They are NOT
+  // selection gates — every row SELECT keys off the delivered_at / read_at
+  // timestamps (the single source of truth), so widening this enum can never change
+  // which rows a query returns. Column is free TEXT (no CHECK), so the new string
+  // values need no DB migration.
+  queued: "queued",
+  delivered: "delivered",
+  read: "read"
 } as const;
 
 export type MessageRowStatus =
@@ -62,7 +71,12 @@ export const MESSAGE_DELIVERY_STATUSES = {
   backendResumeAttempted: "backend_resume_attempted",
   backendUnavailable: "backend_unavailable",
   backendFailed: "backend_failed",
-  recipientStale: "recipient_stale"
+  recipientStale: "recipient_stale",
+  // Terminal delivery state stamped once the recipient has actually PULLED the row
+  // (claimRead). Resolves the observability bug where delivery_status was stuck at
+  // the push-attempt value (backend_resume_attempted / backend_unavailable /
+  // queued_while_idle) forever even after the message was read.
+  delivered: "delivered"
 } as const;
 
 export type MessageDeliveryStatus =
@@ -161,6 +175,11 @@ export const EVENT_TYPES = {
   teammateBackendStartAttempted: "teammate_backend_start_attempted",
   teammateBackendResumeAttempted: "teammate_backend_resume_attempted",
   teammateBackendFailed: "teammate_backend_failed",
+  // Intentional, clean shutdown of a teammate run (TL shutdown_request / TeamDelete
+  // pane teardown, or a reconcile that recognized an intentionally-closed pane). A
+  // real terminal status that is explicitly NOT a backend failure, so an intentional
+  // stop never reads as a crash.
+  teammateStopped: "teammate_stopped",
   teammateReconciled: "teammate_reconciled",
   teammateMarkedStale: "teammate_marked_stale",
   teammateRunCompleted: "teammate_run_completed",

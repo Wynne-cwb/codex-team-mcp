@@ -40,7 +40,11 @@ export function createSendMessageHandler(
         db: adapter.getDatabase(),
         statePath: state.stateRoot,
         executionBackend: createExecutionBackendFromOptions(options),
-        paneMode: options.paneMode
+        paneMode: options.paneMode,
+        // Phase 14 (D-Q2): a single GLOBAL default — the shared
+        // [mcp_servers.codex-team.env] block reaches every teammate MCP child, so
+        // no per-launch -c injection is needed.
+        maxProactiveMessagesPerTurn: resolveMaxProactiveMessagesPerTurn()
       });
       const result = service.sendMessage({
         teamName: input.team_name,
@@ -82,6 +86,29 @@ export function createSendMessageHandler(
       adapter.close();
     }
   };
+}
+
+const DEFAULT_MAX_PROACTIVE_MESSAGES_PER_TURN = 8;
+
+// Phase 14 (D-Q2): resolve the per-turn proactive-message bound for teammate-role
+// senders from CODEX_TEAM_MAX_PROACTIVE_MESSAGES_PER_TURN. Parse as an int, clamp
+// to >= 1, and fall back to the default 8 on NaN / <= 0 / absent.
+function resolveMaxProactiveMessagesPerTurn(): number {
+  return parsePositiveInt(
+    process.env.CODEX_TEAM_MAX_PROACTIVE_MESSAGES_PER_TURN,
+    DEFAULT_MAX_PROACTIVE_MESSAGES_PER_TURN
+  );
+}
+
+function parsePositiveInt(value: string | undefined, fallback: number): number {
+  if (typeof value !== "string") {
+    return fallback;
+  }
+  const parsed = Number.parseInt(value.trim(), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return parsed;
 }
 
 function describeDurableState(

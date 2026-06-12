@@ -1,0 +1,57 @@
+# Changelog
+
+All notable changes to `codex-team-mcp` are documented here. This project
+follows [semantic versioning](https://semver.org/).
+
+## v0.4.0 — 双向消息 + CheckInbox + turn-boundary 投递模型 + UAT 修复
+
+### 新增 (Features)
+- **双向消息 (bidirectional messaging)**:支持 teammate → Team Lead 以及
+  teammate ↔ teammate 的消息路由(此前仅 TL → teammate 单向)。
+- **CheckInbox 工具**:teammate 与 TL 可主动拉取未读消息。新增收件箱读模型
+  (`messageInboxService`)与 `inboxHandler`。
+- **TL 收件箱自动浮现 (auto-surface)**:任意 leader 工具调用的结果会自动附带
+  `inbox` 块(`withLeaderInboxSurface`),TL 无需显式轮询即可看到 teammate 回话。
+- **turn-boundary 投递模型**:消息在 turn 边界排空投递
+  (`queued_while_idle` / `queued_for_next_turn`),不在 turn 中途打断 teammate。
+- **teammate 能力门 + 主动消息限流**:`capabilityGuard` 限定 teammate 可用工具;
+  `CODEX_TEAM_MAX_PROACTIVE_MESSAGES_PER_TURN` 限制每个 turn 的主动消息数量。
+- **caller / member 身份解析增强**:基于环境变量的 caller 身份识别与 teammate
+  member 身份解析(`contextResolver`)。
+
+### 修复 (Fixes)
+- **teardown 停止收敛为 `stopped`(不再 `failed`)**:主动拆除 pane 的 run/member
+  现标记为 `stopped`,并写入 `intentional_stop` 标记;真实崩溃(无标记)仍判定为
+  `failed`。
+- **message `status` / `delivery_status` 收敛到终态**:消息状态从 `queued` 正确
+  推进到 `delivered` → `read`,`delivery_status` 不再永久卡在推送尝试值。时间戳
+  (`delivered_at` / `read_at`)成为消息选择的唯一真相源,CheckInbox / pending 的
+  选择行为保持不变(delivered 但未读的消息仍会浮现)。
+- **`changed_files` 在 teardown 边界重新捕获**:worktree 在 revert → teardown 之后,
+  `changed_files` 现反映最终的干净状态,修掉此前残留 stale 文件列表的问题。
+
+### 内部 (Internal)
+- schema:`MESSAGE_ROW_STATUSES` 新增 `delivered` / `read`,
+  `MESSAGE_DELIVERY_STATUSES` 新增 `delivered`(TEXT 列,含 migration,向后兼容)。
+- diagnostics 大幅扩展(消息 / lifecycle / pane 可观测性)。
+- 测试:528 passed(52 文件),覆盖双向消息、turn-boundary 投递、能力门、
+  status 收敛、`changed_files` teardown 捕获等回归。
+
+## v0.3.3
+Pane-hosted codex TUI teammates + multi-repo worktree isolation + robust
+reconcile/delivery.
+
+## v0.3.2
+iTerm2 pane parity (live tail + stacked layout) + pane teardown.
+
+## v0.3.1
+Context-aware pane backend selection + iTerm2 `it2` fix.
+
+## v0.3.0
+Real execution hardening (async exec, multi-repo worktrees, diagnosability).
+
+## v0.2.0
+Real worktree-isolated execution backend.
+
+## v0.1.1
+Recommend pane mode in README.

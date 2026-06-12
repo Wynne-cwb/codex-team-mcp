@@ -20,7 +20,11 @@ export type CompatibilityToolName =
   | "TeamDiagnostics"
   // Phase 12 (D-04): codex-team extension tool (NOT a native Claude tool, same
   // precedent as TeamDiagnostics). The 8 Claude target tools are unchanged.
-  | "TeamMerge";
+  | "TeamMerge"
+  // Phase 16 (T7 / §3.3): codex-team extension tool (NOT a native Claude tool).
+  // Pull unread (and optionally read-history) messages addressed to the caller.
+  // Available to ALL roles; the 8 Claude target tools are unchanged.
+  | "CheckInbox";
 
 export interface ToolMapping {
   claudeToolName: CompatibilityToolName;

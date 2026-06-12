@@ -208,10 +208,12 @@ describe("PaneExecutionBackend (pane-hosted full TUI)", () => {
       metadata: { prompt: "implement the feature" }
     });
 
-    // Full interactive codex TUI: `codex -C <cwd> -a never -s workspace-write <prompt>`.
+    // Full interactive codex TUI: `codex -C <cwd> -a never -s workspace-write
+    // <-c env overrides> <prompt>`. Phase 13: the 3 per-launch `-c` env overrides
+    // appear AFTER `-s <mode>` and BEFORE the positional prompt.
     expect(paneBackend.createCommands).toHaveLength(1);
     const command = paneBackend.createCommands[0];
-    expect(command).toHaveLength(8);
+    expect(command).toHaveLength(14);
     expect(command.slice(0, 7)).toEqual([
       "codex",
       "-C",
@@ -221,8 +223,16 @@ describe("PaneExecutionBackend (pane-hosted full TUI)", () => {
       "-s",
       "workspace-write"
     ]);
+    expect(command.slice(7, 13)).toEqual([
+      "-c",
+      'mcp_servers.codex-team.env.CODEX_TEAM_WORKSPACE_ROOT="/workspace"',
+      "-c",
+      'mcp_servers.codex-team.env.CODEX_TEAM_MEMBER_ID="teammate:team-alpha:builder"',
+      "-c",
+      'mcp_servers.codex-team.env.CODEX_TEAM_MEMBER_ROLE="teammate"'
+    ]);
     // The positional prompt is the behavior-contract preamble + the real task.
-    expect(command[7]).toBe(`${TEAMMATE_PREAMBLE}\n\nimplement the feature`);
+    expect(command[13]).toBe(`${TEAMMATE_PREAMBLE}\n\nimplement the feature`);
     expect(command).not.toContain("exec");
 
     expect(result).toMatchObject({
@@ -360,6 +370,16 @@ describe("PaneExecutionBackend (pane-hosted full TUI)", () => {
     expect(positionalPrompt).toBe(`${TEAMMATE_PREAMBLE}\n\nimplement the feature`);
   });
 
+  // Phase 14 (SC3 norm / D-Q4): the preamble gains the peer-messaging "send once,
+  // end your turn" norm. Asserted against the CONSTANT (no hard-coded copy) so the
+  // exact-array buildStartCommand tests above stay green via interpolation.
+  it("carries the peer-messaging send-once norm in TEAMMATE_PREAMBLE", () => {
+    expect(TEAMMATE_PREAMBLE).toMatch(/teammates?/i);
+    expect(TEAMMATE_PREAMBLE).toContain("TeamDiagnostics");
+    expect(TEAMMATE_PREAMBLE).toMatch(/end your turn/i);
+    expect(TEAMMATE_PREAMBLE).toMatch(/do not keep replying|don't keep replying|do not ping-pong/i);
+  });
+
   it("opens a blank TUI with no preamble when no prompt is present", () => {
     const paneBackend = createFakePaneBackend();
     const backend = new PaneExecutionBackend(
@@ -376,6 +396,9 @@ describe("PaneExecutionBackend (pane-hosted full TUI)", () => {
     });
 
     const command = paneBackend.createCommands[0];
+    // Phase 13: the env -c overrides are injected even with no positional prompt
+    // (env binding is independent of the prompt); the command still ends WITHOUT
+    // a positional prompt.
     expect(command).toEqual([
       "codex",
       "-C",
@@ -383,9 +406,107 @@ describe("PaneExecutionBackend (pane-hosted full TUI)", () => {
       "-a",
       "never",
       "-s",
-      "read-only"
+      "read-only",
+      "-c",
+      'mcp_servers.codex-team.env.CODEX_TEAM_WORKSPACE_ROOT="/workspace"',
+      "-c",
+      'mcp_servers.codex-team.env.CODEX_TEAM_MEMBER_ID="teammate:team-alpha:builder"',
+      "-c",
+      'mcp_servers.codex-team.env.CODEX_TEAM_MEMBER_ROLE="teammate"'
     ]);
     expect(command.join("\n")).not.toContain(TEAMMATE_PREAMBLE);
+  });
+
+  // Phase 13 (SC1 / BIDIR-01 / D-Q3): per-launch `-c` env injection.
+  it("injects shared workspace root, member id, and teammate role via per-launch -c overrides", () => {
+    const paneBackend = createFakePaneBackend();
+    const backend = new PaneExecutionBackend(
+      durableOptions({ paneBackend, locateRollout: () => null })
+    );
+
+    backend.startRun({
+      ...runContext,
+      member_id: "teammate:team-alpha:builder",
+      workspace_root: "/workspace",
+      workspace_path: "/work/tree/run-a",
+      work_classification: "code_implementation",
+      isolation_kind: "git_worktree",
+      metadata: { prompt: "implement the feature" }
+    });
+
+    expect(paneBackend.createCommands[0]).toEqual([
+      "codex",
+      "-C",
+      "/work/tree/run-a",
+      "-a",
+      "never",
+      "-s",
+      "workspace-write",
+      "-c",
+      'mcp_servers.codex-team.env.CODEX_TEAM_WORKSPACE_ROOT="/workspace"',
+      "-c",
+      'mcp_servers.codex-team.env.CODEX_TEAM_MEMBER_ID="teammate:team-alpha:builder"',
+      "-c",
+      'mcp_servers.codex-team.env.CODEX_TEAM_MEMBER_ROLE="teammate"',
+      `${TEAMMATE_PREAMBLE}\n\nimplement the feature`
+    ]);
+    // Per-launch `-c` only — never a bare global CODEX_TEAM_*= env mutation.
+    const joined = paneBackend.createCommands[0].join(" ");
+    expect(joined).not.toMatch(/(^| )CODEX_TEAM_WORKSPACE_ROOT=/);
+    expect(joined).not.toMatch(/(^| )CODEX_TEAM_MEMBER_ID=/);
+    expect(joined).not.toMatch(/(^| )CODEX_TEAM_MEMBER_ROLE=/);
+  });
+
+  it("TOML-escapes quotes and backslashes in injected -c env values", () => {
+    const paneBackend = createFakePaneBackend();
+    const backend = new PaneExecutionBackend(
+      durableOptions({ paneBackend, locateRollout: () => null })
+    );
+
+    backend.startRun({
+      ...runContext,
+      member_id: "teammate:team-alpha:builder",
+      workspace_root: '/a"b\\c',
+      workspace_path: "/work/tree/run-a",
+      work_classification: "read_only",
+      metadata: {}
+    });
+
+    const command = paneBackend.createCommands[0];
+    expect(command).toContain(
+      'mcp_servers.codex-team.env.CODEX_TEAM_WORKSPACE_ROOT="/a\\"b\\\\c"'
+    );
+  });
+
+  it("omits member id/role -c tokens when the run context has no member_id", () => {
+    const paneBackend = createFakePaneBackend();
+    const backend = new PaneExecutionBackend(
+      durableOptions({ paneBackend, locateRollout: () => null })
+    );
+
+    backend.startRun({
+      ...runContext,
+      member_id: null,
+      workspace_root: "/workspace",
+      workspace_path: "/work/tree/run-a",
+      work_classification: "read_only",
+      metadata: {}
+    });
+
+    expect(paneBackend.createCommands[0]).toEqual([
+      "codex",
+      "-C",
+      "/work/tree/run-a",
+      "-a",
+      "never",
+      "-s",
+      "read-only",
+      "-c",
+      'mcp_servers.codex-team.env.CODEX_TEAM_WORKSPACE_ROOT="/workspace"'
+    ]);
+    const joined = paneBackend.createCommands[0].join(" ");
+    expect(joined).not.toContain("CODEX_TEAM_MEMBER_ID");
+    expect(joined).not.toContain("CODEX_TEAM_MEMBER_ROLE");
   });
 });
 

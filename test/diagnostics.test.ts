@@ -23,7 +23,8 @@ import {
   RUN_BACKEND_STATUSES,
   RUN_REVIEW_STATUSES,
   TABLE_NAMES,
-  TASK_STATUSES
+  TASK_STATUSES,
+  TEAM_STATUSES
 } from "../src/state/schema.js";
 import { COMPATIBILITY_TOOLS, TARGET_CLAUDE_TOOLS } from "../src/tools/registry.js";
 
@@ -574,12 +575,12 @@ describe("TeamDiagnostics payload", () => {
       warnings: [],
       migrationStatus: {
         status: "up_to_date",
-        latestVersion: 7,
-        targetVersion: 7,
+        latestVersion: 8,
+        targetVersion: 8,
         pendingMigrations: []
       },
       tableCounts: {
-        schema_migrations: 7,
+        schema_migrations: 8,
         teams: 0,
         members: 0,
         active_bindings: 0,
@@ -1847,5 +1848,581 @@ describe("TeamDiagnostics payload", () => {
     });
 
     expect(payload.debug).toBeUndefined();
+  });
+});
+
+// Phase 17 (UAT): TeamDiagnostics focus filters. The default behavior changed to
+// "active team only" — these cover the new default, the opt-outs that restore the
+// historical multi-team view, explicit selection, archived opt-in, the bounded
+// caps + truncation markers, the teammate filter, and the no-active-team fallback.
+interface SeededTeam {
+  identity: ReturnType<typeof buildWorkspaceScopedCallerIdentity>;
+  teamId: string;
+  bindingKey: string;
+  callerKey: string;
+  members: Record<string, { runId: string; memberId: string }>;
+}
+
+function seedFilterTeam(input: {
+  stateRoot: string;
+  workspaceRoot: string;
+  callerMetadata: unknown;
+  teamName: string;
+  teammates?: string[];
+}): SeededTeam {
+  const caller = normalizeCallerMetadata(input.callerMetadata);
+  const identity = buildWorkspaceScopedCallerIdentity({
+    workspaceRoot: input.workspaceRoot,
+    caller
+  });
+  const adapter = new DurableStateAdapter({
+    stateRoot: input.stateRoot,
+    workspaceRoot: input.workspaceRoot
+  });
+
+  try {
+    const db = adapter.getDatabase();
+    const statePath = adapter.describeStateRoot().stateRoot;
+    const created = new TeamService({ db, statePath }).createTeam({
+      teamName: input.teamName,
+      description: `${input.teamName} focus-filter diagnostics`,
+      identity
+    });
+    const agentService = new AgentService({ db, statePath });
+    const members: Record<string, { runId: string; memberId: string }> = {};
+    for (const name of input.teammates ?? []) {
+      const agent = agentService.createAgent({
+        name,
+        teamName: created.team_name,
+        prompt: `Sensitive ${name} prompt must not appear`,
+        description: `Create focus-filter ${name}`,
+        identity
+      }) as unknown as ScheduledAgentLike;
+      members[name] = {
+        runId: agent.run_id,
+        memberId: agent.debug.internal_member_id
+      };
+    }
+
+    return {
+      identity,
+      teamId: created.active_binding.team_id,
+      bindingKey: identity.bindingKey,
+      callerKey: identity.callerKey,
+      members
+    };
+  } finally {
+    adapter.close();
+  }
+}
+
+function withDiagnosticsDb<T>(
+  stateRoot: string,
+  workspaceRoot: string,
+  fn: (db: ReturnType<DurableStateAdapter["getDatabase"]>) => T
+): T {
+  const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+  try {
+    return fn(adapter.getDatabase());
+  } finally {
+    adapter.close();
+  }
+}
+
+function sendDiagnosticsMessages(input: {
+  stateRoot: string;
+  workspaceRoot: string;
+  identity: ReturnType<typeof buildWorkspaceScopedCallerIdentity>;
+  teamName: string;
+  to: string;
+  bodies: string[];
+}): void {
+  const adapter = new DurableStateAdapter({
+    stateRoot: input.stateRoot,
+    workspaceRoot: input.workspaceRoot
+  });
+  try {
+    const messageService = new MessageService({
+      db: adapter.getDatabase(),
+      statePath: adapter.describeStateRoot().stateRoot
+    });
+    for (const [index, body] of input.bodies.entries()) {
+      messageService.sendMessage({
+        teamName: input.teamName,
+        to: input.to,
+        message: body,
+        summary: `focus-filter message ${index}`,
+        identity: input.identity
+      });
+    }
+  } finally {
+    adapter.close();
+  }
+}
+
+function knownTeamNames(
+  payload: ReturnType<typeof buildDiagnosticsPayload>
+): string[] {
+  return payload.state.status === "durable"
+    ? payload.state.knownTeams.map((team) => team.team_name)
+    : [];
+}
+
+function recentEventsOf(
+  payload: ReturnType<typeof buildDiagnosticsPayload>
+): unknown[] {
+  return payload.state.status === "durable" ? payload.state.recentEvents : [];
+}
+
+function teammateIdsOf(
+  payload: ReturnType<typeof buildDiagnosticsPayload>
+): string[] {
+  return payload.teammates.map((teammate) => teammate.teammate_id ?? "");
+}
+
+describe("TeamDiagnostics focus filters (Phase 17)", () => {
+  it("defaults to the caller's active team only and excludes other workspace teams", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace";
+    const alphaCaller = { sessionId: "alpha-session", clientName: "codex" };
+    const betaCaller = { sessionId: "beta-session", clientName: "codex" };
+
+    seedFilterTeam({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      teamName: "Alpha Team",
+      teammates: ["Builder"]
+    });
+    seedFilterTeam({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: betaCaller,
+      teamName: "Beta Team",
+      teammates: ["Outsider"]
+    });
+
+    const payload = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+
+    expect(payload.scope).toMatchObject({
+      mode: "single_team",
+      team_name: "alpha-team",
+      current_team_only: true,
+      include_archived: false,
+      include_history: false,
+      fallback_reason: null
+    });
+    expect(knownTeamNames(payload)).toEqual(["alpha-team"]);
+    expect(teammateIdsOf(payload)).toContain("builder@alpha-team");
+    expect(teammateIdsOf(payload)).not.toContain("outsider@beta-team");
+  });
+
+  it("restores multi-team output with current_team_only:false and with include_history:true", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace";
+    const alphaCaller = { sessionId: "alpha-session", clientName: "codex" };
+    const betaCaller = { sessionId: "beta-session", clientName: "codex" };
+
+    seedFilterTeam({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      teamName: "Alpha Team",
+      teammates: ["Builder"]
+    });
+    seedFilterTeam({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: betaCaller,
+      teamName: "Beta Team",
+      teammates: ["Outsider"]
+    });
+
+    const multi = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      currentTeamOnly: false,
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+    expect(multi.scope.mode).toBe("multi_team");
+    expect(knownTeamNames(multi).sort()).toEqual(["alpha-team", "beta-team"]);
+    expect(teammateIdsOf(multi)).toEqual(
+      expect.arrayContaining(["builder@alpha-team", "outsider@beta-team"])
+    );
+
+    const history = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      includeHistory: true,
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+    expect(history.scope.mode).toBe("multi_team");
+    expect(knownTeamNames(history).sort()).toEqual(["alpha-team", "beta-team"]);
+  });
+
+  it("selects a specific non-active team by team_name", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace";
+    const alphaCaller = { sessionId: "alpha-session", clientName: "codex" };
+    const betaCaller = { sessionId: "beta-session", clientName: "codex" };
+
+    seedFilterTeam({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      teamName: "Alpha Team",
+      teammates: ["Builder"]
+    });
+    seedFilterTeam({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: betaCaller,
+      teamName: "Beta Team",
+      teammates: ["Outsider"]
+    });
+
+    // alphaCaller is bound to alpha-team, but team_name explicitly selects beta-team.
+    const payload = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      teamName: "Beta Team",
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+
+    expect(payload.scope).toMatchObject({
+      mode: "single_team",
+      team_name: "beta-team"
+    });
+    expect(knownTeamNames(payload)).toEqual(["beta-team"]);
+    expect(teammateIdsOf(payload)).toEqual(["outsider@beta-team"]);
+  });
+
+  it("excludes archived teams by default and includes them under include_archived", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace";
+    const alphaCaller = { sessionId: "alpha-session", clientName: "codex" };
+    const gammaCaller = { sessionId: "gamma-session", clientName: "codex" };
+
+    seedFilterTeam({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      teamName: "Alpha Team",
+      teammates: ["Builder"]
+    });
+    const gamma = seedFilterTeam({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: gammaCaller,
+      teamName: "Gamma Team"
+    });
+    withDiagnosticsDb(stateRoot, workspaceRoot, (db) => {
+      db.prepare(
+        `UPDATE ${TABLE_NAMES.teams} SET status = ? WHERE team_id = ?`
+      ).run(TEAM_STATUSES.archived, gamma.teamId);
+    });
+
+    const byDefault = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      currentTeamOnly: false,
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+    expect(knownTeamNames(byDefault)).toContain("alpha-team");
+    expect(knownTeamNames(byDefault)).not.toContain("gamma-team");
+
+    const withArchived = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      currentTeamOnly: false,
+      includeArchived: true,
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+    expect(knownTeamNames(withArchived)).toContain("gamma-team");
+  });
+
+  it("excludes archived teammates by default and includes them under include_archived", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace";
+    const alphaCaller = { sessionId: "alpha-session", clientName: "codex" };
+
+    const alpha = seedFilterTeam({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      teamName: "Alpha Team",
+      teammates: ["Builder", "Ghost"]
+    });
+    withDiagnosticsDb(stateRoot, workspaceRoot, (db) => {
+      db.prepare(
+        `UPDATE ${TABLE_NAMES.members} SET status = ? WHERE member_id = ?`
+      ).run(MEMBER_STATUSES.archived, alpha.members.Ghost.memberId);
+    });
+
+    const byDefault = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+    expect(teammateIdsOf(byDefault)).toContain("builder@alpha-team");
+    expect(teammateIdsOf(byDefault)).not.toContain("ghost@alpha-team");
+
+    const withArchived = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      includeArchived: true,
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+    expect(teammateIdsOf(withArchived)).toContain("ghost@alpha-team");
+  });
+
+  it("caps events and runs to the newest N and marks the truncation", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace";
+    const alphaCaller = { sessionId: "alpha-session", clientName: "codex" };
+
+    seedFilterTeam({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      teamName: "Alpha Team",
+      teammates: ["Builder", "Helper", "Scout"]
+    });
+
+    const payload = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      includeDebug: true,
+      maxEvents: 1,
+      maxRuns: 1,
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+
+    expect(recentEventsOf(payload)).toHaveLength(1);
+    expect(payload.scope.events_returned).toBe(1);
+    expect(payload.scope.events_truncated).toBe(true);
+    expect(payload.scope.caps.max_events).toBe(1);
+
+    expect(payload.debug?.runs).toHaveLength(1);
+    expect(payload.scope.runs_returned).toBe(1);
+    expect(payload.scope.runs_truncated).toBe(true);
+    expect(payload.scope.caps.max_runs).toBe(1);
+  });
+
+  it("caps messages to the newest N and marks the truncation", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace";
+    const alphaCaller = { sessionId: "alpha-session", clientName: "codex" };
+
+    const alpha = seedFilterTeam({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      teamName: "Alpha Team",
+      teammates: ["Builder"]
+    });
+    sendDiagnosticsMessages({
+      stateRoot,
+      workspaceRoot,
+      identity: alpha.identity,
+      teamName: "alpha-team",
+      to: "Builder",
+      bodies: ["first body", "second body", "third body"]
+    });
+
+    const payload = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      maxMessages: 1,
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+    const messageSummary =
+      payload.state.status === "durable"
+        ? payload.state.messageSummary
+        : { total: 0 };
+
+    expect(messageSummary.total).toBe(1);
+    expect(payload.scope.messages_matched).toBe(3);
+    expect(payload.scope.messages_returned).toBe(1);
+    expect(payload.scope.messages_truncated).toBe(true);
+    expect(payload.scope.caps.max_messages).toBe(1);
+  });
+
+  it("filters the message listing by messages_since", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace";
+    const alphaCaller = { sessionId: "alpha-session", clientName: "codex" };
+
+    const alpha = seedFilterTeam({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      teamName: "Alpha Team",
+      teammates: ["Builder"]
+    });
+    sendDiagnosticsMessages({
+      stateRoot,
+      workspaceRoot,
+      identity: alpha.identity,
+      teamName: "alpha-team",
+      to: "Builder",
+      bodies: ["old body", "new body"]
+    });
+    // Pin deterministic timestamps either side of the messages_since boundary.
+    withDiagnosticsDb(stateRoot, workspaceRoot, (db) => {
+      const rows = db
+        .prepare(
+          `SELECT message_id FROM ${TABLE_NAMES.messages} ORDER BY rowid ASC`
+        )
+        .all() as Array<{ message_id: string }>;
+      db.prepare(
+        `UPDATE ${TABLE_NAMES.messages} SET created_at = ? WHERE message_id = ?`
+      ).run("2026-01-01T00:00:00.000Z", rows[0].message_id);
+      db.prepare(
+        `UPDATE ${TABLE_NAMES.messages} SET created_at = ? WHERE message_id = ?`
+      ).run("2026-12-01T00:00:00.000Z", rows[1].message_id);
+    });
+
+    const payload = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      messagesSince: "2026-06-01T00:00:00.000Z",
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+    const messageSummary =
+      payload.state.status === "durable"
+        ? payload.state.messageSummary
+        : { total: 0 };
+
+    expect(messageSummary.total).toBe(1);
+    expect(payload.scope.messages_matched).toBe(1);
+    expect(payload.scope.caps.messages_since).toBe("2026-06-01T00:00:00.000Z");
+  });
+
+  it("restricts teammate, run, and message detail to one teammate via teammate_id", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace";
+    const alphaCaller = { sessionId: "alpha-session", clientName: "codex" };
+
+    const alpha = seedFilterTeam({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      teamName: "Alpha Team",
+      teammates: ["Builder", "Helper"]
+    });
+
+    const payload = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      includeDebug: true,
+      teammateId: "builder@alpha-team",
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+
+    expect(payload.scope.teammate_id).toBe("builder@alpha-team");
+    expect(teammateIdsOf(payload)).toEqual(["builder@alpha-team"]);
+    expect(payload.debug?.runs).toHaveLength(1);
+    expect(payload.debug?.runs?.[0]?.member_id).toBe(alpha.members.Builder.memberId);
+  });
+
+  it("falls back to a compact known-teams list when there is no active team", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace";
+    const alphaCaller = { sessionId: "alpha-session", clientName: "codex" };
+    const betaCaller = { sessionId: "beta-session", clientName: "codex" };
+    // A third caller that never created/joined a team -> no active binding.
+    const observerCaller = { sessionId: "observer-session", clientName: "codex" };
+
+    seedFilterTeam({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      teamName: "Alpha Team",
+      teammates: ["Builder"]
+    });
+    seedFilterTeam({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: betaCaller,
+      teamName: "Beta Team",
+      teammates: ["Outsider"]
+    });
+
+    const payload = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: observerCaller,
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+
+    expect(payload.scope).toMatchObject({
+      mode: "known_teams_fallback",
+      team_id: null,
+      fallback_reason: "no_active_team"
+    });
+    // Not blank/misleading: the full team list is offered so the user can pick.
+    expect(knownTeamNames(payload).sort()).toEqual(["alpha-team", "beta-team"]);
+    // Compact: no per-team detail is dumped while unfocused.
+    expect(payload.teammates).toEqual([]);
+  });
+
+  it("falls back to known teams when team_name does not match", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace";
+    const alphaCaller = { sessionId: "alpha-session", clientName: "codex" };
+
+    seedFilterTeam({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      teamName: "Alpha Team",
+      teammates: ["Builder"]
+    });
+
+    const payload = buildDiagnosticsPayload({
+      stateRoot,
+      workspaceRoot,
+      callerMetadata: alphaCaller,
+      teamName: "Nonexistent Team",
+      targetClaudeTools: TARGET_CLAUDE_TOOLS,
+      registeredTools: COMPATIBILITY_TOOLS
+    });
+
+    expect(payload.scope).toMatchObject({
+      mode: "known_teams_fallback",
+      fallback_reason: "team_name_not_found"
+    });
+    expect(knownTeamNames(payload)).toEqual(["alpha-team"]);
+    expect(payload.teammates).toEqual([]);
   });
 });

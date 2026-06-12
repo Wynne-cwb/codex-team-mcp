@@ -23,7 +23,8 @@ const expectedToolStatuses = {
   TaskList: "implemented",
   TaskGet: "implemented",
   TeamDiagnostics: "implemented",
-  TeamMerge: "implemented"
+  TeamMerge: "implemented",
+  CheckInbox: "implemented"
 };
 
 describe("compatibility tool registry", () => {
@@ -31,10 +32,15 @@ describe("compatibility tool registry", () => {
     expect([...TARGET_CLAUDE_TOOLS]).toEqual(expectedTargetTools);
   });
 
-  it("registers all target tools plus TeamDiagnostics and TeamMerge", () => {
+  it("registers all target tools plus TeamDiagnostics, TeamMerge, and CheckInbox", () => {
     const names = COMPATIBILITY_TOOLS.map((tool) => tool.codexToolName);
 
-    expect(names).toEqual([...expectedTargetTools, "TeamDiagnostics", "TeamMerge"]);
+    expect(names).toEqual([
+      ...expectedTargetTools,
+      "TeamDiagnostics",
+      "TeamMerge",
+      "CheckInbox"
+    ]);
   });
 
   it("keeps the 8 Claude target tools unchanged when codex-team extensions are added", () => {
@@ -43,6 +49,21 @@ describe("compatibility tool registry", () => {
     expect(TARGET_CLAUDE_TOOLS).toHaveLength(8);
     expect([...TARGET_CLAUDE_TOOLS]).not.toContain("TeamMerge");
     expect([...TARGET_CLAUDE_TOOLS]).not.toContain("TeamDiagnostics");
+  });
+
+  it("reports CheckInbox as an implemented codex-team extension (not a native Claude tool)", () => {
+    const checkInbox = COMPATIBILITY_TOOLS.find(
+      (tool) => tool.codexToolName === "CheckInbox"
+    );
+
+    expect(checkInbox).toMatchObject({
+      status: "implemented",
+      nextPhase: "Phase 16"
+    });
+    expect(checkInbox?.description).toContain("codex-team extension");
+    expect(checkInbox?.description).toContain("Available to all roles");
+    // CheckInbox is a codex-team extension, NOT one of the 8 Claude target tools.
+    expect([...TARGET_CLAUDE_TOOLS]).not.toContain("CheckInbox");
   });
 
   it("reports TeamMerge as an implemented codex-team extension (not a native Claude tool)", () => {

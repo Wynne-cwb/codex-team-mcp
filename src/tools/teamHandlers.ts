@@ -4,6 +4,7 @@ import type Database from "better-sqlite3";
 import { z, ZodError } from "zod";
 
 import { normalizeCallerMetadata } from "../context/caller.js";
+import { enforceTeammateCapability } from "./capabilityGuard.js";
 import { buildWorkspaceScopedCallerIdentity } from "../services/callerIdentity.js";
 import { ContextResolver } from "../services/contextResolver.js";
 import {
@@ -72,6 +73,19 @@ export function createTeamCreateHandler(
     });
 
     try {
+      const denial = enforceTeammateCapability({
+        tool: "TeamCreate",
+        identity,
+        db: adapter.getDatabase()
+      });
+      if (denial) {
+        return jsonResponse({
+          implemented_now: true,
+          status: "error",
+          error_code: denial.error_code,
+          message: denial.message
+        });
+      }
       const input = teamCreateInputSchema.parse(args);
       const service = new TeamService({
         db: adapter.getDatabase(),
@@ -129,6 +143,19 @@ export function createTeamDeleteHandler(
     });
 
     try {
+      const denial = enforceTeammateCapability({
+        tool: "TeamDelete",
+        identity,
+        db: adapter.getDatabase()
+      });
+      if (denial) {
+        return jsonResponse({
+          implemented_now: true,
+          status: "error",
+          error_code: denial.error_code,
+          message: denial.message
+        });
+      }
       const input = parseTeamDeleteInput(args);
       const service = new TeamService({
         db: adapter.getDatabase(),

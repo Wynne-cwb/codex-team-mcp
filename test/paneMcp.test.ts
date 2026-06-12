@@ -291,13 +291,14 @@ describe("pane MCP routing", () => {
       "TaskList",
       "TaskGet"
     ]);
-    // Phase 12 adds the TeamMerge codex-team extension (same precedent as
-    // TeamDiagnostics); the 8 Claude target tools are unchanged and there are
-    // still no kill/terminate controls.
+    // Phase 12 adds the TeamMerge codex-team extension and Phase 16 adds CheckInbox
+    // (same precedent as TeamDiagnostics); the 8 Claude target tools are unchanged
+    // and there are still no kill/terminate controls.
     expect(toolNames).toEqual([
       ...TARGET_CLAUDE_TOOLS,
       "TeamDiagnostics",
-      "TeamMerge"
+      "TeamMerge",
+      "CheckInbox"
     ]);
     expect(toolNames).not.toEqual(
       expect.arrayContaining([

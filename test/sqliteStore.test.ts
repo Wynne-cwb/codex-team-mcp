@@ -410,7 +410,8 @@ describe("SQLite durable store", () => {
       4,
       5,
       6,
-      7
+      7,
+      8
     ]);
     expect(tableNames(db)).toEqual(expect.arrayContaining(requiredTables));
     expect(tableNames(db)).toEqual(expect.arrayContaining(["task_edges", "task_events"]));
@@ -460,8 +461,8 @@ describe("SQLite durable store", () => {
 
     expect(getMigrationStatus(db)).toMatchObject({
       status: "up_to_date",
-      targetVersion: 7,
-      latestVersion: 7
+      targetVersion: 8,
+      latestVersion: 8
     });
     expect(tableColumns(db, TABLE_NAMES.runs)).toEqual(
       expect.arrayContaining(expectedMergeAuditColumns)
@@ -487,8 +488,8 @@ describe("SQLite durable store", () => {
 
     expect(getMigrationStatus(db)).toMatchObject({
       status: "up_to_date",
-      targetVersion: 7,
-      latestVersion: 7
+      targetVersion: 8,
+      latestVersion: 8
     });
     expect(tableColumns(db, TABLE_NAMES.runs)).toEqual(
       expect.arrayContaining(expectedRepoDecouplingColumns)
@@ -540,12 +541,13 @@ describe("SQLite durable store", () => {
 
     const upgrade = runMigrations(db);
     expect(upgrade.appliedMigrations.map((migration) => migration.version)).toEqual([
-      7
+      7,
+      8
     ]);
     expect(getMigrationStatus(db)).toMatchObject({
       status: "up_to_date",
-      latestVersion: 7,
-      targetVersion: 7
+      latestVersion: 8,
+      targetVersion: 8
     });
     expect(tableColumns(db, TABLE_NAMES.runs)).toContain("worktree_repo_root");
     // No data loss: the seeded run survived, the new column defaults to NULL.
@@ -613,7 +615,8 @@ describe("SQLite durable store", () => {
       4,
       5,
       6,
-      7
+      7,
+      8
     ]);
     expect(uniqueIndexes(db, "teams")).toContain(
       "idx_teams_workspace_canonical_name"
@@ -636,7 +639,8 @@ describe("SQLite durable store", () => {
       4,
       5,
       6,
-      7
+      7,
+      8
     ]);
     expect(result.appliedMigrations[0]?.name).toContain(
       "expand message and task coordination state"
@@ -825,7 +829,7 @@ describe("SQLite durable store", () => {
     ).toMatchObject({ canonical_name: "persisted" });
     expect(
       reopened.db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()
-    ).toMatchObject({ count: 7 });
+    ).toMatchObject({ count: 8 });
 
     reopened.db.close();
   });
@@ -872,8 +876,8 @@ describe("DurableStateAdapter", () => {
     expect(description.databasePath).toBe(path.join(stateRoot, STATE_DB_FILENAME));
     expect(description.migrationStatus).toMatchObject({
       status: "up_to_date",
-      latestVersion: 7,
-      targetVersion: 7,
+      latestVersion: 8,
+      targetVersion: 8,
       pendingMigrations: []
     });
     expect(description.tableCounts).toMatchObject({
@@ -919,7 +923,7 @@ describe("DurableStateAdapter", () => {
 
     expect(description.migrationStatus.status).toBe("up_to_date");
     expect(description.tableCounts.teams).toBe(1);
-    expect(description.tableCounts.schema_migrations).toBe(7);
+    expect(description.tableCounts.schema_migrations).toBe(8);
     expect(description.tableCounts.task_edges).toBe(0);
     expect(description.tableCounts.task_events).toBe(0);
 

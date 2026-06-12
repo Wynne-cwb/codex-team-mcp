@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -21,15 +22,22 @@ import type {
   PaneReconcileResult
 } from "../src/adapters/paneBackend.js";
 import { LifecycleService } from "../src/services/lifecycleService.js";
+import {
+  WorkspaceSafetyService,
+  type WorkspaceInspectionInput,
+  type WorkspaceInspectionResult
+} from "../src/services/workspaceSafetyService.js";
 import { createTeamDeleteHandler } from "../src/tools/teamHandlers.js";
 import { buildDiagnosticsPayload } from "../src/diagnostics.js";
 import { normalizeCallerMetadata } from "../src/context/caller.js";
 import { AgentService } from "../src/services/agentService.js";
 import { buildWorkspaceScopedCallerIdentity } from "../src/services/callerIdentity.js";
 import { MessageService } from "../src/services/messageService.js";
+import { ReconciliationService } from "../src/services/reconciliationService.js";
 import { TeamService } from "../src/services/teamService.js";
 import { DurableStateAdapter } from "../src/state/durableState.js";
 import {
+  EVENT_TYPES,
   MEMBER_STATUSES,
   MESSAGE_DELIVERY_STATUSES,
   RUN_BACKEND_STATUSES,
@@ -1064,11 +1072,11 @@ describe("lifecycle pane visibility overlay", () => {
   });
 });
 
-describe("SendMessage full-body delivery to a resumed teammate (做法 1 escalation loop)", () => {
+describe("SendMessage short-nudge delivery to a resumed teammate (Phase 16 notify + pull)", () => {
   const FULL_BODY_SENTINEL =
     "FULL_BODY_DELIVERY_SENTINEL: the complete human answer the teammate must receive verbatim.";
 
-  it("threads the full body into the resume context as resume_delivery_text without persisting it (D-02)", () => {
+  it("threads only a SHORT bounded inbox nudge into the resume context — never the full body (notify + pull, D-02)", () => {
     const stateRoot = createTempStateRoot();
     const workspaceRoot = "/workspace/full-body-delivery";
     const callerMetadata = { sessionId: "session-1", clientName: "codex" };
@@ -1120,10 +1128,19 @@ describe("SendMessage full-body delivery to a resumed teammate (做法 1 escalat
         identity
       });
 
-      // The resume CONTEXT carried the full body verbatim (not just the summary).
+      // Phase 16 (notify + pull): the resume CONTEXT now carries a SHORT inbox NUDGE
+      // (count + senders) as resume_delivery_text — NEVER the full body. The recipient
+      // pulls the full body over MCP/JSON via CheckInbox.
       expect(fakeExec.resumeCalls).toHaveLength(1);
       const resumeMeta = fakeExec.resumeCalls[0].context.metadata ?? {};
-      expect(resumeMeta.resume_delivery_text).toBe(FULL_BODY_SENTINEL);
+      const nudge = resumeMeta.resume_delivery_text;
+      expect(typeof nudge).toBe("string");
+      expect(nudge).toContain("CheckInbox");
+      // The full body is NEVER injected into the pane (the long-body hazard is gone).
+      expect(nudge).not.toContain(FULL_BODY_SENTINEL);
+      // Bounded + single line, independent of body size.
+      expect((nudge as string).length).toBeLessThan(512);
+      expect(nudge as string).not.toMatch(/[\r\n]/);
       // The non-sensitive summary still rides alongside (the fallback channel).
       expect(resumeMeta.summary).toBe("short summary");
 
@@ -1681,5 +1698,480 @@ describe("lifecycle pane teardown (TeamDelete / shutdown_request)", () => {
     // Pane mode is off in this handler path, so teardown is a clean no-op — its
     // mere presence proves the wiring runs before archive without breaking it.
     expect(response.pane_teardown).toEqual({ attempted: 0, closed: 0 });
+  });
+
+  // ---------------------------------------------------------------------------
+  // BUG #4: an intentional teardown of a RUNNING teammate is a clean stop, not a
+  // crash. The run + member become `stopped`, last_error is never the gone-pane
+  // reason, a teammate_stopped (not teammate_backend_failed) event is recorded, and
+  // a later reconcile cannot flip it to failed.
+  // ---------------------------------------------------------------------------
+
+  const PANE_PROCESS_GONE = "codex_pane_exited_without_completion";
+
+  // Seed a RUNNING pane-hosted teammate (the execution backend owns a live pane).
+  function seedRunningPaneTeammate(input: {
+    db: ReturnType<DurableStateAdapter["getDatabase"]>;
+    statePath: string;
+    identity: ReturnType<typeof buildIdentity>;
+    paneBackend: PaneBackendRegistry;
+    name: string;
+  }): ScheduledAgentLike {
+    return new AgentService({
+      db: input.db,
+      statePath: input.statePath,
+      executionBackend: new FakePaneHostedExecutionBackend(),
+      paneMode: { enabled: true },
+      paneBackend: input.paneBackend
+    }).createAgent({
+      name: input.name,
+      teamName: "alpha-team",
+      mode: "read",
+      prompt: SECRET_PANE_VISIBILITY_PROMPT,
+      description: `Running ${input.name}`,
+      identity: input.identity
+    }) as unknown as ScheduledAgentLike;
+  }
+
+  function readRunStatus(
+    db: ReturnType<DurableStateAdapter["getDatabase"]>,
+    runId: string
+  ): { status: string; backend_status: string | null; last_error: string | null } {
+    return db
+      .prepare(
+        `SELECT status, backend_status, last_error FROM ${TABLE_NAMES.runs} WHERE run_id = ?`
+      )
+      .get(runId) as {
+      status: string;
+      backend_status: string | null;
+      last_error: string | null;
+    };
+  }
+
+  function readEventTypes(
+    db: ReturnType<DurableStateAdapter["getDatabase"]>
+  ): string[] {
+    return (
+      db.prepare(`SELECT event_type FROM ${TABLE_NAMES.events}`).all() as Array<{
+        event_type: string;
+      }>
+    ).map((row) => row.event_type);
+  }
+
+  it("shutdown_request marks a running teammate stopped (not failed) and survives a later reconcile", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace/pane-teardown";
+    const identity = buildIdentity(workspaceRoot);
+    const fakePane = new FakeAvailablePaneBackend({
+      mode: "pane",
+      backend_type: "iterm2",
+      availability_status: "available",
+      pane_id: "iterm-pane-1",
+      session_name: "w0t0p0:session"
+    });
+
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    try {
+      const db = adapter.getDatabase();
+      const statePath = adapter.describeStateRoot().stateRoot;
+      new TeamService({ db, statePath }).createTeam({
+        teamName: "Alpha Team",
+        description: "Shutdown stopped team",
+        identity
+      });
+      const builder = seedRunningPaneTeammate({
+        db,
+        statePath,
+        identity,
+        paneBackend: fakePane,
+        name: "Builder"
+      });
+      // Sanity: the pane-hosted teammate is genuinely running before shutdown.
+      expect(readRunStatus(db, builder.run_id).status).toBe(MEMBER_STATUSES.running);
+
+      const result = new MessageService({
+        db,
+        statePath,
+        executionBackend: new FakePaneHostedExecutionBackend(),
+        paneMode: { enabled: true },
+        paneBackend: fakePane
+      }).sendMessage({
+        teamName: "alpha-team",
+        to: "Builder",
+        message: { type: "shutdown_request" },
+        summary: "shutdown",
+        identity
+      });
+
+      expect(result.persisted).toBe(true);
+      expect(
+        (result as { pane_teardown?: { attempted: number; closed: number } })
+          .pane_teardown
+      ).toEqual({ attempted: 1, closed: 1 });
+
+      // The run + member are a CLEAN stop — never failed, never the gone-pane error.
+      const run = readRunStatus(db, builder.run_id);
+      expect(run.status).toBe(MEMBER_STATUSES.stopped);
+      expect(run.backend_status).toBe(RUN_BACKEND_STATUSES.stopped);
+      expect(run.last_error).not.toBe(PANE_PROCESS_GONE);
+      expect(run.last_error).toBeNull();
+      expect(
+        readMemberPaneStatus(db, builder.debug.internal_member_id)
+      ).toBe("unavailable");
+
+      let events = readEventTypes(db);
+      expect(events).toContain(EVENT_TYPES.teammateStopped);
+      expect(events).not.toContain(EVENT_TYPES.teammateBackendFailed);
+
+      // A SUBSEQUENT reconcile must NOT re-classify the intentional stop as failed:
+      // a stopped run is outside the running set, so it is never reconciled.
+      new ReconciliationService({
+        db,
+        statePath,
+        executionBackend: new FakePaneHostedExecutionBackend()
+      }).reconcileWorkspace({
+        workspaceRoot,
+        actorCallerKey: identity.callerKey,
+        mode: "finalize"
+      });
+
+      expect(readRunStatus(db, builder.run_id).status).toBe(MEMBER_STATUSES.stopped);
+      events = readEventTypes(db);
+      expect(events).not.toContain(EVENT_TYPES.teammateBackendFailed);
+    } finally {
+      adapter.close();
+    }
+  });
+
+  it("TeamDelete teardown (closePanesForTeam) marks a running teammate stopped (not failed)", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace/pane-teardown";
+    const identity = buildIdentity(workspaceRoot);
+    const fakePane = new FakeAvailablePaneBackend({
+      mode: "pane",
+      backend_type: "iterm2",
+      availability_status: "available",
+      pane_id: "iterm-pane-1",
+      session_name: "w0t0p0:session"
+    });
+
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    try {
+      const db = adapter.getDatabase();
+      const statePath = adapter.describeStateRoot().stateRoot;
+      new TeamService({ db, statePath }).createTeam({
+        teamName: "Alpha Team",
+        description: "TeamDelete stopped team",
+        identity
+      });
+      const builder = seedRunningPaneTeammate({
+        db,
+        statePath,
+        identity,
+        paneBackend: fakePane,
+        name: "Builder"
+      });
+      const { team_id } = readRunIds(db);
+      expect(readRunStatus(db, builder.run_id).status).toBe(MEMBER_STATUSES.running);
+
+      // closePanesForTeam is exactly what the TeamDelete handler invokes before
+      // archive (closeTeamPanesBestEffort -> LifecycleService.closePanesForTeam).
+      const summary = new LifecycleService({
+        db,
+        statePath,
+        paneBackend: fakePane
+      }).closePanesForTeam(team_id);
+      expect(summary).toEqual({ attempted: 1, closed: 1 });
+
+      const run = readRunStatus(db, builder.run_id);
+      // The run is a clean stop, NOT a gone-pane failure.
+      expect(run.status).toBe(MEMBER_STATUSES.stopped);
+      expect(run.backend_status).toBe(RUN_BACKEND_STATUSES.stopped);
+      expect(run.last_error).not.toBe(PANE_PROCESS_GONE);
+      expect(readMemberPaneStatus(db, builder.debug.internal_member_id)).toBe(
+        "unavailable"
+      );
+      const events = readEventTypes(db);
+      expect(events).toContain(EVENT_TYPES.teammateStopped);
+      expect(events).not.toContain(EVENT_TYPES.teammateBackendFailed);
+    } finally {
+      adapter.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX #3: a teammate's FINAL terminal transition under TeamDelete / shutdown is the
+// teardown-stop path (markRunStoppedByTeardown), which the reconcile-side
+// changed_files capture never reaches. Without a capture here, changed_files_json
+// keeps a STALE pre-stop snapshot (the real UAT bug: a teammate reverted a change
+// but diagnostics still listed it). The teardown must re-capture the worktree's
+// FINAL state ONCE, best-effort, touching ONLY changed_files_json + diff_summary.
+// ---------------------------------------------------------------------------
+
+describe("lifecycle teardown changed_files capture (FIX #3)", () => {
+  const TEARDOWN_PANE: PaneBackendMetadata = {
+    mode: "pane",
+    backend_type: "iterm2",
+    availability_status: "available",
+    pane_id: "iterm-pane-capture",
+    session_name: "w0t0p0:session"
+  };
+
+  // An inspection path that THROWS — proves the teardown capture is best-effort
+  // (degrades to leaving changed_files as-is, never breaks the stop transition).
+  class ThrowingTeardownSafetyService extends WorkspaceSafetyService {
+    inspectCalls = 0;
+    inspectWorkspace(_input: WorkspaceInspectionInput): WorkspaceInspectionResult {
+      this.inspectCalls += 1;
+      throw new Error("inspect boom: teardown capture");
+    }
+  }
+
+  // A real temp git repo. dirty:true leaves an uncommitted change at stop time;
+  // dirty:false leaves a CLEAN working tree (mirrors a teammate that reverted).
+  function createGitWorkspace(options: { dirty: boolean }): {
+    workspacePath: string;
+    baseRevision: string;
+  } {
+    const workspacePath = mkdtempSync(
+      path.join(tmpdir(), "codex-team-teardown-git-")
+    );
+    tempRoots.push(workspacePath);
+    const git = (args: string[]): string =>
+      execFileSync("git", args, {
+        cwd: workspacePath,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+    git(["init"]);
+    git(["config", "user.email", "test@example.com"]);
+    git(["config", "user.name", "Codex Test"]);
+    writeFileSync(path.join(workspacePath, "package.json"), '{"name":"base"}\n');
+    git(["add", "package.json"]);
+    git(["commit", "-m", "base"]);
+    const baseRevision = git(["rev-parse", "HEAD"]).trim();
+    if (options.dirty) {
+      writeFileSync(
+        path.join(workspacePath, "package.json"),
+        '{"name":"changed"}\n'
+      );
+    }
+    return { workspacePath, baseRevision };
+  }
+
+  function createTeamId(
+    db: ReturnType<DurableStateAdapter["getDatabase"]>,
+    statePath: string,
+    identity: ReturnType<typeof buildIdentity>
+  ): string {
+    new TeamService({ db, statePath }).createTeam({
+      teamName: "Alpha Team",
+      description: "Teardown capture team",
+      identity
+    });
+    return (
+      db.prepare(`SELECT team_id FROM ${TABLE_NAMES.teams} LIMIT 1`).get() as {
+        team_id: string;
+      }
+    ).team_id;
+  }
+
+  // Seed a RUNNING pane teammate run bound to a worktree, with a STALE changed_files
+  // snapshot to prove the teardown capture overwrites it with the FINAL state.
+  function seedRunningWorktreeRun(input: {
+    db: ReturnType<DurableStateAdapter["getDatabase"]>;
+    teamId: string;
+    workspaceRoot: string;
+    memberId: string;
+    runId: string;
+    workspacePath: string;
+    baseRevision: string;
+    staleChangedFiles: string[];
+  }): void {
+    input.db
+      .prepare(
+        `INSERT INTO ${TABLE_NAMES.members}
+           (member_id, team_id, display_name, role, status, workspace_root, joined_at, metadata_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        input.memberId,
+        input.teamId,
+        "Builder",
+        "teammate",
+        MEMBER_STATUSES.running,
+        input.workspaceRoot,
+        "2026-06-05T00:00:00.000Z",
+        JSON.stringify({ publicTeammateId: `${input.memberId}@alpha-team` })
+      );
+    input.db
+      .prepare(
+        `INSERT INTO ${TABLE_NAMES.runs}
+           (run_id, team_id, member_id, status, backend, workspace_path, metadata_json,
+            created_at, updated_at, last_error, backend_status, base_revision,
+            review_status, changed_files_json, diff_summary)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        input.runId,
+        input.teamId,
+        input.memberId,
+        MEMBER_STATUSES.running,
+        "codex_cli_exec",
+        input.workspacePath,
+        JSON.stringify({ backend_metadata: { pane: TEARDOWN_PANE } }),
+        "2026-06-05T00:00:00.000Z",
+        "2026-06-05T00:00:00.000Z",
+        null,
+        RUN_BACKEND_STATUSES.running,
+        input.baseRevision,
+        "pending_review",
+        JSON.stringify(input.staleChangedFiles),
+        null
+      );
+  }
+
+  function readCapture(
+    db: ReturnType<DurableStateAdapter["getDatabase"]>,
+    runId: string
+  ): { status: string; review_status: string | null; changed_files: string[] } {
+    const row = db
+      .prepare(
+        `SELECT status, review_status, changed_files_json FROM ${TABLE_NAMES.runs} WHERE run_id = ?`
+      )
+      .get(runId) as {
+      status: string;
+      review_status: string | null;
+      changed_files_json: string | null;
+    };
+    return {
+      status: row.status,
+      review_status: row.review_status,
+      changed_files: JSON.parse(row.changed_files_json ?? "[]") as string[]
+    };
+  }
+
+  it("re-captures the FINAL (clean) worktree state, overwriting a stale changed_files snapshot", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace/teardown-capture";
+    const identity = buildIdentity(workspaceRoot);
+    const fakePane = new FakeAvailablePaneBackend(TEARDOWN_PANE);
+
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    try {
+      const db = adapter.getDatabase();
+      const statePath = adapter.describeStateRoot().stateRoot;
+      const teamId = createTeamId(db, statePath, identity);
+      // Worktree was dirty earlier, then REVERTED -> clean at stop time.
+      const workspace = createGitWorkspace({ dirty: false });
+      seedRunningWorktreeRun({
+        db,
+        teamId,
+        workspaceRoot,
+        memberId: "teammate:capture",
+        runId: "run:capture",
+        workspacePath: workspace.workspacePath,
+        baseRevision: workspace.baseRevision,
+        staleChangedFiles: ["package.json"]
+      });
+
+      const summary = new LifecycleService({
+        db,
+        statePath,
+        paneBackend: fakePane
+      }).closePanesForTeam(teamId);
+      expect(summary).toEqual({ attempted: 1, closed: 1 });
+
+      const result = readCapture(db, "run:capture");
+      // Clean stop AND the final, clean changed_files (the stale ["package.json"] is gone).
+      expect(result.status).toBe(MEMBER_STATUSES.stopped);
+      expect(result.changed_files).toEqual([]);
+      // D-02: the capture writes ONLY changed_files — review_status is untouched.
+      expect(result.review_status).toBe("pending_review");
+    } finally {
+      adapter.close();
+    }
+  });
+
+  it("records the ACTUAL changed files when the worktree is still dirty at teardown", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace/teardown-capture";
+    const identity = buildIdentity(workspaceRoot);
+    const fakePane = new FakeAvailablePaneBackend(TEARDOWN_PANE);
+
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    try {
+      const db = adapter.getDatabase();
+      const statePath = adapter.describeStateRoot().stateRoot;
+      const teamId = createTeamId(db, statePath, identity);
+      const workspace = createGitWorkspace({ dirty: true });
+      seedRunningWorktreeRun({
+        db,
+        teamId,
+        workspaceRoot,
+        memberId: "teammate:dirty",
+        runId: "run:dirty",
+        workspacePath: workspace.workspacePath,
+        baseRevision: workspace.baseRevision,
+        staleChangedFiles: []
+      });
+
+      new LifecycleService({ db, statePath, paneBackend: fakePane }).closePanesForTeam(
+        teamId
+      );
+
+      const result = readCapture(db, "run:dirty");
+      expect(result.status).toBe(MEMBER_STATUSES.stopped);
+      // The real uncommitted change is captured (not lost).
+      expect(result.changed_files).toContain("package.json");
+    } finally {
+      adapter.close();
+    }
+  });
+
+  it("is best-effort: a throwing inspection never breaks teardown (run still -> stopped)", () => {
+    const stateRoot = createTempStateRoot();
+    const workspaceRoot = "/workspace/teardown-capture";
+    const identity = buildIdentity(workspaceRoot);
+    const fakePane = new FakeAvailablePaneBackend(TEARDOWN_PANE);
+    const safety = new ThrowingTeardownSafetyService();
+
+    const adapter = new DurableStateAdapter({ stateRoot, workspaceRoot });
+    try {
+      const db = adapter.getDatabase();
+      const statePath = adapter.describeStateRoot().stateRoot;
+      const teamId = createTeamId(db, statePath, identity);
+      const workspace = createGitWorkspace({ dirty: true });
+      seedRunningWorktreeRun({
+        db,
+        teamId,
+        workspaceRoot,
+        memberId: "teammate:degrade",
+        runId: "run:degrade",
+        workspacePath: workspace.workspacePath,
+        baseRevision: workspace.baseRevision,
+        staleChangedFiles: ["package.json"]
+      });
+
+      let summary: { attempted: number; closed: number } | undefined;
+      expect(() => {
+        summary = new LifecycleService({
+          db,
+          statePath,
+          paneBackend: fakePane,
+          workspaceSafetyService: safety
+        }).closePanesForTeam(teamId);
+      }).not.toThrow();
+      expect(summary).toEqual({ attempted: 1, closed: 1 });
+
+      const result = readCapture(db, "run:degrade");
+      // The stop transition completed; changed_files degraded to as-is (unchanged).
+      expect(result.status).toBe(MEMBER_STATUSES.stopped);
+      expect(result.changed_files).toEqual(["package.json"]);
+      expect(safety.inspectCalls).toBe(1);
+    } finally {
+      adapter.close();
+    }
   });
 });

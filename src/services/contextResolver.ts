@@ -23,7 +23,12 @@ export const CONTEXT_RESOLVER_ERROR_CODES = {
 export type ContextResolverErrorCode =
   (typeof CONTEXT_RESOLVER_ERROR_CODES)[keyof typeof CONTEXT_RESOLVER_ERROR_CODES];
 
-export type TeamContextResolution = "explicit" | "active_binding";
+export type TeamContextResolution =
+  | "explicit"
+  | "active_binding"
+  // Phase 13 (D-Q6): a self-identified teammate caller (no active binding of its
+  // own) resolved its team from the TL-injected member id in observedMetadata.
+  | "member_identity";
 
 export interface ResolvedTeamContext {
   teamId: string;
@@ -77,7 +82,77 @@ export class ContextResolver {
       return this.resolveExplicitTeam(input.teamName, input.identity);
     }
 
+    // Active binding stays the first-choice resolution: zero behavior change for
+    // the TL and every existing caller. Only when no binding exists do we try the
+    // D-Q6 member-identity fallback (a co-located teammate MCP has its own
+    // callerKey, hence no binding). A definitive member-identity outcome (ok,
+    // cross-workspace, or archived) is returned; otherwise we fall through to the
+    // unchanged no_active_team path.
+    if (!this.findActiveBinding(input.identity.bindingKey)) {
+      const memberResolution = this.resolveTeamFromMemberIdentity(input.identity);
+      if (memberResolution) {
+        return memberResolution;
+      }
+    }
+
     return this.resolveActiveBinding(input.identity);
+  }
+
+  // D-Q6: resolve the team from the caller's TL-injected member id
+  // (observedMetadata.codexTeamMemberId). Returns null to fall through to
+  // no_active_team when there is no member id, the member is unknown, or its team
+  // is missing. Enforces the SAME guards as active-binding resolution: the team's
+  // workspace_root must match the caller's workspace (else cross_workspace_team),
+  // and an archived team yields the existing archived error. Security: the member
+  // id is TL-injected per-launch (T-13-01); the workspace guard blocks reaching
+  // teams outside the injected container root.
+  private resolveTeamFromMemberIdentity(
+    identity: WorkspaceScopedCallerIdentity
+  ): ResolveTeamResult | null {
+    const memberId = identity.observedMetadata.codexTeamMemberId;
+    if (!memberId) {
+      return null;
+    }
+
+    const teamId = this.findTeamIdByMemberId(memberId);
+    if (!teamId) {
+      return null;
+    }
+
+    const team = this.findTeamById(teamId);
+    if (!team) {
+      return null;
+    }
+
+    if (team.workspaceRoot !== identity.workspaceRoot) {
+      return this.resolverError({
+        code: CONTEXT_RESOLVER_ERROR_CODES.crossWorkspaceTeam,
+        identity,
+        message: "Member identity points at a team in a different workspace.",
+        context: {
+          team_workspace_root: team.workspaceRoot,
+          resolved_team_id: team.teamId
+        },
+        teamId: team.teamId
+      });
+    }
+
+    if (team.status === TEAM_STATUSES.archived) {
+      return this.resolverError({
+        code: CONTEXT_RESOLVER_ERROR_CODES.archivedActiveTeam,
+        identity,
+        message: "Member identity points at an archived team.",
+        context: { resolved_team_id: team.teamId },
+        teamId: team.teamId
+      });
+    }
+
+    this.appendExplicitAccessEvent(team, identity);
+
+    return {
+      ok: true,
+      team: toResolvedTeamContext(team, "member_identity")
+    };
   }
 
   private resolveExplicitTeam(
@@ -232,6 +307,21 @@ export class ContextResolver {
         `
       )
       .get(teamId) as TeamRow | undefined;
+  }
+
+  private findTeamIdByMemberId(memberId: string): string | undefined {
+    const row = this.db
+      .prepare(
+        `
+          SELECT team_id AS teamId
+          FROM ${TABLE_NAMES.members}
+          WHERE member_id = ?
+          LIMIT 1
+        `
+      )
+      .get(memberId) as { teamId: string } | undefined;
+
+    return row?.teamId;
   }
 
   private findActiveBinding(bindingKey: string): ActiveBindingRow | undefined {

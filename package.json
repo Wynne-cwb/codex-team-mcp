@@ -1,6 +1,6 @@
 {
   "name": "codex-team-mcp",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "description": "Unofficial Claude Agent Team compatibility MCP server for Codex.",
   "type": "module",
   "bin": {
@@ -11,7 +11,8 @@
     "docs/",
     "skills/",
     "scripts/smoke-list-tools.mjs",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",

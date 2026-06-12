@@ -16,6 +16,7 @@ import {
 } from "./lifecycleService.js";
 import { MemberResolver } from "./memberResolver.js";
 import type { MemberResolutionResult, ResolvedMember } from "./memberResolver.js";
+import { buildInboxNudge } from "./messageInboxService.js";
 import {
   EVENT_TYPES,
   MEMBER_STATUSES,
@@ -34,6 +35,9 @@ export interface MessageServiceOptions {
   // injection seam for deterministic tests (CI has no real tmux/iTerm2).
   paneMode?: PaneModeOptions;
   paneBackend?: PaneBackendRegistry;
+  // Phase 14 (D-Q2 / BIDIR-06): per-turn proactive-message bound for teammate-role
+  // senders. Resolved by the handler from env/options; default 8 when omitted.
+  maxProactiveMessagesPerTurn?: number;
 }
 
 export interface SendMessageInput {
@@ -137,6 +141,19 @@ const BACKEND_START_ATTEMPTED_DELIVERY_STATUS =
 const BACKEND_RESUME_ATTEMPTED_DELIVERY_STATUS =
   MESSAGE_DELIVERY_STATUSES.backendResumeAttempted satisfies "backend_resume_attempted";
 
+// Phase 14 (D-Q2 / D-Q5): sanitized error codes for the teammate-only send
+// guards. Both are enum identifiers — never derived from caller-supplied text.
+const TEAMMATE_PROACTIVE_LIMIT_EXCEEDED = "teammate_proactive_limit_exceeded";
+const TEAMMATE_SELF_SEND_REJECTED = "teammate_self_send_rejected";
+const TEAMMATE_ROLE = "teammate";
+const DEFAULT_MAX_PROACTIVE_MESSAGES_PER_TURN = 8;
+// metadata.message_type values that are system lifecycle notices and therefore
+// EXEMPT from (and uncounted by) the per-turn proactive bound (D-Q2).
+const SYSTEM_LIFECYCLE_NOTICE_TYPES = [
+  "resume_failure_notice",
+  "lifecycle_completion"
+] as const;
+
 export class MessageService {
   constructor(private readonly options: MessageServiceOptions) {}
 
@@ -218,6 +235,23 @@ export class MessageService {
         resultStatus: errorCode,
         resolutionStatus: recipient.status
       });
+    }
+
+    // Phase 14 (D-Q2 / D-Q5): teammate-only anti-loop guards, enforced AFTER both
+    // sender + recipient are resolved and BEFORE persist — so a rejection never
+    // writes a messages row, never delivers, and never touches the body (D-02).
+    // System lifecycle notices are exempt (the recursion-bounded notice paths must
+    // never be throttled) and the TL / absent-role callers are never gated.
+    const guardResult = this.enforceTeammateSendGuards({
+      teamId: team.teamId,
+      teamName: team.teamName,
+      sender: sender.member,
+      recipient: recipient.member,
+      identity: input.identity,
+      metadata: input.metadata
+    });
+    if (guardResult) {
+      return guardResult;
     }
 
     const result = this.persistResolvedMessage({
@@ -323,13 +357,15 @@ export class MessageService {
     const persisted = tx(input);
     // D10-3 recursion guard: a system lifecycle notice never re-triggers resume.
     const inboundIsSystemNotice = isSystemLifecycleNotice(input.metadata);
-    // Full body text delivered into a pane-hosted teammate's TUI on resume (the
-    // "做法 1" escalation closed loop). Threaded in-memory only (never persisted —
-    // see lifecycle buildResumeContextMetadata D-02 note). System lifecycle notices
-    // deliberately carry no body text: they only ever surfaced a summary, kept so.
+    // Phase 16 (notify + pull): the pane resume injects ONLY a SHORT, length-bounded
+    // inbox nudge — NEVER the full body. A multi-KB body typed into a live TUI is the
+    // long-body hazard (15-RCA); instead the recipient pulls the full body over the
+    // reliable MCP/JSON channel via CheckInbox. The nudge length is independent of
+    // body size (buildInboxNudge). System lifecycle notices suppress resume entirely,
+    // so they carry no nudge (delivery_text null) and only ever surfaced a summary.
     const deliveryText = inboundIsSystemNotice
       ? null
-      : deliveryTextFromBody(input.body);
+      : buildInboxNudge(1, [input.sender.public_id]);
     const lifecycleDelivery =
       this.createLifecycleService().attemptDeliveryAfterPersistence({
         message_id: persisted.messageId,
@@ -413,6 +449,156 @@ export class MessageService {
       executionBackend: this.options.executionBackend,
       paneMode: this.options.paneMode,
       paneBackend: this.options.paneBackend
+    });
+  }
+
+  // Phase 14 (D-Q2 / D-Q5): the teammate-only send guards. Returns a rejection
+  // SendMessageResult to short-circuit BEFORE persist, or null to proceed. The
+  // gate keys on the env-derived caller role ("teammate") — matching the Phase-13
+  // capability boundary — so the TL and every absent-role/pre-Phase-13 caller is
+  // never throttled. System lifecycle notices are exempt so the recursion-bounded
+  // notice paths (resume_failure_notice / lifecycle_completion) are never blocked.
+  // Self-send is checked first, then the per-turn proactive bound.
+  private enforceTeammateSendGuards(input: {
+    teamId: string;
+    teamName: string;
+    sender: ResolvedMember;
+    recipient: ResolvedMember;
+    identity: WorkspaceScopedCallerIdentity;
+    metadata: Record<string, unknown> | undefined;
+  }): SendMessageResult | null {
+    if (input.identity.observedMetadata.codexTeamMemberRole !== TEAMMATE_ROLE) {
+      return null;
+    }
+    if (isSystemLifecycleNotice(input.metadata)) {
+      return null;
+    }
+
+    if (input.recipient.member_id === input.sender.member_id) {
+      this.appendTeammateGuardRejectionEvent({
+        teamId: input.teamId,
+        teamName: input.teamName,
+        identity: input.identity,
+        actorMemberId: input.sender.member_id,
+        errorCode: TEAMMATE_SELF_SEND_REJECTED,
+        payload: { reason: "teammate_self_send" }
+      });
+      return {
+        status: "error",
+        error_code: TEAMMATE_SELF_SEND_REJECTED,
+        team_name: input.teamName,
+        persisted: false
+      };
+    }
+
+    const limit = this.effectiveMaxProactiveMessagesPerTurn();
+    const sentThisTurn = this.countProactiveSendsThisTurn(
+      input.teamId,
+      input.sender.member_id
+    );
+    if (sentThisTurn >= limit) {
+      this.appendTeammateGuardRejectionEvent({
+        teamId: input.teamId,
+        teamName: input.teamName,
+        identity: input.identity,
+        actorMemberId: input.sender.member_id,
+        errorCode: TEAMMATE_PROACTIVE_LIMIT_EXCEEDED,
+        payload: { reason: "teammate_proactive_limit_per_turn", limit }
+      });
+      return {
+        status: "error",
+        error_code: TEAMMATE_PROACTIVE_LIMIT_EXCEEDED,
+        team_name: input.teamName,
+        persisted: false
+      };
+    }
+
+    return null;
+  }
+
+  private effectiveMaxProactiveMessagesPerTurn(): number {
+    const configured = this.options.maxProactiveMessagesPerTurn;
+    if (typeof configured !== "number" || !Number.isFinite(configured)) {
+      return DEFAULT_MAX_PROACTIVE_MESSAGES_PER_TURN;
+    }
+    return Math.max(1, Math.floor(configured));
+  }
+
+  // Per-turn proactive count, DERIVED purely from messages.rowid ordering (D-Q2) —
+  // NO Date.now, NO timer, NO migration. A pane-hosted teammate is woken exactly
+  // once per turn by an inbound message, so the turn boundary is the rowid of the
+  // most-recently-persisted inbound message TO the sender; the count is the
+  // sender's outbound rows after that boundary, EXCLUDING system lifecycle notices.
+  // The json_extract NULL handling is explicit: a plain message (no message_type)
+  // yields NULL and MUST be counted (NOT IN alone would drop it). A stale/absent
+  // boundary can only INFLATE the count (throttle sooner), never under-throttle.
+  private countProactiveSendsThisTurn(
+    teamId: string,
+    senderMemberId: string
+  ): number {
+    const noticeTypePlaceholders = SYSTEM_LIFECYCLE_NOTICE_TYPES.map(() => "?").join(
+      ", "
+    );
+    const boundaryRow = this.options.db
+      .prepare(
+        `
+          SELECT MAX(rowid) AS boundary_rowid
+          FROM ${TABLE_NAMES.messages}
+          WHERE team_id = ? AND recipient_member_id = ?
+        `
+      )
+      .get(teamId, senderMemberId) as { boundary_rowid: number | null };
+    const boundaryRowid = boundaryRow?.boundary_rowid ?? 0;
+
+    const countRow = this.options.db
+      .prepare(
+        `
+          SELECT COUNT(*) AS sent_this_turn
+          FROM ${TABLE_NAMES.messages}
+          WHERE team_id = ?
+            AND sender_member_id = ?
+            AND rowid > ?
+            AND (
+              json_extract(metadata_json, '$.message_type') IS NULL
+              OR json_extract(metadata_json, '$.message_type') NOT IN (${noticeTypePlaceholders})
+            )
+        `
+      )
+      .get(
+        teamId,
+        senderMemberId,
+        boundaryRowid,
+        ...SYSTEM_LIFECYCLE_NOTICE_TYPES
+      ) as { sent_this_turn: number };
+
+    return countRow?.sent_this_turn ?? 0;
+  }
+
+  // Sanitized message_send_failed event for a teammate guard rejection (D-02): the
+  // payload carries only identifiers + an enum reason (+ the limit for the bound) —
+  // never any body / prompt / summary text. The rejection runs before persist, so
+  // no body is ever touched.
+  private appendTeammateGuardRejectionEvent(input: {
+    teamId: string;
+    teamName: string;
+    identity: WorkspaceScopedCallerIdentity;
+    actorMemberId: string | null;
+    errorCode: string;
+    payload: Record<string, unknown>;
+  }): void {
+    this.appendEvent({
+      teamId: input.teamId,
+      actorMemberId: input.actorMemberId,
+      identity: input.identity,
+      eventType: MESSAGE_SEND_FAILED_EVENT_TYPE,
+      errorCode: input.errorCode,
+      payload: {
+        team_name: input.teamName,
+        error_code: input.errorCode,
+        persisted: false,
+        ...input.payload
+      },
+      createdAt: new Date().toISOString()
     });
   }
 
@@ -635,24 +821,6 @@ function normalizeMessageBody(value: unknown): unknown {
   return value ?? {};
 }
 
-// Extract the deliverable text from an already-normalized message body for the
-// in-memory resume passthrough (delivery_text). A string body (or a normalized
-// `{ type: "text", text }`) yields its text; any other structured body whose
-// `text` field is a non-empty string yields that; otherwise null (e.g.
-// shutdown_request and other text-less structured bodies type nothing into a pane).
-function deliveryTextFromBody(body: unknown): string | null {
-  if (typeof body === "string") {
-    return normalizeOptionalText(body);
-  }
-  if (typeof body === "object" && body !== null && !Array.isArray(body)) {
-    const text = (body as Record<string, unknown>).text;
-    if (typeof text === "string") {
-      return normalizeOptionalText(text);
-    }
-  }
-  return null;
-}
-
 function normalizeOptionalText(value: string | undefined): string | null {
   const trimmed = value?.trim();
   return trimmed && trimmed.length > 0 ? trimmed : null;
@@ -693,8 +861,8 @@ function isSystemLifecycleNotice(
 ): boolean {
   const messageType = metadata?.message_type;
   return (
-    messageType === "resume_failure_notice" ||
-    messageType === "lifecycle_completion"
+    typeof messageType === "string" &&
+    (SYSTEM_LIFECYCLE_NOTICE_TYPES as readonly string[]).includes(messageType)
   );
 }
 

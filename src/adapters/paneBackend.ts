@@ -1,4 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import path from "node:path";
 
 import type {
   ExecutionBackendReconcileStatus,
@@ -9,6 +11,7 @@ import {
   TerminalCommandError,
   runTerminalCommand
 } from "./terminalCommand.js";
+import { resolveStateRoot } from "../state/root.js";
 import type { PaneBackendPreference } from "../types.js";
 
 export type PaneBackendType = "tmux" | "iterm2";
@@ -156,12 +159,24 @@ export interface ITerm2PaneBackendOptions {
   // Synchronous settle between the two-step submit sends (see sendToPane). Tests
   // inject a no-op; production defaults to a real blocking sleep.
   sleep?: (ms: number) => void;
+  // Directory the per-launch codex bootstrap script is written into (see the
+  // `it2 session run` block in createPane). Defaults to the codex-team state dir
+  // (the same root the DB lives in), derived from env. Tests inject a temp dir.
+  bootstrapDir?: string;
 }
 
 const DEFAULT_SESSION_PREFIX = "codex-team";
 const SOCKET_NAME_PREFIX = "codex-team-";
 const DEFAULT_WINDOW_NAME = "teammates";
 const SECRET_TOKEN_PATTERN = /SECRET_[A-Z0-9_]+/gi;
+
+// Per-launch codex bootstrap scripts live under <state-dir>/<this subdir>. The
+// state dir is the same root the durable DB lives in (NOT the user's repo), so a
+// stray script never lands in tracked files. Each script is mode 0600 with a
+// crypto-random name. See writeITerm2BootstrapScript for why this side channel
+// exists (the iTerm2 typed-delivery byte-loss fix).
+const PANE_BOOTSTRAP_SUBDIR = "pane-bootstrap";
+const BOOTSTRAP_FILENAME_RANDOM_BYTES = 16;
 
 // Settle delay between delivering the bracketed-paste body and the lone carriage
 // return that submits it. Keeps the CR clear of codex's 120ms paste-burst suppress
@@ -545,6 +560,8 @@ export function createITerm2PaneBackend(
 ): PaneBackend {
   const commandRunner = options.commandRunner ?? createCommandRunner();
   const env = options.env ?? process.env;
+  const bootstrapDir =
+    normalizeOptionalDir(options.bootstrapDir) ?? defaultBootstrapDir(env);
   const sleep =
     options.sleep ??
     ((ms: number) => {
@@ -677,23 +694,44 @@ export function createITerm2PaneBackend(
           };
         }
 
-        // Run the visibility command (e.g. `tail -f <exec_log_path>`) inside the
-        // freshly split pane. `it2 session run` takes the whole command as ONE arg
-        // that it2 hands to a shell, so we pass a single shell-quoted string (paths
-        // may contain spaces). A failed `session run` keeps the (successfully
-        // split) pane and only records a degradation_reason — the split succeeded,
-        // so the pane is available; content failure must not flip it to failed.
+        // Launch the command inside the freshly split pane WITHOUT typing it into
+        // the interactive shell. `it2 session run` is `async_send_text(cmd + "\r")`
+        // — it raw-types the whole string char-by-char then one CR. A ~1.5 KB codex
+        // launch line (TEAMMATE_PREAMBLE + `-c` env overrides + the user prompt)
+        // injected into a freshly-split, plugin-heavy zsh (syntax-highlighting /
+        // autosuggestions / p10k redraw per byte) overruns the input pipeline and
+        // DROPS tail bytes, so the closing quote + CR never arrive and codex never
+        // launches (Phase 15 P0 RCA). Fix: write the full argv to a per-launch 0600
+        // bootstrap script under the state dir (long prompt + flags live in the
+        // FILE) and type only a SHORT, single-line, newline-free `. '<script>'`
+        // source command. The script self-deletes then `exec`s codex so it replaces
+        // the shell and owns the pane (identical UX to typing `codex …`). A failed
+        // `session run` keeps the (successfully split) pane and only records a
+        // degradation_reason — the split succeeded, so the pane is available;
+        // content failure must not flip it to failed.
         let degradationReason: string | undefined;
         if (command && command.length > 0) {
-          const runResult = commandRunner.run(
-            "it2",
-            ["session", "run", "-s", paneId, buildTailCommandString(command)],
-            { cwd }
-          );
-          if (!runResult.ok) {
+          let sourceCommand: string | undefined;
+          try {
+            sourceCommand = writeITerm2BootstrapScript(bootstrapDir, command);
+          } catch (error) {
             degradationReason = sanitizePaneText(
-              runResult.stderr || "iterm2 session run failed"
+              error instanceof Error
+                ? error.message
+                : "iterm2 bootstrap script write failed"
             );
+          }
+          if (sourceCommand) {
+            const runResult = commandRunner.run(
+              "it2",
+              ["session", "run", "-s", paneId, sourceCommand],
+              { cwd }
+            );
+            if (!runResult.ok) {
+              degradationReason = sanitizePaneText(
+                runResult.stderr || "iterm2 session run failed"
+              );
+            }
           }
         }
 
@@ -814,6 +852,67 @@ function buildTailCommandString(command: readonly string[]): string {
   return command
     .map((token) => shellQuoteAttachArg(sanitizePaneText(token)))
     .join(" ");
+}
+
+function normalizeOptionalDir(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+/**
+ * Default directory for per-launch iTerm2 bootstrap scripts: a `pane-bootstrap`
+ * subdir of the codex-team state root (the SAME root the durable DB lives in),
+ * derived from env exactly like the DB path. This guarantees scripts land under
+ * runtime state — never in the user's tracked repo.
+ */
+function defaultBootstrapDir(env: NodeJS.ProcessEnv): string {
+  const { stateRoot } = resolveStateRoot({ env });
+  return path.join(stateRoot, PANE_BOOTSTRAP_SUBDIR);
+}
+
+/**
+ * Reconstructs the FULL launch command as a self-contained POSIX bootstrap script
+ * and returns the short, single-line `. '<scriptpath>'` source command typed into
+ * the pane. The long prompt + `-c` env overrides + flags live in the FILE, never
+ * on the typed line, so the typed payload's length is bounded and independent of
+ * the prompt size.
+ *
+ * Single source of truth: the script body reuses buildTailCommandString over the
+ * SAME argv the command builder produced, so the codex identity/env/prompt stay
+ * byte-identical to what would have been typed. Single-quoting preserves the exact
+ * bytes — including the prompt's `\n\n` separator and any embedded newlines — when
+ * the pane shell re-parses the line.
+ *
+ * Security/cleanup: the script is written under the state dir (NOT the repo) with
+ * a crypto-random name and mode 0600. It self-deletes as its FIRST command: the
+ * shell already has the file open for sourcing, so unlinking only drops the
+ * directory entry while the open inode is still read to completion; `exec` then
+ * replaces the shell so nothing after it runs. AM_API_KEY is inherited via the
+ * MCP child's env block and is NEVER part of `command`, so it never reaches the
+ * script. The script body is a launch-only side channel — it is never logged nor
+ * persisted (D-02).
+ */
+function writeITerm2BootstrapScript(
+  bootstrapDir: string,
+  command: readonly string[]
+): string {
+  mkdirSync(bootstrapDir, { recursive: true, mode: 0o700 });
+  const fileName = `launch-${randomBytes(BOOTSTRAP_FILENAME_RANDOM_BYTES).toString("hex")}.sh`;
+  const scriptPath = path.join(bootstrapDir, fileName);
+  const quotedPath = shellQuoteAttachArg(scriptPath);
+  const content = [
+    "#!/bin/sh",
+    // Self-delete BEFORE exec (after exec nothing runs). The open-for-source fd
+    // keeps the inode alive so the rest of the script still executes.
+    `rm -f -- ${quotedPath}`,
+    // `exec` so codex replaces the shell and owns the pane (same UX as typing it).
+    `exec ${buildTailCommandString(command)}`,
+    ""
+  ].join("\n");
+  writeFileSync(scriptPath, content, { mode: 0o600 });
+  // Enforce 0600 regardless of umask (writeFileSync's mode is masked by umask).
+  chmodSync(scriptPath, 0o600);
+  return `. ${quotedPath}`;
 }
 
 function buildTmuxAttachCommand(input: {

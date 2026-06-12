@@ -753,13 +753,15 @@ describe("MessageService.sendMessage", () => {
       )
     ).not.toContain(SECRET_PHASE5_MESSAGE);
 
-    // "做法 1": the full body DOES ride the in-memory resume context (the transient
-    // delivery channel into the teammate's pane) as resume_delivery_text — this is
-    // intended delivery, never a persisted leak.
+    // Phase 16 (notify + pull): the resume context now carries a SHORT inbox NUDGE
+    // as resume_delivery_text — NEVER the full body. The body is pulled later via
+    // CheckInbox, so it can never leak into the transient pane channel either.
     expect(backend.resumeCalls).toHaveLength(1);
-    expect(backend.resumeCalls[0]?.context.metadata?.resume_delivery_text).toBe(
-      SECRET_PHASE5_MESSAGE
-    );
+    const nudge = backend.resumeCalls[0]?.context.metadata?.resume_delivery_text;
+    expect(typeof nudge).toBe("string");
+    expect(nudge).toContain("CheckInbox");
+    expect(nudge).not.toContain(SECRET_PHASE5_MESSAGE);
+    expect((nudge as string).length).toBeLessThan(512);
 
     context.adapter.close();
   });

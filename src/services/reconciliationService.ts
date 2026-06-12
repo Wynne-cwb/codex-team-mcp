@@ -12,7 +12,6 @@ import { extractPaneMetadata } from "../adapters/paneExecutionBackend.js";
 import {
   EVENT_TYPES,
   MEMBER_STATUSES,
-  MESSAGE_ROW_STATUSES,
   RUN_BACKEND_STATUSES,
   RUN_REVIEW_STATUSES,
   TABLE_NAMES,
@@ -23,12 +22,18 @@ import {
   WorkspaceSafetyService,
   type WorkspaceInspectionResult
 } from "./workspaceSafetyService.js";
+import type { DeliveryDrainHook } from "./lifecycleService.js";
 
 export interface ReconciliationServiceOptions {
   db: Database.Database;
   statePath: string;
   executionBackend?: ExecutionBackend;
   workspaceSafetyService?: WorkspaceSafetyService;
+  // Phase 16: optional turn-boundary delivery drain. When injected, the moment
+  // markRunTerminal flips a member to idle (its pane teammate's turn boundary) the
+  // hook drains that member's pending deliveries. Optional so the service stays
+  // unit-testable; best-effort so a drain error never breaks reconcile.
+  deliveryDrain?: DeliveryDrainHook;
 }
 
 export interface ReconcileWorkspaceInput {
@@ -98,6 +103,10 @@ interface CountRow {
 }
 
 const SYSTEM_RECONCILIATION_CALLER = "system:reconciliation";
+// Mirror of LifecycleService.PANE_CLOSED_REASON: the degradation_reason a pane
+// carries after an INTENTIONAL teardown (TL shutdown_request / TeamDelete). Used
+// as the fallback intentional-stop signal when the run-level marker is absent.
+const PANE_CLOSED_REASON = "pane_closed";
 const STALE_RECONCILE_STATUSES = new Set(["stale", "unsupported", "unknown"]);
 // Terminal reconcile outcomes from an async (detached) backend: the background
 // run finished (idle) or failed (turn.failed / crash). Distinct from the stale
@@ -326,6 +335,12 @@ export class ReconciliationService {
       .map((row) => (row as { run_id: string }).run_id);
   }
 
+  // Orphaned PENDING messages: still awaiting delivery (delivered_at IS NULL) but
+  // addressed to a recipient that is gone/archived. Gated on the delivered_at
+  // timestamp — the single source of truth — rather than the status column, so the
+  // count is unaffected by the status observability convergence (queued ->
+  // delivered -> read). A delivered message only leaves the pending set by having
+  // delivered_at stamped, which is exactly when it should stop counting as "queued".
   private countOrphanedQueuedMessages(workspaceRoot: string): number {
     return this.countRows(
       `
@@ -335,7 +350,7 @@ export class ReconciliationService {
         LEFT JOIN ${TABLE_NAMES.members} recipient
           ON recipient.member_id = msg.recipient_member_id
         WHERE t.workspace_root = ?
-          AND msg.status = '${MESSAGE_ROW_STATUSES.queued}'
+          AND msg.delivered_at IS NULL
           AND (
             msg.recipient_member_id IS NULL
             OR recipient.member_id IS NULL
@@ -469,14 +484,33 @@ export class ReconciliationService {
     createdAt: string;
   }): void {
     const now = input.createdAt;
-    const isFailure = input.result.status === "failed";
-    const runStatus = isFailure ? MEMBER_STATUSES.failed : MEMBER_STATUSES.idle;
-    const backendStatus = isFailure
-      ? RUN_BACKEND_STATUSES.failed
-      : RUN_BACKEND_STATUSES.idle;
+    // BUG #4 (gone-pane → failed guard): a run whose pane was INTENTIONALLY torn
+    // down (TL shutdown_request / TeamDelete) carries an intentional-stop marker.
+    // When such a run reconciles to a gone-pane failure
+    // (codex_pane_exited_without_completion), treat it as a clean STOP, not a
+    // crash — never record `failed` / a teammate_backend_failed event for an
+    // intentional shutdown. A run torn down the normal way is already `stopped`
+    // (out of the running set) so it never reaches reconcile; this is the
+    // belt-and-suspenders path for a run still observed `running`.
+    const rawFailure = input.result.status === "failed";
+    const intentionalStop = rawFailure && isIntentionalStop(input.run);
+    const isFailure = rawFailure && !intentionalStop;
+    const runStatus = intentionalStop
+      ? MEMBER_STATUSES.stopped
+      : isFailure
+        ? MEMBER_STATUSES.failed
+        : MEMBER_STATUSES.idle;
+    const backendStatus = intentionalStop
+      ? RUN_BACKEND_STATUSES.stopped
+      : isFailure
+        ? RUN_BACKEND_STATUSES.failed
+        : RUN_BACKEND_STATUSES.idle;
+    // Intentional stop clears last_error (it is NOT a crash); a real failure keeps
+    // the sanitized reason; a clean idle has none.
     const lastError = isFailure
       ? redactRunSensitiveText(input.result.last_error, input.run)
       : null;
+    const isIdle = runStatus === MEMBER_STATUSES.idle;
 
     this.options.db
       .prepare(
@@ -523,14 +557,44 @@ export class ReconciliationService {
         .run(runStatus, input.run.member_id);
     }
 
+    // BUG #1 (turn-boundary changed-files capture): the moment a run first
+    // transitions to a terminal state is the only point at which diagnostics'
+    // finalize-mode reconcile (which skips the per-poll workspace-inspection loop)
+    // can record the teammate's actual worktree changes. Capture them once here,
+    // reusing the shared inspectWorkspace path. Bounded to once by construction: a
+    // run reaches markRunTerminal only out of the running set, and this transition
+    // takes it out of that set, so no later poll re-finalizes (and re-inspects) it.
+    // Best-effort: an inspection failure degrades to empty and never breaks reconcile.
+    this.captureChangedFilesAtTurnBoundary(input.run, now);
+
+    // Phase 16 (turn boundary, PRIMARY trigger): the member just flipped to idle —
+    // its pane teammate reached a turn boundary. Drain its pending deliveries. Only
+    // on idle (a failed/intentionally-stopped run has no turn to deliver into);
+    // best-effort so reconcile is never broken by a drain error.
+    if (isIdle && input.run.member_id && this.options.deliveryDrain) {
+      try {
+        this.options.deliveryDrain({
+          teamId: input.run.team_id,
+          teamName: input.run.canonical_name,
+          recipientMemberId: input.run.member_id,
+          workspaceRoot: input.run.workspace_root,
+          actorCallerKey: input.actorCallerKey
+        });
+      } catch {
+        // Best-effort: a drain failure must never corrupt the reconcile transition.
+      }
+    }
+
     this.appendEvent({
       teamId: input.run.team_id,
       actorMemberId: input.run.member_id,
       workspaceRoot: input.run.workspace_root,
       actorCallerKey: input.actorCallerKey,
-      eventType: isFailure
-        ? EVENT_TYPES.teammateBackendFailed
-        : EVENT_TYPES.teammateRunCompleted,
+      eventType: intentionalStop
+        ? EVENT_TYPES.teammateStopped
+        : isFailure
+          ? EVENT_TYPES.teammateBackendFailed
+          : EVENT_TYPES.teammateRunCompleted,
       payload: {
         run_id: input.run.run_id,
         member_id: input.run.member_id,
@@ -539,10 +603,61 @@ export class ReconciliationService {
         reconcile_status: input.result.status,
         backend: input.result.backend,
         backend_status: backendStatus,
-        last_error: lastError
+        last_error: lastError,
+        ...(intentionalStop ? { intentional_stop: true } : {})
       },
       createdAt: input.createdAt
     });
+  }
+
+  // BUG #1: capture changed_files ONCE when a run first transitions to terminal.
+  // Reuses the shared workspaceSafetyService.inspectWorkspace path so the
+  // changed-files semantics match the apply-mode inspection loop. Only pane/worktree
+  // runs (workspace_path set) are inspected; detached non-worktree runs are skipped.
+  // The worktree still exists at terminal/idle (cleanup happens at TeamDelete/merge),
+  // so inspection is feasible. Writes ONLY changed_files_json + diff_summary via a
+  // targeted UPDATE — it never touches review_status / merge_* (D-02: changed_files
+  // is a list of paths, no bodies). Best-effort: any failure degrades to empty.
+  private captureChangedFilesAtTurnBoundary(
+    run: ReconciliationRunRow,
+    now: string
+  ): void {
+    if (!run.workspace_path) {
+      return;
+    }
+
+    let inspection: WorkspaceInspectionResult;
+    try {
+      inspection = this.workspaceSafetyService.inspectWorkspace({
+        workspace_path: run.workspace_path,
+        base_revision: run.base_revision
+      });
+    } catch {
+      // Defensive: inspectWorkspace already degrades internally, but a thrown
+      // error must never break the reconcile transition.
+      return;
+    }
+
+    try {
+      this.options.db
+        .prepare(
+          `
+            UPDATE ${TABLE_NAMES.runs}
+            SET changed_files_json = ?,
+                diff_summary = COALESCE(?, diff_summary),
+                updated_at = ?
+            WHERE run_id = ?
+          `
+        )
+        .run(
+          inspection.changed_files_json,
+          normalizeOptionalText(inspection.diff_summary),
+          now,
+          run.run_id
+        );
+    } catch {
+      // Best-effort: a persistence failure leaves changed_files as-is.
+    }
   }
 
   private updateWorkspaceInspection(
@@ -735,6 +850,27 @@ function coerceBackendReconcileException(
     backend_status: RUN_BACKEND_STATUSES.failed,
     last_error: redactRunSensitiveText(errorToMessage(error), run) ?? "backend_failed"
   };
+}
+
+// BUG #4: a run is intentionally stopped when the pane teardown stamped the
+// run-level marker (LifecycleService.markRunPaneClosed) or, as a fallback, when its
+// pane metadata shows an intentionally-closed pane (unavailable + pane_closed). Used
+// to keep reconcile's gone-pane → failed path from re-classifying a clean shutdown.
+function isIntentionalStop(run: ReconciliationRunRow): boolean {
+  const metadata = parseJsonObject(run.metadata_json);
+  if (metadata.intentional_stop === true) {
+    return true;
+  }
+
+  const pane = extractPaneMetadata(
+    backendMetadataFromRunMetadata(metadata)
+      ? { backend_metadata: metadata.backend_metadata }
+      : metadata
+  );
+  return (
+    pane?.availability_status === "unavailable" &&
+    pane.degradation_reason === PANE_CLOSED_REASON
+  );
 }
 
 function teammateIdFromMemberMetadata(metadataJson: string | null): string | undefined {

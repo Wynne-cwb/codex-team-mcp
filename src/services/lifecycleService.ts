@@ -37,8 +37,14 @@ import {
 import type { PaneModeOptions } from "../types.js";
 import type { WorkspaceScopedCallerIdentity } from "./callerIdentity.js";
 import {
+  MessageInboxService,
+  buildInboxNudge,
+  inboxSenderPublicId
+} from "./messageInboxService.js";
+import {
   WorkspaceSafetyService,
   type WorkspaceBackendCapabilities,
+  type WorkspaceInspectionResult,
   type WorkspaceSafetyReadyResult,
   type WorkspaceSafetyResult
 } from "./workspaceSafetyService.js";
@@ -147,12 +153,12 @@ export interface DeliveryLifecycleInput {
   recipient_status: string;
   teammate_id: string;
   summary?: string | null;
-  // Full SendMessage body text, threaded IN-MEMORY ONLY to the resume context so a
-  // pane-hosted backend can inject the real message into the teammate's pane
-  // (the "做法 1" escalation closed loop). Never persisted to runs.metadata_json /
-  // events / diagnostics — only `summary` ever was, and that stays unchanged.
-  // System lifecycle notices (resume_failure_notice / lifecycle_completion) leave
-  // this unset (they only carry a summary).
+  // Phase 16 (notify + pull): the SHORT, length-bounded inbox NUDGE text (count +
+  // distinct senders), threaded IN-MEMORY ONLY to the resume context so a pane-hosted
+  // backend injects a bounded single line into the teammate's pane — NEVER the full
+  // body (the recipient pulls bodies via CheckInbox). Never persisted to
+  // runs.metadata_json / events / diagnostics. System lifecycle notices
+  // (resume_failure_notice / lifecycle_completion) leave this unset.
   delivery_text?: string | null;
   task_id?: string | null;
   trigger_kind?: "message" | "task_assignment";
@@ -168,9 +174,8 @@ export interface ResumeRunInput extends LifecycleRunContextInput {
   message_id: string;
   recipient_status: string;
   summary?: string | null;
-  // Full SendMessage body text — see DeliveryLifecycleInput.delivery_text. Flows
-  // into the in-memory resume context (buildResumeContextMetadata) only; never
-  // persisted.
+  // Short inbox nudge text — see DeliveryLifecycleInput.delivery_text. Flows into the
+  // in-memory resume context (buildResumeContextMetadata) only; never persisted.
   delivery_text?: string | null;
   task_id?: string | null;
   trigger_kind?: "message" | "task_assignment" | "manual";
@@ -243,12 +248,21 @@ interface RunMetadataRow {
   metadata_json: string;
 }
 
-// Projection for the pane-teardown sweep: only the columns needed to locate the
-// pane and to write back the closed marker via a metadata_json-only UPDATE.
+// Projection for the pane-teardown sweep: the columns needed to locate the pane, to
+// write back the closed marker via a metadata_json-only UPDATE, to flip the run to a
+// clean terminal `stopped` status + emit an auditable teammate_stopped event
+// (team_id + workspace_root come from the joined team row), and to capture the
+// worktree's FINAL changed_files at stop time (workspace_path + base_revision feed
+// the shared inspectWorkspace path; null for detached non-worktree runs, which are
+// skipped).
 interface PaneTeardownRunRow {
   run_id: string;
   member_id: string | null;
+  team_id: string;
+  workspace_root: string;
   metadata_json: string;
+  workspace_path: string | null;
+  base_revision: string | null;
 }
 
 // Best-effort pane teardown summary. `attempted` counts available panes we tried
@@ -258,9 +272,46 @@ export interface PaneTeardownSummary {
   closed: number;
 }
 
+// Phase 16: turn-boundary delivery drain input + outcome.
+export interface DrainPendingDeliveriesInput {
+  teamId: string;
+  teamName: string;
+  recipientMemberId: string;
+  identity: WorkspaceScopedCallerIdentity;
+}
+
+export interface DrainPendingDeliveriesResult {
+  status:
+    | "delivered"
+    | "recipient_running"
+    | "no_live_pane"
+    | "no_durable_metadata"
+    | "nothing_pending"
+    | "no_run"
+    | "inject_failed"
+    | "reentrant_skip";
+  nudged: boolean;
+  claimed_count: number;
+  run_id?: string;
+}
+
+// Optional dependency injected into ReconciliationService so the turn boundary
+// (markRunTerminal -> member idle) can fire the drain while keeping the service
+// unit-testable. Best-effort: the hook must never throw into reconcile.
+export type DeliveryDrainHook = (input: {
+  teamId: string;
+  teamName: string;
+  recipientMemberId: string;
+  workspaceRoot: string;
+  actorCallerKey: string;
+}) => void;
+
 // Marker written to backend_metadata.pane.degradation_reason after a successful
 // teardown so diagnostics / reconcile see the pane as intentionally closed.
 const PANE_CLOSED_REASON = "pane_closed";
+// Actor caller key stamped on the teammate_stopped event emitted by an intentional
+// pane teardown (system action — there is no human caller in this side-effect path).
+const SYSTEM_PANE_TEARDOWN_CALLER = "system:pane_teardown";
 
 interface MemberMetadataRow {
   metadata_json: string;
@@ -351,6 +402,10 @@ export class LifecycleService {
   // PANE-01 / PANE-02: best-effort visibility overlay. undefined when pane mode
   // is off, so the overlay is a pure no-op and the core run is untouched.
   private readonly paneBackend: PaneBackendRegistry | undefined;
+  // Phase 16: re-entrancy guard for the drain. A synchronous one-shot resume nudge
+  // can finalize the member to idle and re-enter the finalizer drain hook; the nudge
+  // creates no inbound rows so a nested drain has nothing new to do — skip it.
+  private draining = false;
 
   constructor(private readonly options: LifecycleServiceOptions) {
     this.executionBackend =
@@ -517,6 +572,14 @@ export class LifecycleService {
         });
       }
 
+      // Phase 16 (claim-first): stamp delivered_at on THIS triggering row BEFORE the
+      // resume so a finalizer / turn-boundary drain never re-nudges it. Only
+      // delivered_at is touched here — delivery_status stays as the lifecycle reports
+      // it (preserving the queued_while_idle row state on a resume failure). Reset on
+      // a failed inject so a later drain retries.
+      const inbox = new MessageInboxService(this.options.db);
+      inbox.markDelivered(input.message_id, new Date().toISOString());
+
       const resumeResult = this.resumeRun({
         team_id: input.team_id,
         team_name: input.team_name,
@@ -527,8 +590,9 @@ export class LifecycleService {
         message_id: input.message_id,
         recipient_status: input.recipient_status,
         summary: input.summary,
-        // In-memory passthrough to the resume context so a pane-hosted backend
-        // injects the FULL body (not just the 5-word summary) into the pane.
+        // Phase 16 (notify + pull): in-memory passthrough of the SHORT inbox nudge
+        // (NOT the full body) so a pane-hosted backend injects only a bounded, single
+        // line into the live TUI. The full body is pulled later via CheckInbox.
         delivery_text: input.delivery_text,
         task_id: input.task_id,
         trigger_kind: input.trigger_kind,
@@ -539,6 +603,15 @@ export class LifecycleService {
       // (10-RESEARCH §同步后端下的 burst 实情). A targeted UPDATE that leaves the
       // run's lifecycle columns (just written by resumeRun) untouched.
       this.stampResumeAttempt(run.run_id, new Date().toISOString());
+
+      // Inject failed -> un-stamp delivered_at so a later drain retries the row (the
+      // existing D10-3 resume-failure notice still informs the sender).
+      if (
+        resumeResult.delivery_status !==
+        MESSAGE_DELIVERY_STATUSES.backendResumeAttempted
+      ) {
+        inbox.unmarkDelivered(input.message_id);
+      }
 
       return this.buildDeliveryResultFromAction({
         input,
@@ -721,6 +794,11 @@ export class LifecycleService {
           finalBackendStatus,
           createdAt: completedAt
         });
+
+        // Phase 16 (turn boundary): a synchronous one-shot start just finalized the
+        // member to idle — drain any pending deliveries (best-effort, no-op without a
+        // live pane / durable metadata; the detached one-shot path is the target).
+        this.drainAfterSynchronousIdle(input);
 
         return {
           status: "idle",
@@ -1003,6 +1081,12 @@ export class LifecycleService {
           fromStatus: currentStatus,
           createdAt: completedAt
         });
+
+        // Phase 16 (turn boundary): a synchronous one-shot resume just finalized the
+        // member to idle — drain any pending deliveries. Re-entrancy-guarded: when
+        // this resume IS the drain's own nudge, the nested drain is skipped (the
+        // nudge created no inbound rows, so there is nothing new to deliver).
+        this.drainAfterSynchronousIdle(input);
 
         return {
           status: "idle",
@@ -1719,7 +1803,11 @@ export class LifecycleService {
   // affected. Returns how many panes were attempted vs. successfully closed.
   closePanesForTeam(teamId: string): PaneTeardownSummary {
     return this.closePanesForRows(
-      `SELECT run_id, member_id, metadata_json FROM ${TABLE_NAMES.runs} WHERE team_id = ?`,
+      `SELECT r.run_id, r.member_id, r.team_id, t.workspace_root, r.metadata_json,
+              r.workspace_path, r.base_revision
+         FROM ${TABLE_NAMES.runs} r
+         INNER JOIN ${TABLE_NAMES.teams} t ON t.team_id = r.team_id
+        WHERE r.team_id = ?`,
       [teamId]
     );
   }
@@ -1729,7 +1817,11 @@ export class LifecycleService {
   // closePanesForTeam — the SendMessage persistence is never affected.
   closePanesForMember(teamId: string, memberId: string): PaneTeardownSummary {
     return this.closePanesForRows(
-      `SELECT run_id, member_id, metadata_json FROM ${TABLE_NAMES.runs} WHERE team_id = ? AND member_id = ?`,
+      `SELECT r.run_id, r.member_id, r.team_id, t.workspace_root, r.metadata_json,
+              r.workspace_path, r.base_revision
+         FROM ${TABLE_NAMES.runs} r
+         INNER JOIN ${TABLE_NAMES.teams} t ON t.team_id = r.team_id
+        WHERE r.team_id = ? AND r.member_id = ?`,
       [teamId, memberId]
     );
   }
@@ -1772,7 +1864,16 @@ export class LifecycleService {
         const result = this.paneBackend.closePane(pane);
         if (result.ok) {
           closed += 1;
+          // Metadata-only marker: pane unavailable + intentional-stop signal.
           this.markRunPaneClosed(row.run_id, metadata, pane);
+          // BUG #4: an intentional teardown is a CLEAN stop, not a crash. Flip a
+          // still-running run (and its member) to the terminal `stopped` status so
+          // a later reconcile never re-classifies the gone pane as
+          // `failed` / codex_pane_exited_without_completion, and emit a
+          // teammate_stopped (NOT teammate_backend_failed) event. Guarded to
+          // status='running' so an already-terminal run (e.g. a completed idle run
+          // torn down at TeamDelete) keeps its real status.
+          this.markRunStoppedByTeardown(row);
         }
       } catch {
         // Best-effort: a single run's failure never affects the others.
@@ -1802,6 +1903,10 @@ export class LifecycleService {
       : {};
     const updatedMetadata: Record<string, unknown> = {
       ...metadata,
+      // BUG #4: durable intentional-stop marker. Reconcile's gone-pane → failed path
+      // checks this so an intentionally-closed pane is never re-classified as a crash
+      // even if the status flip below did not persist (best-effort defense-in-depth).
+      intentional_stop: true,
       backend_metadata: {
         ...backendMetadata,
         pane: closedPane
@@ -1821,6 +1926,166 @@ export class LifecycleService {
       // The pane is already closed in the terminal; failing to persist the
       // marker is non-fatal and must not surface to the caller.
     }
+  }
+
+  // BUG #4: flip an intentionally-torn-down RUNNING run (and its member) to the
+  // clean terminal `stopped` status, then emit a teammate_stopped event. Guarded to
+  // status='running' so it never downgrades an already-terminal run (a completed
+  // idle run, a prior failure) — only the live runs that a later reconcile would
+  // otherwise mis-read as a gone-pane crash are stopped. Touches ONLY status /
+  // backend_status / ended_at / updated_at (workspace_path / review_status / merge_*
+  // stay untouched, preserving the merge-audit contract). Best-effort + non-gating:
+  // any failure is swallowed so the originating SendMessage / TeamDelete is never
+  // affected.
+  private markRunStoppedByTeardown(row: PaneTeardownRunRow): void {
+    const now = new Date().toISOString();
+    try {
+      const update = this.options.db
+        .prepare(
+          `
+            UPDATE ${TABLE_NAMES.runs}
+            SET status = ?,
+                backend_status = ?,
+                ended_at = COALESCE(ended_at, ?),
+                updated_at = ?
+            WHERE run_id = ? AND status = ?
+          `
+        )
+        .run(
+          MEMBER_STATUSES.stopped,
+          RUN_BACKEND_STATUSES.stopped,
+          now,
+          now,
+          row.run_id,
+          MEMBER_STATUSES.running
+        );
+
+      // Not a running run (already terminal / scheduled) -> leave it (and its
+      // member + events) untouched. Only a real running -> stopped transition is
+      // recorded.
+      if (update.changes === 0) {
+        return;
+      }
+
+      if (row.member_id) {
+        this.options.db
+          .prepare(
+            `UPDATE ${TABLE_NAMES.members} SET status = ? WHERE member_id = ? AND status = ?`
+          )
+          .run(MEMBER_STATUSES.stopped, row.member_id, MEMBER_STATUSES.running);
+      }
+
+      // FIX #3: this teardown-stop is the run's FINAL terminal transition under
+      // TeamDelete / shutdown_request. The reconcile-side capture
+      // (ReconciliationService.captureChangedFilesAtTurnBoundary) never runs for a
+      // run stopped this way, so without this call changed_files_json would keep the
+      // pre-stop snapshot and go STALE (e.g. a late-delivered revert leaves the
+      // worktree clean but diagnostics still lists the reverted file). Re-capture
+      // the worktree's final state ONCE here, guarded by the same changes>0 success
+      // gate as teammate_stopped so it only fires on a real running -> stopped flip.
+      this.captureChangedFilesAtTeardown(row, now);
+
+      this.appendTeammateStoppedEvent(row, now);
+    } catch {
+      // Best-effort: a status flip / event failure must never fail the teardown.
+      // The metadata intentional-stop marker (markRunPaneClosed) still guards the
+      // reconcile gone-pane path.
+    }
+  }
+
+  // FIX #3: capture changed_files ONCE at the teardown-stop terminal transition so
+  // it reflects the worktree's FINAL state at stop time. Mirrors the reconcile-side
+  // ReconciliationService.captureChangedFilesAtTurnBoundary: reuses the SHARED
+  // workspaceSafetyService.inspectWorkspace path and writes ONLY changed_files_json +
+  // diff_summary via a scoped UPDATE (NEVER review_status / merge_* / workspace_path —
+  // D-02: changed_files is a list of paths, no bodies). Only pane/worktree runs
+  // (workspace_path set) are inspected; detached non-worktree runs are skipped.
+  // Best-effort + bounded: try/catch around BOTH the inspection AND the UPDATE so any
+  // failure degrades to leaving changed_files as-is and never breaks teardown.
+  private captureChangedFilesAtTeardown(
+    row: PaneTeardownRunRow,
+    now: string
+  ): void {
+    if (!row.workspace_path) {
+      return;
+    }
+
+    let inspection: WorkspaceInspectionResult;
+    try {
+      inspection = this.workspaceSafetyService.inspectWorkspace({
+        workspace_path: row.workspace_path,
+        base_revision: row.base_revision
+      });
+    } catch {
+      // Defensive: inspectWorkspace already degrades internally, but a thrown error
+      // must never break the teardown-stop transition.
+      return;
+    }
+
+    try {
+      this.options.db
+        .prepare(
+          `
+            UPDATE ${TABLE_NAMES.runs}
+            SET changed_files_json = ?,
+                diff_summary = COALESCE(?, diff_summary),
+                updated_at = ?
+            WHERE run_id = ?
+          `
+        )
+        .run(
+          inspection.changed_files_json,
+          normalizeOptionalText(inspection.diff_summary),
+          now,
+          row.run_id
+        );
+    } catch {
+      // Best-effort: a persistence failure leaves changed_files as-is.
+    }
+  }
+
+  // Auditable record of an intentional teammate stop from a pane teardown. A system
+  // action (no human caller), so the actor caller key is a system marker. Mirrors the
+  // reconcile terminal events; explicitly NOT a teammate_backend_failed.
+  private appendTeammateStoppedEvent(
+    row: PaneTeardownRunRow,
+    createdAt: string
+  ): void {
+    this.options.db
+      .prepare(
+        `
+          INSERT INTO ${TABLE_NAMES.events} (
+            event_id,
+            team_id,
+            actor_member_id,
+            workspace_root,
+            actor_caller_key,
+            event_type,
+            error_code,
+            payload_json,
+            created_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `
+      )
+      .run(
+        `event:${randomUUID()}`,
+        row.team_id,
+        row.member_id,
+        row.workspace_root,
+        SYSTEM_PANE_TEARDOWN_CALLER,
+        EVENT_TYPES.teammateStopped,
+        null,
+        JSON.stringify({
+          run_id: row.run_id,
+          member_id: row.member_id,
+          previous_status: MEMBER_STATUSES.running,
+          status: MEMBER_STATUSES.stopped,
+          reason: PANE_CLOSED_REASON,
+          intentional_stop: true
+        }),
+        createdAt
+      );
   }
 
   // Resolve the visibility command for a new pane: tail the run's codex exec log
@@ -2562,6 +2827,291 @@ export class LifecycleService {
       )
       .run(repoRoot, runId);
   }
+
+  // Phase 16 — TURN-BOUNDARY delivery drain. Delivers every pending message to a
+  // recipient that is at a turn boundary (idle/stopped with a live pane + durable
+  // resume metadata) by injecting ONE short, length-bounded inbox nudge — never the
+  // body (notify + pull). Claim-first on the shared WAL DB makes it at-most-once and
+  // multi-process race safe. NEVER injects into a running recipient (locked #1: no
+  // mid-turn steer). Loop-free: a nudge sets delivered_at on every claimed row and
+  // creates no inbound rows, so a re-drain finds nothing.
+  drainPendingDeliveries(
+    input: DrainPendingDeliveriesInput
+  ): DrainPendingDeliveriesResult {
+    if (this.draining) {
+      return { status: "reentrant_skip", nudged: false, claimed_count: 0 };
+    }
+    this.draining = true;
+    try {
+      return this.drainPendingDeliveriesInner(input);
+    } finally {
+      this.draining = false;
+    }
+  }
+
+  private drainPendingDeliveriesInner(
+    input: DrainPendingDeliveriesInput
+  ): DrainPendingDeliveriesResult {
+    const run = this.findLatestRunForMember(
+      input.teamId,
+      input.recipientMemberId
+    );
+    if (!run) {
+      return { status: "no_run", nudged: false, claimed_count: 0 };
+    }
+
+    const memberStatus =
+      this.readMemberStatus(input.recipientMemberId) ?? run.status;
+
+    // Locked #1: a running recipient has NOT reached its turn boundary — return
+    // immediately, never mid-turn steer.
+    if (memberStatus === MEMBER_STATUSES.running) {
+      return {
+        status: "recipient_running",
+        nudged: false,
+        claimed_count: 0,
+        run_id: run.run_id
+      };
+    }
+    if (
+      memberStatus !== MEMBER_STATUSES.idle &&
+      memberStatus !== MEMBER_STATUSES.stopped
+    ) {
+      return {
+        status: "nothing_pending",
+        nudged: false,
+        claimed_count: 0,
+        run_id: run.run_id
+      };
+    }
+
+    // Reachability: a live pane + durable resume metadata. No live pane (detached
+    // run, or pane closed) -> leave delivered_at NULL, do nothing destructive.
+    const pane = extractPaneMetadata(parseJsonObject(run.metadata_json));
+    if (
+      !pane ||
+      pane.availability_status !== "available" ||
+      !normalizeOptionalText(pane.pane_id)
+    ) {
+      return {
+        status: "no_live_pane",
+        nudged: false,
+        claimed_count: 0,
+        run_id: run.run_id
+      };
+    }
+    if (!hasDurableResumeMetadata(run)) {
+      return {
+        status: "no_durable_metadata",
+        nudged: false,
+        claimed_count: 0,
+        run_id: run.run_id
+      };
+    }
+
+    // Claim-first (atomic BEGIN IMMEDIATE, conditional delivered_at IS NULL): only
+    // rows THIS process flipped are ours. A concurrent drain claims zero -> no
+    // duplicate nudge, no double delivery.
+    const inbox = new MessageInboxService(this.options.db);
+    const claimed = inbox.claimDelivered(
+      input.teamId,
+      input.recipientMemberId,
+      new Date().toISOString()
+    );
+    if (claimed.length === 0) {
+      return {
+        status: "nothing_pending",
+        nudged: false,
+        claimed_count: 0,
+        run_id: run.run_id
+      };
+    }
+
+    // ONE short nudge for the whole claimed batch: count + distinct sender public
+    // ids. Bounded + independent of body size (buildInboxNudge).
+    const nudge = buildInboxNudge(
+      claimed.length,
+      claimed.map((row) => inboxSenderPublicId(row, input.teamName))
+    );
+
+    const resumeResult = this.resumeRun({
+      team_id: input.teamId,
+      team_name: input.teamName,
+      member_id: input.recipientMemberId,
+      run_id: run.run_id,
+      teammate_id: this.resolveMemberPublicId(
+        input.recipientMemberId,
+        input.teamName
+      ),
+      prompt_present: false,
+      message_id: claimed[claimed.length - 1].message_id,
+      recipient_status: memberStatus,
+      delivery_text: nudge,
+      trigger_kind: "message",
+      identity: input.identity
+    });
+
+    const delivered =
+      resumeResult.delivery_status ===
+      MESSAGE_DELIVERY_STATUSES.backendResumeAttempted;
+    if (!delivered) {
+      // Inject failed -> compensating un-stamp so a later drain retries the batch.
+      inbox.uncompensateDelivered(claimed.map((row) => row.message_id));
+      return {
+        status: "inject_failed",
+        nudged: false,
+        claimed_count: 0,
+        run_id: run.run_id
+      };
+    }
+
+    // Stamp the debounce timestamp AFTER injecting so a message arriving right after
+    // the nudge does not immediately re-resume.
+    this.stampResumeAttempt(run.run_id, new Date().toISOString());
+    return {
+      status: "delivered",
+      nudged: true,
+      claimed_count: claimed.length,
+      run_id: run.run_id
+    };
+  }
+
+  // Best-effort drain of EVERY recipient in a team that is already idle/stopped with
+  // pending rows (the §1.4(a) tool-tail backstop). NON-GATING: any failure is
+  // swallowed per-recipient so the originating tool is never affected. Does NOT run
+  // the full finalize reconcile (that stays in TeamDiagnostics).
+  drainTeamPendingDeliveries(input: {
+    teamId: string;
+    teamName: string;
+    identity: WorkspaceScopedCallerIdentity;
+  }): void {
+    let recipients: string[];
+    try {
+      recipients = this.findRecipientsWithPendingDeliveries(input.teamId);
+    } catch {
+      return;
+    }
+    for (const recipientMemberId of recipients) {
+      try {
+        this.drainPendingDeliveries({
+          teamId: input.teamId,
+          teamName: input.teamName,
+          recipientMemberId,
+          identity: input.identity
+        });
+      } catch {
+        // Best-effort: a single recipient's failure never affects the others.
+      }
+    }
+  }
+
+  // Internal turn-boundary hook for the two synchronous idle finalizers. Best-effort
+  // and re-entrancy-guarded (drainPendingDeliveries skips when already draining).
+  private drainAfterSynchronousIdle(input: {
+    team_id: string;
+    team_name: string;
+    member_id: string;
+    identity: WorkspaceScopedCallerIdentity;
+  }): void {
+    try {
+      this.drainPendingDeliveries({
+        teamId: input.team_id,
+        teamName: input.team_name,
+        recipientMemberId: input.member_id,
+        identity: input.identity
+      });
+    } catch {
+      // Best-effort: the synchronous finalize must never fail on a drain error.
+    }
+  }
+
+  private findLatestRunForMember(
+    teamId: string,
+    memberId: string
+  ): DeliveryRunRow | null {
+    return (
+      (this.options.db
+        .prepare(
+          `
+            SELECT *
+            FROM ${TABLE_NAMES.runs}
+            WHERE team_id = ?
+              AND member_id = ?
+            ORDER BY created_at DESC, run_id DESC
+            LIMIT 1
+          `
+        )
+        .get(teamId, memberId) as DeliveryRunRow | undefined) ?? null
+    );
+  }
+
+  private readMemberStatus(memberId: string): string | null {
+    const row = this.options.db
+      .prepare(
+        `SELECT status FROM ${TABLE_NAMES.members} WHERE member_id = ? LIMIT 1`
+      )
+      .get(memberId) as { status: string } | undefined;
+    return row?.status ?? null;
+  }
+
+  // The recipient's public id (teammate_id) for the resume events. Mirrors
+  // memberResolver.resolvePublicId: prefer the persisted publicTeammateId, then the
+  // leader form, then the canonical-name fallback.
+  private resolveMemberPublicId(memberId: string, teamName: string): string {
+    const metadata = this.readMemberMetadata(memberId);
+    const publicTeammateId = optionalStringFromMetadata(
+      metadata.publicTeammateId
+    );
+    if (publicTeammateId) {
+      return publicTeammateId;
+    }
+    const publicLeadAgentId = optionalStringFromMetadata(
+      metadata.publicLeadAgentId
+    );
+    if (publicLeadAgentId) {
+      return publicLeadAgentId;
+    }
+    if (memberId.startsWith("leader:")) {
+      return `team-lead@${teamName}`;
+    }
+    return `${canonicalNameFromMemberId(memberId)}@${teamName}`;
+  }
+
+  // Distinct recipients in a team that are idle/stopped AND have at least one pending
+  // (undelivered, non-suppress) row — the backstop work list. SELECTION GATE =
+  // `delivered_at IS NULL` ONLY (the single source of truth); the prior
+  // `status = 'queued'` predicate is dropped so the set stays IDENTICAL while the
+  // status column converges, and so a compensating un-stamp (delivered_at -> NULL)
+  // correctly re-surfaces the row for a retry.
+  private findRecipientsWithPendingDeliveries(teamId: string): string[] {
+    const rows = this.options.db
+      .prepare(
+        `
+          SELECT DISTINCT m.recipient_member_id AS recipient_member_id
+          FROM ${TABLE_NAMES.messages} m
+          INNER JOIN ${TABLE_NAMES.members} mem
+            ON mem.member_id = m.recipient_member_id
+          WHERE m.team_id = ?
+            AND m.delivered_at IS NULL
+            AND mem.status IN (
+              '${MEMBER_STATUSES.idle}',
+              '${MEMBER_STATUSES.stopped}'
+            )
+            AND (
+              json_extract(m.metadata_json, '$.message_type') IS NULL
+              OR json_extract(m.metadata_json, '$.message_type') NOT IN (
+                'resume_failure_notice',
+                'lifecycle_completion'
+              )
+            )
+        `
+      )
+      .all(teamId) as Array<{ recipient_member_id: string | null }>;
+
+    return rows
+      .map((row) => row.recipient_member_id)
+      .filter((value): value is string => typeof value === "string" && value.length > 0);
+  }
 }
 
 function isFileModifyingWork(classification: WorkClassification): boolean {
@@ -2857,9 +3407,9 @@ function buildResumeContextMetadata(
     summary_present: Boolean(normalizeOptionalText(input.summary)),
     // D-02: this metadata object is the IN-MEMORY input to resumeRun only — it is
     // never persisted (updateRunLifecycle writes only the returned
-    // actionResult.metadata, i.e. `{ pane }`). So the full body rides the resume
-    // context to sendToPane without ever touching runs.metadata_json / events /
-    // diagnostics. Falls back to undefined when no body text was supplied.
+    // actionResult.metadata, i.e. `{ pane }`). Phase 16 (notify + pull): this carries
+    // the SHORT inbox NUDGE (count + senders), NOT the full body — the body never
+    // rides the resume context at all. Falls back to undefined when no nudge supplied.
     resume_delivery_text: normalizeOptionalText(input.delivery_text) ?? undefined,
     previous_status: input.recipient_status,
     backend_run_id: backendIdFromRunOrMetadata(run, "backend_run_id"),

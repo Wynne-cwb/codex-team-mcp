@@ -5,6 +5,7 @@ import { z, ZodError } from "zod";
 
 import { createExecutionBackendFromOptions } from "../adapters/paneExecutionBackend.js";
 import { normalizeCallerMetadata } from "../context/caller.js";
+import { enforceTeammateCapability } from "./capabilityGuard.js";
 import { buildWorkspaceScopedCallerIdentity } from "../services/callerIdentity.js";
 import type { WorkspaceScopedCallerIdentity } from "../services/callerIdentity.js";
 import { LifecycleService } from "../services/lifecycleService.js";
@@ -43,6 +44,21 @@ export function createTeamMergeHandler(
         workspaceRoot: state.workspaceRoot,
         caller: normalizeCallerMetadata(extra)
       });
+      // Phase 13 (D-Q2): teammate-role callers cannot drive TL-only worktree
+      // merges. Deny BEFORE parse / lifecycle construction (no body touched).
+      const denial = enforceTeammateCapability({
+        tool: "TeamMerge",
+        identity,
+        db: adapter.getDatabase()
+      });
+      if (denial) {
+        return jsonResponse({
+          implemented_now: true,
+          status: "error",
+          error_code: denial.error_code,
+          message: denial.message
+        });
+      }
       const input = teamMergeInputSchema.parse(args);
       const db = adapter.getDatabase();
 

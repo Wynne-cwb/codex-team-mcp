@@ -22,6 +22,11 @@ import { PaneExecutionBackend } from "../src/adapters/paneExecutionBackend.js";
 import { normalizeCallerMetadata } from "../src/context/caller.js";
 import { buildWorkspaceScopedCallerIdentity } from "../src/services/callerIdentity.js";
 import { ReconciliationService } from "../src/services/reconciliationService.js";
+import {
+  WorkspaceSafetyService,
+  type WorkspaceInspectionInput,
+  type WorkspaceInspectionResult
+} from "../src/services/workspaceSafetyService.js";
 import { TeamService } from "../src/services/teamService.js";
 import { DurableStateAdapter } from "../src/state/durableState.js";
 import {
@@ -405,6 +410,32 @@ class ThrowingReconcileBackend implements ExecutionBackend {
     throw new Error(this.errorMessage);
   }
 }
+
+// BUG #1: counts inspectWorkspace calls while delegating to the real git inspection,
+// so a test can assert the turn-boundary capture runs exactly once.
+class CountingWorkspaceSafetyService extends WorkspaceSafetyService {
+  inspectCalls: WorkspaceInspectionInput[] = [];
+
+  inspectWorkspace(input: WorkspaceInspectionInput): WorkspaceInspectionResult {
+    this.inspectCalls.push(input);
+    return super.inspectWorkspace(input);
+  }
+}
+
+// BUG #1: an inspection path that THROWS, to prove the turn-boundary capture is
+// best-effort (degrades to empty, never breaks the reconcile transition).
+class ThrowingWorkspaceSafetyService extends WorkspaceSafetyService {
+  inspectCalls = 0;
+
+  inspectWorkspace(_input: WorkspaceInspectionInput): WorkspaceInspectionResult {
+    this.inspectCalls += 1;
+    throw new Error(`inspect boom ${SECRET_PHASE5_RECONCILE}`);
+  }
+}
+
+// BUG #4: the gone-pane reconcile failure reason a pane-hosted backend returns when
+// a pane disappears mid-turn (mirror of paneExecutionBackend's PANE_PROCESS_GONE).
+const PANE_PROCESS_GONE = "codex_pane_exited_without_completion";
 
 afterEach(() => {
   for (const adapter of adapters.splice(0)) {
@@ -1159,8 +1190,10 @@ describe("ReconciliationService.reconcileWorkspace", () => {
       mode: "finalize"
     });
 
-    // Terminal idle is the ONE mutation finalize performs: run + member promoted to
-    // idle, exactly one completion event, and review_status left intact (no inspect).
+    // Terminal idle: run + member promoted to idle, exactly one completion event, and
+    // review_status left intact. The per-poll inspection loop stays skipped; the only
+    // git touch is the BUG #1 turn-boundary changed-files capture (here the path is
+    // missing, so it degrades to empty and never clobbers review_status).
     expect(summary.eventsAppended).toBe(1);
     expect(rowCount(context.db, TABLE_NAMES.events) - eventsBefore).toBe(1);
     expect(readRun(context.db, "run:fin")).toMatchObject({
@@ -1176,5 +1209,351 @@ describe("ReconciliationService.reconcileWorkspace", () => {
         expect.objectContaining({ event_type: EVENT_TYPES.teammateRunCompleted })
       ])
     );
+  });
+
+  // ---------------------------------------------------------------------------
+  // BUG #4: reconcile's gone-pane -> failed path must NOT re-classify an
+  // INTENTIONALLY-stopped run as a crash.
+  // ---------------------------------------------------------------------------
+
+  it("does NOT mark an intentionally-stopped run failed when its pane reconciles gone (run-level marker)", () => {
+    const context = createContext();
+    insertTeammate({
+      db: context.db,
+      teamId: context.teamId,
+      workspaceRoot: context.identity.workspaceRoot,
+      memberId: "teammate:shutdown",
+      status: MEMBER_STATUSES.running
+    });
+    insertRun({
+      db: context.db,
+      teamId: context.teamId,
+      memberId: "teammate:shutdown",
+      runId: "run:shutdown",
+      status: MEMBER_STATUSES.running,
+      // The teardown stamped the durable intentional-stop marker.
+      metadata: { intentional_stop: true }
+    });
+    // A pane-hosted backend reports the pane gone mid-turn -> the gone-pane failure.
+    const backend = new FakeReconcileBackend({
+      status: "failed",
+      backend: "iterm2",
+      backend_status: RUN_BACKEND_STATUSES.failed,
+      last_error: PANE_PROCESS_GONE
+    });
+
+    const summary = createService(context, backend).reconcileWorkspace({
+      workspaceRoot: context.identity.workspaceRoot,
+      actorCallerKey: context.identity.callerKey,
+      mode: "finalize"
+    });
+
+    expect(summary.staleRunsMarked).toBe(0);
+    // The run is a CLEAN stop, not a crash: stopped, no PANE_PROCESS_GONE error.
+    const run = readRun(context.db, "run:shutdown");
+    expect(run).toMatchObject({
+      status: MEMBER_STATUSES.stopped,
+      backend_status: RUN_BACKEND_STATUSES.stopped
+    });
+    expect(run.last_error).toBeNull();
+    expect(readMember(context.db, "teammate:shutdown")).toMatchObject({
+      status: MEMBER_STATUSES.stopped
+    });
+    const events = eventRows(context.db).map((row) => row.event_type);
+    expect(events).toContain(EVENT_TYPES.teammateStopped);
+    expect(events).not.toContain(EVENT_TYPES.teammateBackendFailed);
+  });
+
+  it("recognizes an intentional stop via the pane degradation_reason fallback", () => {
+    const context = createContext();
+    insertTeammate({
+      db: context.db,
+      teamId: context.teamId,
+      workspaceRoot: context.identity.workspaceRoot,
+      memberId: "teammate:closed-pane",
+      status: MEMBER_STATUSES.running
+    });
+    insertRun({
+      db: context.db,
+      teamId: context.teamId,
+      memberId: "teammate:closed-pane",
+      runId: "run:closed-pane",
+      status: MEMBER_STATUSES.running,
+      // No run-level marker: only the pane carries the intentional pane_closed reason.
+      metadata: {
+        backend_metadata: {
+          pane: {
+            mode: "pane",
+            backend_type: "iterm2",
+            availability_status: "unavailable",
+            degradation_reason: "pane_closed",
+            pane_id: "%77"
+          }
+        }
+      }
+    });
+    const backend = new FakeReconcileBackend({
+      status: "failed",
+      backend: "iterm2",
+      backend_status: RUN_BACKEND_STATUSES.failed,
+      last_error: PANE_PROCESS_GONE
+    });
+
+    createService(context, backend).reconcileWorkspace({
+      workspaceRoot: context.identity.workspaceRoot,
+      actorCallerKey: context.identity.callerKey,
+      mode: "finalize"
+    });
+
+    expect(readRun(context.db, "run:closed-pane")).toMatchObject({
+      status: MEMBER_STATUSES.stopped
+    });
+    const events = eventRows(context.db).map((row) => row.event_type);
+    expect(events).toContain(EVENT_TYPES.teammateStopped);
+    expect(events).not.toContain(EVENT_TYPES.teammateBackendFailed);
+  });
+
+  it("STILL marks a real crash failed when a pane exits without an intentional teardown", () => {
+    const context = createContext();
+    insertTeammate({
+      db: context.db,
+      teamId: context.teamId,
+      workspaceRoot: context.identity.workspaceRoot,
+      memberId: "teammate:crash",
+      status: MEMBER_STATUSES.running
+    });
+    insertRun({
+      db: context.db,
+      teamId: context.teamId,
+      memberId: "teammate:crash",
+      runId: "run:crash",
+      status: MEMBER_STATUSES.running
+      // No intentional-stop marker anywhere -> a genuine crash.
+    });
+    const backend = new FakeReconcileBackend({
+      status: "failed",
+      backend: "iterm2",
+      backend_status: RUN_BACKEND_STATUSES.failed,
+      last_error: PANE_PROCESS_GONE
+    });
+
+    createService(context, backend).reconcileWorkspace({
+      workspaceRoot: context.identity.workspaceRoot,
+      actorCallerKey: context.identity.callerKey,
+      mode: "finalize"
+    });
+
+    const run = readRun(context.db, "run:crash");
+    expect(run).toMatchObject({
+      status: MEMBER_STATUSES.failed,
+      backend_status: RUN_BACKEND_STATUSES.failed
+    });
+    expect(run.last_error).toBe(PANE_PROCESS_GONE);
+    expect(readMember(context.db, "teammate:crash")).toMatchObject({
+      status: MEMBER_STATUSES.failed
+    });
+    const events = eventRows(context.db).map((row) => row.event_type);
+    expect(events).toContain(EVENT_TYPES.teammateBackendFailed);
+    expect(events).not.toContain(EVENT_TYPES.teammateStopped);
+  });
+
+  it("never re-reconciles an already-stopped run (subsequent finalize is a no-op)", () => {
+    const context = createContext();
+    insertTeammate({
+      db: context.db,
+      teamId: context.teamId,
+      workspaceRoot: context.identity.workspaceRoot,
+      memberId: "teammate:done-stopped",
+      status: MEMBER_STATUSES.stopped
+    });
+    // The teardown already flipped this run to the terminal `stopped` status.
+    insertRun({
+      db: context.db,
+      teamId: context.teamId,
+      memberId: "teammate:done-stopped",
+      runId: "run:done-stopped",
+      status: MEMBER_STATUSES.stopped,
+      metadata: { intentional_stop: true }
+    });
+    const backend = new FakeReconcileBackend({
+      status: "failed",
+      backend: "iterm2",
+      backend_status: RUN_BACKEND_STATUSES.failed,
+      last_error: PANE_PROCESS_GONE
+    });
+
+    createService(context, backend).reconcileWorkspace({
+      workspaceRoot: context.identity.workspaceRoot,
+      actorCallerKey: context.identity.callerKey,
+      mode: "finalize"
+    });
+
+    // A stopped run is outside the running set, so the backend is never consulted and
+    // the status is left untouched -> a later poll can never flip it to failed.
+    expect(backend.reconcileCalls).toHaveLength(0);
+    expect(readRun(context.db, "run:done-stopped")).toMatchObject({
+      status: MEMBER_STATUSES.stopped
+    });
+    expect(eventRows(context.db).map((row) => row.event_type)).not.toContain(
+      EVENT_TYPES.teammateBackendFailed
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // BUG #1: changed_files captured ONCE at the terminal turn boundary, even in
+  // finalize mode (which skips the per-poll workspace-inspection loop).
+  // ---------------------------------------------------------------------------
+
+  it("captures changed_files at the terminal transition in finalize mode (worktree run)", () => {
+    const context = createContext();
+    const workspace = createTempGitWorkspace();
+    insertTeammate({
+      db: context.db,
+      teamId: context.teamId,
+      workspaceRoot: context.identity.workspaceRoot,
+      memberId: "teammate:turn",
+      status: MEMBER_STATUSES.running
+    });
+    insertRun({
+      db: context.db,
+      teamId: context.teamId,
+      memberId: "teammate:turn",
+      runId: "run:turn",
+      status: MEMBER_STATUSES.running,
+      workspacePath: workspace.workspacePath,
+      baseRevision: workspace.baseRevision,
+      reviewStatus: RUN_REVIEW_STATUSES.pendingReview
+    });
+    const backend = new FakeReconcileBackend({
+      status: "idle",
+      backend: "codex_cli_exec",
+      backend_status: RUN_BACKEND_STATUSES.idle,
+      thread_id: "thread-turn"
+    });
+    const safety = new CountingWorkspaceSafetyService();
+    const service = new ReconciliationService({
+      db: context.db,
+      statePath: context.adapter.describeStateRoot().stateRoot,
+      executionBackend: backend,
+      workspaceSafetyService: safety
+    });
+
+    service.reconcileWorkspace({
+      workspaceRoot: context.identity.workspaceRoot,
+      actorCallerKey: context.identity.callerKey,
+      mode: "finalize"
+    });
+
+    const run = readRun(context.db, "run:turn");
+    expect(run.status).toBe(MEMBER_STATUSES.idle);
+    // The teammate's actual worktree change is now visible in diagnostics' field.
+    expect(run.changed_files_json).toContain("tracked.txt");
+    expect(JSON.parse(run.changed_files_json) as string[]).toContain("tracked.txt");
+    // Captured via the SHARED inspectWorkspace path, exactly ONCE.
+    expect(safety.inspectCalls).toHaveLength(1);
+    // The capture writes changed_files only — it does NOT clobber review_status.
+    expect(run.review_status).toBe(RUN_REVIEW_STATUSES.pendingReview);
+  });
+
+  it("inspects the worktree only ONCE — a later finalize poll does not re-inspect", () => {
+    const context = createContext();
+    const workspace = createTempGitWorkspace();
+    insertTeammate({
+      db: context.db,
+      teamId: context.teamId,
+      workspaceRoot: context.identity.workspaceRoot,
+      memberId: "teammate:once",
+      status: MEMBER_STATUSES.running
+    });
+    insertRun({
+      db: context.db,
+      teamId: context.teamId,
+      memberId: "teammate:once",
+      runId: "run:once",
+      status: MEMBER_STATUSES.running,
+      workspacePath: workspace.workspacePath,
+      baseRevision: workspace.baseRevision,
+      reviewStatus: RUN_REVIEW_STATUSES.pendingReview
+    });
+    const backend = new FakeReconcileBackend({
+      status: "idle",
+      backend: "codex_cli_exec",
+      backend_status: RUN_BACKEND_STATUSES.idle,
+      thread_id: "thread-once"
+    });
+    const safety = new CountingWorkspaceSafetyService();
+    const service = new ReconciliationService({
+      db: context.db,
+      statePath: context.adapter.describeStateRoot().stateRoot,
+      executionBackend: backend,
+      workspaceSafetyService: safety
+    });
+
+    // First poll: running -> idle, inspect once.
+    service.reconcileWorkspace({
+      workspaceRoot: context.identity.workspaceRoot,
+      actorCallerKey: context.identity.callerKey,
+      mode: "finalize"
+    });
+    // Second poll: the run is already idle (out of the running set) -> no re-inspect.
+    service.reconcileWorkspace({
+      workspaceRoot: context.identity.workspaceRoot,
+      actorCallerKey: context.identity.callerKey,
+      mode: "finalize"
+    });
+
+    expect(safety.inspectCalls).toHaveLength(1);
+    expect(backend.reconcileCalls).toHaveLength(1);
+    expect(readRun(context.db, "run:once").changed_files_json).toContain(
+      "tracked.txt"
+    );
+  });
+
+  it("degrades changed_files to empty (and never throws) when the turn-boundary inspection fails", () => {
+    const context = createContext();
+    insertTeammate({
+      db: context.db,
+      teamId: context.teamId,
+      workspaceRoot: context.identity.workspaceRoot,
+      memberId: "teammate:degrade",
+      status: MEMBER_STATUSES.running
+    });
+    insertRun({
+      db: context.db,
+      teamId: context.teamId,
+      memberId: "teammate:degrade",
+      runId: "run:degrade",
+      status: MEMBER_STATUSES.running,
+      workspacePath: "/tmp/codex-team-degrade-inspection",
+      baseRevision: "base-revision",
+      reviewStatus: RUN_REVIEW_STATUSES.pendingReview
+    });
+    const backend = new FakeReconcileBackend({
+      status: "idle",
+      backend: "codex_cli_exec",
+      backend_status: RUN_BACKEND_STATUSES.idle,
+      thread_id: "thread-degrade"
+    });
+    const safety = new ThrowingWorkspaceSafetyService();
+    const service = new ReconciliationService({
+      db: context.db,
+      statePath: context.adapter.describeStateRoot().stateRoot,
+      executionBackend: backend,
+      workspaceSafetyService: safety
+    });
+
+    expect(() =>
+      service.reconcileWorkspace({
+        workspaceRoot: context.identity.workspaceRoot,
+        actorCallerKey: context.identity.callerKey,
+        mode: "finalize"
+      })
+    ).not.toThrow();
+
+    // The transition still completed; changed_files stayed empty (degraded).
+    const run = readRun(context.db, "run:degrade");
+    expect(run.status).toBe(MEMBER_STATUSES.idle);
+    expect(JSON.parse(run.changed_files_json) as string[]).toEqual([]);
+    expect(safety.inspectCalls).toBe(1);
   });
 });

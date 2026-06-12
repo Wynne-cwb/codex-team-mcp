@@ -27,6 +27,8 @@ import {
   type NormalizedCallerMetadata
 } from "./context/caller.js";
 import { buildWorkspaceScopedCallerIdentity } from "./services/callerIdentity.js";
+import { canonicalizeTeamName } from "./services/teamNames.js";
+import { LifecycleService, type DeliveryDrainHook } from "./services/lifecycleService.js";
 import {
   readPaneStatusSummary,
   type PaneStatusSummary
@@ -55,6 +57,86 @@ export interface DiagnosticsPayloadOptions extends CodexTeamServerOptions {
   // source the pane backend uses, so production reflects the live MCP process.
   terminalEnv?: NodeJS.ProcessEnv;
   terminalCommandRunner?: PaneBackendCommandRunner;
+  // Phase 17 (UAT focus filters): scope the output to the caller's ACTIVE team by
+  // default instead of dumping every team/run/message in the workspace. All
+  // optional — defaults are applied in resolveDiagnosticsScope.
+  teamName?: string;
+  currentTeamOnly?: boolean;
+  includeArchived?: boolean;
+  includeHistory?: boolean;
+  maxEvents?: number;
+  maxRuns?: number;
+  maxMessages?: number;
+  messagesSince?: string;
+  teammateId?: string;
+}
+
+// Phase 17 focus-filter caps. Defaults keep the live view bounded; explicit caps
+// are clamped to a sane range so a caller can never request an unbounded dump.
+const DIAGNOSTICS_CAP_MIN = 1;
+const DIAGNOSTICS_CAP_MAX = 500;
+const DEFAULT_MAX_EVENTS = 20;
+const DEFAULT_MAX_RUNS = 10;
+const DEFAULT_MAX_MESSAGES = 20;
+
+type DiagnosticsScopeMode =
+  | "single_team"
+  | "multi_team"
+  | "known_teams_fallback";
+
+// Resolved focus filter, threaded (read-only) through every team-scoped read so
+// the output focuses on ONE team unless explicitly widened.
+interface DiagnosticsScope {
+  mode: DiagnosticsScopeMode;
+  teamId: string | null;
+  teamName: string | null;
+  teammateMemberId: string | null;
+  teammateIdRequested: string | null;
+  currentTeamOnly: boolean;
+  includeArchived: boolean;
+  includeHistory: boolean;
+  maxEvents: number;
+  maxRuns: number;
+  maxMessages: number;
+  messagesSince: string | null;
+  fallbackReason: string | null;
+}
+
+// Mutable truncation accumulator: read functions set these when a cap dropped
+// rows, so truncation is always VISIBLE in the payload (never silent).
+interface DiagnosticsTruncation {
+  events_returned: number;
+  events_truncated: boolean;
+  runs_returned: number;
+  runs_truncated: boolean;
+  messages_matched: number;
+  messages_returned: number;
+  messages_truncated: boolean;
+}
+
+// Public-facing scope echo + truncation markers attached to the payload.
+interface DiagnosticsScopeReport {
+  mode: DiagnosticsScopeMode;
+  team_id: string | null;
+  team_name: string | null;
+  current_team_only: boolean;
+  include_archived: boolean;
+  include_history: boolean;
+  teammate_id: string | null;
+  fallback_reason: string | null;
+  caps: {
+    max_events: number;
+    max_runs: number;
+    max_messages: number;
+    messages_since: string | null;
+  };
+  events_returned: number;
+  events_truncated: boolean;
+  runs_returned: number;
+  runs_truncated: boolean;
+  messages_matched: number;
+  messages_returned: number;
+  messages_truncated: boolean;
 }
 
 interface DiagnosticsActiveBinding {
@@ -218,6 +300,8 @@ export interface DiagnosticsPayload {
   };
   state: DiagnosticsStateDescription;
   execution: ExecutionBackendDescription;
+  // Phase 17: echo of the active focus filter + truncation markers.
+  scope: DiagnosticsScopeReport;
   teammates: DiagnosticsTeammateStatus[];
   lifecycleSummary: DiagnosticsLifecycleSummary;
   runSummary: DiagnosticsRunSummary;
@@ -238,29 +322,103 @@ export interface DiagnosticsPayload {
   };
 }
 
+// Phase 16: construct the turn-boundary delivery drain hook for ReconciliationService.
+// Returns undefined when pane mode is off (no pane to nudge), so non-pane diagnostics
+// are completely unaffected. The hook is best-effort: a drain failure is swallowed so
+// it can never break the finalize reconcile.
+function buildDeliveryDrainHook(
+  db: ReturnType<DurableStateAdapter["getDatabase"]>,
+  statePath: string,
+  options: DiagnosticsPayloadOptions
+): DeliveryDrainHook | undefined {
+  if (options.paneMode?.enabled !== true) {
+    return undefined;
+  }
+
+  return (input) => {
+    try {
+      const lifecycle = new LifecycleService({
+        db,
+        statePath,
+        executionBackend: createExecutionBackendFromOptions(options),
+        paneMode: options.paneMode
+      });
+      lifecycle.drainPendingDeliveries({
+        teamId: input.teamId,
+        teamName: input.teamName,
+        recipientMemberId: input.recipientMemberId,
+        identity: buildWorkspaceScopedCallerIdentity({
+          workspaceRoot: input.workspaceRoot,
+          caller: {
+            callerKey: input.actorCallerKey,
+            observedMetadata: {},
+            fallbackUsed: false
+          }
+        })
+      });
+    } catch {
+      // Best-effort: never break reconcile on a drain error.
+    }
+  };
+}
+
 export function buildDiagnosticsPayload(options: DiagnosticsPayloadOptions = {}): DiagnosticsPayload {
   const registeredTools = options.registeredTools ?? [];
   const caller = normalizeCallerMetadata(options.callerMetadata);
   const stateAdapter = new DurableStateAdapter(options);
 
   try {
-    const state = buildDiagnosticsState(stateAdapter, caller);
     const db = stateAdapter.getDatabase();
-    const executionBackend = createExecutionBackendFromOptions(options);
-    const lifecycleSummary = readLifecycleSummary(
-      db,
-      state.workspaceRoot
-    );
-    const runSummary = readRunSummary(db, state.workspaceRoot);
-    const workspaceReviewSummary = readWorkspaceReviewSummary(
-      db,
-      state.workspaceRoot
-    );
-    const paneMessageSummary = readPaneMessageSummary(db, state.workspaceRoot);
-    const paneStatusSummary = readPaneStatusSummary(db, state.workspaceRoot, {
-      paneModeEnabled: options.paneMode?.enabled === true,
-      includeDebug: options.includeDebug === true
+    const baseState = describeDurableState(stateAdapter);
+    const identity = buildWorkspaceScopedCallerIdentity({
+      workspaceRoot: baseState.workspaceRoot,
+      caller
     });
+    // Phase 17: resolve the focus filter ONCE (read-only) and thread it through
+    // every team-scoped read. `detail` is false only in the no-active-team
+    // fallback, where we surface a compact "known teams" list (so the user can
+    // pick) instead of a blank or misleading dump.
+    const scope = resolveDiagnosticsScope({ db, identity, options });
+    const detail = scope.mode !== "known_teams_fallback";
+    const truncation: DiagnosticsTruncation = {
+      events_returned: 0,
+      events_truncated: false,
+      runs_returned: 0,
+      runs_truncated: false,
+      messages_matched: 0,
+      messages_returned: 0,
+      messages_truncated: false
+    };
+
+    const state = buildDiagnosticsState({
+      baseState,
+      db,
+      identity,
+      scope,
+      detail,
+      truncation
+    });
+    const executionBackend = createExecutionBackendFromOptions(options);
+    const lifecycleSummary = detail
+      ? readLifecycleSummary(db, state.workspaceRoot, scope)
+      : emptyLifecycleSummary();
+    const runSummary = detail
+      ? readRunSummary(db, state.workspaceRoot, scope)
+      : emptyRunSummary();
+    const workspaceReviewSummary = detail
+      ? readWorkspaceReviewSummary(db, state.workspaceRoot, scope)
+      : emptyWorkspaceReviewSummary();
+    const paneMessageSummary = detail
+      ? readPaneMessageSummary(db, state.workspaceRoot, scope)
+      : emptyMessageSummary();
+    const paneStatusSummary = detail
+      ? readPaneStatusSummary(db, state.workspaceRoot, {
+          paneModeEnabled: options.paneMode?.enabled === true,
+          includeDebug: options.includeDebug === true,
+          teamId: scope.teamId ?? undefined,
+          teammateMemberId: scope.teammateMemberId ?? undefined
+        })
+      : emptyPaneStatusSummary(options.paneMode?.enabled === true);
     // Finalize-on-poll (finalize mode): with the async/detached codex_cli_exec
     // backend, startRun returns `running` and the real task finishes in the
     // background. TeamDiagnostics is the live reconcile trigger — "finalize" mode
@@ -274,19 +432,44 @@ export function buildDiagnosticsPayload(options: DiagnosticsPayloadOptions = {})
     // deliverable preview reflect the freshly finalized status. Idempotent: reconcile
     // only iterates running runs, so a run already finalized to idle/failed is not
     // re-finalized and emits no duplicate completion event.
+    // Phase 16: when pane mode is enabled, inject the turn-boundary delivery drain so
+    // the finalize-on-poll markRunTerminal (a pane teammate's turn boundary) delivers
+    // its pending inbox nudges. Gated on pane mode (the nudge target is a pane); the
+    // drain itself is a further no-op without a live pane / durable resume metadata,
+    // so a detached or pane-less run is unaffected.
+    const deliveryDrain = buildDeliveryDrainHook(db, state.stateRoot, options);
     const reconciliationSummary = new ReconciliationService({
       db,
       statePath: state.stateRoot,
-      executionBackend
+      executionBackend,
+      deliveryDrain
     }).reconcileWorkspace({
       workspaceRoot: state.workspaceRoot,
       actorCallerKey: caller.callerKey,
       mode: "finalize"
     });
-    const teammates = readTeammateStatuses(db, state.workspaceRoot);
+    const teammates = detail
+      ? readTeammateStatuses(db, state.workspaceRoot, scope)
+      : [];
     const metadataDiagnostics =
+      options.includeDebug === true && detail
+        ? buildMetadataDiagnostics(db, state.workspaceRoot, executionBackend, scope)
+        : null;
+    // Compute the debug runs BEFORE building the return object so the run cap's
+    // truncation markers are recorded before toScopeReport snapshots them (object
+    // literal properties evaluate top-to-bottom, and `scope` precedes `debug`).
+    const debugBlock =
       options.includeDebug === true
-        ? buildMetadataDiagnostics(db, state.workspaceRoot, executionBackend)
+        ? {
+            callerMetadataType: typeof options.callerMetadata,
+            runs: detail
+              ? readRunDebugRows(db, state.workspaceRoot, scope, truncation)
+              : [],
+            terminalContext: describeTerminalContext({
+              env: options.terminalEnv,
+              commandRunner: options.terminalCommandRunner
+            })
+          }
         : null;
 
     return {
@@ -307,6 +490,7 @@ export function buildDiagnosticsPayload(options: DiagnosticsPayloadOptions = {})
       },
       state,
       execution: executionBackend.describeBackend(),
+      scope: toScopeReport(scope, truncation),
       teammates,
       lifecycleSummary,
       runSummary,
@@ -325,33 +509,358 @@ export function buildDiagnosticsPayload(options: DiagnosticsPayloadOptions = {})
           ? "07-pane-style-teammate-ui-and-terminal-backends"
           : "05-lifecycle-isolation-and-status",
       ...(metadataDiagnostics ? { metadataDiagnostics } : {}),
-      ...(options.includeDebug
-        ? {
-            debug: {
-              callerMetadataType: typeof options.callerMetadata,
-              runs: readRunDebugRows(db, state.workspaceRoot),
-              terminalContext: describeTerminalContext({
-                env: options.terminalEnv,
-                commandRunner: options.terminalCommandRunner
-              })
-            }
-          }
-        : {})
+      ...(debugBlock ? { debug: debugBlock } : {})
     };
   } finally {
     stateAdapter.close();
   }
 }
 
+// Phase 17: resolve the focus filter. Precedence:
+//   1. explicit team_name (selects that team, even a non-active one);
+//   2. multi-team when the caller explicitly widens (current_team_only:false OR
+//      include_history:true);
+//   3. DEFAULT: the caller's ACTIVE team (active binding, else TL-injected member
+//      identity for a teammate caller);
+//   4. no active team + no team_name → compact "known teams" fallback (not blank).
+// Purely read-only: it never appends events (unlike ContextResolver), so a poll
+// does not pollute the event log it is reporting on.
+function resolveDiagnosticsScope(input: {
+  db: ReturnType<DurableStateAdapter["getDatabase"]>;
+  identity: NormalizedCallerIdentityLike;
+  options: DiagnosticsPayloadOptions;
+}): DiagnosticsScope {
+  const { db, identity, options } = input;
+  const currentTeamOnly = options.currentTeamOnly ?? true;
+  const includeArchived = options.includeArchived ?? false;
+  const includeHistory = options.includeHistory ?? false;
+  const base = {
+    currentTeamOnly,
+    includeArchived,
+    includeHistory,
+    maxEvents: clampCap(options.maxEvents, DEFAULT_MAX_EVENTS),
+    maxRuns: clampCap(options.maxRuns, DEFAULT_MAX_RUNS),
+    maxMessages: clampCap(options.maxMessages, DEFAULT_MAX_MESSAGES),
+    messagesSince: normalizeIsoTimestamp(options.messagesSince),
+    teammateIdRequested: optionalText(options.teammateId) ?? null
+  } as const;
+
+  // 1. Explicit team selection.
+  const requestedTeamName = optionalText(options.teamName);
+  if (requestedTeamName) {
+    const team = findTeamByNameForDiagnostics(
+      db,
+      requestedTeamName,
+      identity.workspaceRoot,
+      includeArchived
+    );
+    if (team) {
+      return {
+        ...base,
+        mode: "single_team",
+        teamId: team.teamId,
+        teamName: team.teamName,
+        teammateMemberId: resolveTeammateMemberId(
+          db,
+          team.teamId,
+          base.teammateIdRequested
+        ),
+        fallbackReason: null
+      };
+    }
+    return {
+      ...base,
+      mode: "known_teams_fallback",
+      teamId: null,
+      teamName: null,
+      teammateMemberId: null,
+      fallbackReason: "team_name_not_found"
+    };
+  }
+
+  // 2. Explicitly widened to multi-team output.
+  if (!currentTeamOnly || includeHistory) {
+    return {
+      ...base,
+      mode: "multi_team",
+      teamId: null,
+      teamName: null,
+      teammateMemberId: null,
+      fallbackReason: null
+    };
+  }
+
+  // 3. Default: focus on the caller's active team.
+  const active = resolveActiveTeamForDiagnostics(db, identity);
+  if (active) {
+    return {
+      ...base,
+      mode: "single_team",
+      teamId: active.teamId,
+      teamName: active.teamName,
+      teammateMemberId: resolveTeammateMemberId(
+        db,
+        active.teamId,
+        base.teammateIdRequested
+      ),
+      fallbackReason: null
+    };
+  }
+
+  // 4. No active team to focus on → compact known-teams fallback (not blank).
+  return {
+    ...base,
+    mode: "known_teams_fallback",
+    teamId: null,
+    teamName: null,
+    teammateMemberId: null,
+    fallbackReason: "no_active_team"
+  };
+}
+
+// Minimal identity shape used by scope resolution (the full identity from
+// buildWorkspaceScopedCallerIdentity satisfies it).
+interface NormalizedCallerIdentityLike {
+  workspaceRoot: string;
+  callerKey: string;
+  bindingKey: string;
+  observedMetadata: Record<string, string>;
+}
+
+// Read-only resolution of the caller's active team: the active binding first
+// (zero behavior change for the TL and existing callers), then the TL-injected
+// member identity (a co-located teammate MCP has no binding of its own). The
+// team's workspace must match the caller's. Returns null when neither resolves.
+function resolveActiveTeamForDiagnostics(
+  db: ReturnType<DurableStateAdapter["getDatabase"]>,
+  identity: NormalizedCallerIdentityLike
+): { teamId: string; teamName: string } | null {
+  const binding = readActiveBinding(db, identity.bindingKey);
+  if (
+    binding &&
+    binding.workspace_root === identity.workspaceRoot &&
+    binding.caller_key === identity.callerKey
+  ) {
+    return { teamId: binding.team_id, teamName: binding.team_name };
+  }
+
+  const memberId = identity.observedMetadata.codexTeamMemberId;
+  if (memberId) {
+    const row = db
+      .prepare(
+        `
+          SELECT
+            teams.team_id AS teamId,
+            teams.canonical_name AS teamName
+          FROM ${TABLE_NAMES.members} AS members
+          JOIN ${TABLE_NAMES.teams} AS teams
+            ON teams.team_id = members.team_id
+          WHERE members.member_id = ?
+            AND teams.workspace_root = ?
+          LIMIT 1
+        `
+      )
+      .get(memberId, identity.workspaceRoot) as
+      | { teamId: string; teamName: string }
+      | undefined;
+    if (row) {
+      return row;
+    }
+  }
+
+  return null;
+}
+
+// Resolve team_name → team row. A team_name explicitly selects a team even if it
+// is not the active one. Archived teams resolve only when include_archived is set.
+function findTeamByNameForDiagnostics(
+  db: ReturnType<DurableStateAdapter["getDatabase"]>,
+  rawTeamName: string,
+  workspaceRoot: string,
+  includeArchived: boolean
+): { teamId: string; teamName: string } | null {
+  let canonical: string;
+  try {
+    canonical = canonicalizeTeamName(rawTeamName);
+  } catch {
+    return null;
+  }
+
+  const row = db
+    .prepare(
+      `
+        SELECT
+          team_id AS teamId,
+          canonical_name AS teamName,
+          status
+        FROM ${TABLE_NAMES.teams}
+        WHERE workspace_root = ?
+          AND canonical_name = ?
+        LIMIT 1
+      `
+    )
+    .get(workspaceRoot, canonical) as
+    | { teamId: string; teamName: string; status: string }
+    | undefined;
+
+  if (!row) {
+    return null;
+  }
+  if (row.status === TEAM_STATUSES.archived && !includeArchived) {
+    return null;
+  }
+  return { teamId: row.teamId, teamName: row.teamName };
+}
+
+// Resolve a teammate reference (public id, member id, or display name) to a
+// member id within the selected team — mirroring the merge handler's accepted
+// forms. Returns the raw reference when unresolved so a bad teammate_id filters
+// to NOTHING (signposting "no such teammate") rather than silently to everything.
+function resolveTeammateMemberId(
+  db: ReturnType<DurableStateAdapter["getDatabase"]>,
+  teamId: string,
+  reference: string | null
+): string | null {
+  if (!reference) {
+    return null;
+  }
+
+  const row = db
+    .prepare(
+      `
+        SELECT member_id AS memberId
+        FROM ${TABLE_NAMES.members}
+        WHERE team_id = ?
+          AND (
+            member_id = ?
+            OR json_extract(metadata_json, '$.publicTeammateId') = ?
+            OR lower(display_name) = lower(?)
+          )
+        LIMIT 1
+      `
+    )
+    .get(teamId, reference, reference, reference) as
+    | { memberId: string }
+    | undefined;
+
+  return row?.memberId ?? reference;
+}
+
+// Clamp an integer cap to [1, 500]; non-finite / missing falls back to the
+// default. Floors fractional inputs so a cap is always a whole row count.
+function clampCap(value: number | undefined, fallback: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return fallback;
+  }
+  const floored = Math.floor(value);
+  if (floored < DIAGNOSTICS_CAP_MIN) {
+    return DIAGNOSTICS_CAP_MIN;
+  }
+  if (floored > DIAGNOSTICS_CAP_MAX) {
+    return DIAGNOSTICS_CAP_MAX;
+  }
+  return floored;
+}
+
+// Accept only a parseable ISO-8601 timestamp; anything else is ignored (no
+// filter) rather than silently dropping all rows.
+function normalizeIsoTimestamp(value: string | undefined): string | null {
+  const trimmed = optionalText(value);
+  if (!trimmed) {
+    return null;
+  }
+  return Number.isNaN(Date.parse(trimmed)) ? null : trimmed;
+}
+
+// Team filter clause for queries that JOIN teams; empty when not single-team.
+function teamFilterClause(
+  scope: DiagnosticsScope,
+  teamsAlias = "teams"
+): { sql: string; params: string[] } {
+  if (scope.teamId) {
+    return { sql: ` AND ${teamsAlias}.team_id = ?`, params: [scope.teamId] };
+  }
+  return { sql: "", params: [] };
+}
+
+function toScopeReport(
+  scope: DiagnosticsScope,
+  truncation: DiagnosticsTruncation
+): DiagnosticsScopeReport {
+  return {
+    mode: scope.mode,
+    team_id: scope.teamId,
+    team_name: scope.teamName,
+    current_team_only: scope.currentTeamOnly,
+    include_archived: scope.includeArchived,
+    include_history: scope.includeHistory,
+    teammate_id: scope.teammateIdRequested,
+    fallback_reason: scope.fallbackReason,
+    caps: {
+      max_events: scope.maxEvents,
+      max_runs: scope.maxRuns,
+      max_messages: scope.maxMessages,
+      messages_since: scope.messagesSince
+    },
+    events_returned: truncation.events_returned,
+    events_truncated: truncation.events_truncated,
+    runs_returned: truncation.runs_returned,
+    runs_truncated: truncation.runs_truncated,
+    messages_matched: truncation.messages_matched,
+    messages_returned: truncation.messages_returned,
+    messages_truncated: truncation.messages_truncated
+  };
+}
+
+function emptyLifecycleSummary(): DiagnosticsLifecycleSummary {
+  return { total: 0, by_status: {} };
+}
+
+function emptyRunSummary(): DiagnosticsRunSummary {
+  return { total: 0, by_status: {}, by_backend_status: {}, stale: 0 };
+}
+
+function emptyWorkspaceReviewSummary(): DiagnosticsWorkspaceReviewSummary {
+  return {
+    pending_review: 0,
+    needs_review: 0,
+    with_workspace_path: 0,
+    merged: 0,
+    merge_conflict: 0,
+    escalated: 0
+  };
+}
+
+function emptyMessageSummary(): DiagnosticsMessageSummary {
+  return { total: 0, queued: 0, by_delivery_status: {} };
+}
+
+function emptyPaneStatusSummary(paneModeEnabled: boolean): PaneStatusSummary {
+  return {
+    enabled: paneModeEnabled,
+    total: 0,
+    attachable: 0,
+    available: 0,
+    unavailable: 0,
+    degraded: 0,
+    by_backend_type: {},
+    by_availability_status: {},
+    recent: [],
+    panes: []
+  };
+}
+
 function readLifecycleSummary(
   db: ReturnType<DurableStateAdapter["getDatabase"]>,
-  workspaceRoot: string
+  workspaceRoot: string,
+  scope: DiagnosticsScope
 ): DiagnosticsLifecycleSummary {
   const byStatus = readCountsByStatus({
     db,
     workspaceRoot,
     tableName: TABLE_NAMES.members,
-    statusColumn: "members.status"
+    statusColumn: "members.status",
+    scope
   });
 
   return {
@@ -362,15 +871,17 @@ function readLifecycleSummary(
 
 function readRunSummary(
   db: ReturnType<DurableStateAdapter["getDatabase"]>,
-  workspaceRoot: string
+  workspaceRoot: string,
+  scope: DiagnosticsScope
 ): DiagnosticsRunSummary {
   const byStatus = readCountsByStatus({
     db,
     workspaceRoot,
     tableName: TABLE_NAMES.runs,
-    statusColumn: "runs.status"
+    statusColumn: "runs.status",
+    scope
   });
-  const byBackendStatus = readRunCountsByBackendStatus(db, workspaceRoot);
+  const byBackendStatus = readRunCountsByBackendStatus(db, workspaceRoot, scope);
 
   return {
     total: Object.values(byStatus).reduce((total, count) => total + count, 0),
@@ -382,8 +893,10 @@ function readRunSummary(
 
 function readWorkspaceReviewSummary(
   db: ReturnType<DurableStateAdapter["getDatabase"]>,
-  workspaceRoot: string
+  workspaceRoot: string,
+  scope: DiagnosticsScope
 ): DiagnosticsWorkspaceReviewSummary {
+  const teamFilter = teamFilterClause(scope);
   const row = db
     .prepare(
       `
@@ -397,7 +910,7 @@ function readWorkspaceReviewSummary(
         FROM ${TABLE_NAMES.runs} AS runs
         JOIN ${TABLE_NAMES.teams} AS teams
           ON teams.team_id = runs.team_id
-        WHERE teams.workspace_root = ?
+        WHERE teams.workspace_root = ?${teamFilter.sql}
       `
     )
     .get(
@@ -406,7 +919,8 @@ function readWorkspaceReviewSummary(
       RUN_REVIEW_STATUSES.merged,
       RUN_REVIEW_STATUSES.mergeConflict,
       RUN_REVIEW_STATUSES.escalated,
-      workspaceRoot
+      workspaceRoot,
+      ...teamFilter.params
     ) as DiagnosticsWorkspaceReviewSummary | undefined;
 
   return {
@@ -424,7 +938,9 @@ function readCountsByStatus(input: {
   workspaceRoot: string;
   tableName: string;
   statusColumn: string;
+  scope: DiagnosticsScope;
 }): Record<string, number> {
+  const teamFilter = teamFilterClause(input.scope);
   const rows = input.db
     .prepare(
       `
@@ -434,20 +950,25 @@ function readCountsByStatus(input: {
         FROM ${input.tableName}
         JOIN ${TABLE_NAMES.teams} AS teams
           ON teams.team_id = ${input.tableName}.team_id
-        WHERE teams.workspace_root = ?
+        WHERE teams.workspace_root = ?${teamFilter.sql}
         GROUP BY ${input.statusColumn}
         ORDER BY ${input.statusColumn}
       `
     )
-    .all(input.workspaceRoot) as Array<{ status: string; count: number }>;
+    .all(input.workspaceRoot, ...teamFilter.params) as Array<{
+    status: string;
+    count: number;
+  }>;
 
   return Object.fromEntries(rows.map((row) => [row.status, row.count]));
 }
 
 function readRunCountsByBackendStatus(
   db: ReturnType<DurableStateAdapter["getDatabase"]>,
-  workspaceRoot: string
+  workspaceRoot: string,
+  scope: DiagnosticsScope
 ): Record<string, number> {
+  const teamFilter = teamFilterClause(scope);
   const rows = db
     .prepare(
       `
@@ -457,20 +978,29 @@ function readRunCountsByBackendStatus(
         FROM ${TABLE_NAMES.runs} AS runs
         JOIN ${TABLE_NAMES.teams} AS teams
           ON teams.team_id = runs.team_id
-        WHERE teams.workspace_root = ?
+        WHERE teams.workspace_root = ?${teamFilter.sql}
         GROUP BY COALESCE(runs.backend_status, 'unknown')
         ORDER BY backend_status
       `
     )
-    .all(workspaceRoot) as Array<{ backend_status: string; count: number }>;
+    .all(workspaceRoot, ...teamFilter.params) as Array<{
+    backend_status: string;
+    count: number;
+  }>;
 
   return Object.fromEntries(rows.map((row) => [row.backend_status, row.count]));
 }
 
 function readRunDebugRows(
   db: ReturnType<DurableStateAdapter["getDatabase"]>,
-  workspaceRoot: string
+  workspaceRoot: string,
+  scope: DiagnosticsScope,
+  truncation: DiagnosticsTruncation
 ): DiagnosticsRunDebugRow[] {
+  const teamFilter = teamFilterClause(scope);
+  const memberSql = scope.teammateMemberId ? " AND runs.member_id = ?" : "";
+  const memberParams = scope.teammateMemberId ? [scope.teammateMemberId] : [];
+  // Fetch one more than the cap to detect (and mark) truncation; newest first.
   const rows = db
     .prepare(
       `
@@ -493,11 +1023,17 @@ function readRunDebugRows(
         FROM ${TABLE_NAMES.runs} AS runs
         JOIN ${TABLE_NAMES.teams} AS teams
           ON teams.team_id = runs.team_id
-        WHERE teams.workspace_root = ?
+        WHERE teams.workspace_root = ?${teamFilter.sql}${memberSql}
         ORDER BY runs.updated_at DESC, runs.run_id DESC
+        LIMIT ?
       `
     )
-    .all(workspaceRoot) as Array<
+    .all(
+      workspaceRoot,
+      ...teamFilter.params,
+      ...memberParams,
+      scope.maxRuns + 1
+    ) as Array<
     Omit<
       DiagnosticsRunDebugRow,
       "changed_files" | "last_error" | "merge_status" | "final_message"
@@ -508,7 +1044,12 @@ function readRunDebugRows(
     }
   >;
 
-  return rows.map((row) => ({
+  const truncated = rows.length > scope.maxRuns;
+  const capped = truncated ? rows.slice(0, scope.maxRuns) : rows;
+  truncation.runs_returned = capped.length;
+  truncation.runs_truncated = truncated;
+
+  return capped.map((row) => ({
     run_id: row.run_id,
     member_id: row.member_id,
     backend: row.backend,
@@ -677,8 +1218,15 @@ interface MetadataDiagnosticsRunRow {
 // never live backend — so CI without tmux/codex stays deterministic.
 function readTeammateStatuses(
   db: ReturnType<DurableStateAdapter["getDatabase"]>,
-  workspaceRoot: string
+  workspaceRoot: string,
+  scope: DiagnosticsScope
 ): DiagnosticsTeammateStatus[] {
+  const teamFilter = teamFilterClause(scope);
+  const memberSql = scope.teammateMemberId ? " AND members.member_id = ?" : "";
+  const memberParams = scope.teammateMemberId ? [scope.teammateMemberId] : [];
+  // Archived teammates are excluded by default; include_archived opts them in.
+  const archivedSql = scope.includeArchived ? "" : " AND members.status != ?";
+  const archivedParams = scope.includeArchived ? [] : [MEMBER_STATUSES.archived];
   const rows = db
     .prepare(
       `
@@ -697,13 +1245,17 @@ function readTeammateStatuses(
           ON teams.team_id = members.team_id
         LEFT JOIN ${TABLE_NAMES.runs} AS runs
           ON runs.member_id = members.member_id
-        WHERE teams.workspace_root = ?
-          AND members.role = 'teammate'
-          AND members.status != ?
+        WHERE teams.workspace_root = ?${teamFilter.sql}
+          AND members.role = 'teammate'${memberSql}${archivedSql}
         ORDER BY members.joined_at ASC, runs.updated_at DESC, runs.run_id DESC
       `
     )
-    .all(workspaceRoot, MEMBER_STATUSES.archived) as TeammateStatusRow[];
+    .all(
+      workspaceRoot,
+      ...teamFilter.params,
+      ...memberParams,
+      ...archivedParams
+    ) as TeammateStatusRow[];
 
   const seen = new Set<string>();
   const teammates: DiagnosticsTeammateStatus[] = [];
@@ -817,8 +1369,12 @@ function isUnavailableSignal(lastError: string | null): boolean {
 function buildMetadataDiagnostics(
   db: ReturnType<DurableStateAdapter["getDatabase"]>,
   workspaceRoot: string,
-  executionBackend: ExecutionBackend
+  executionBackend: ExecutionBackend,
+  scope: DiagnosticsScope
 ): DiagnosticsMetadataDiagnostics | null {
+  const teamFilter = teamFilterClause(scope);
+  const memberSql = scope.teammateMemberId ? " AND runs.member_id = ?" : "";
+  const memberParams = scope.teammateMemberId ? [scope.teammateMemberId] : [];
   const rows = db
     .prepare(
       `
@@ -835,11 +1391,11 @@ function buildMetadataDiagnostics(
         FROM ${TABLE_NAMES.runs} AS runs
         JOIN ${TABLE_NAMES.teams} AS teams
           ON teams.team_id = runs.team_id
-        WHERE teams.workspace_root = ?
+        WHERE teams.workspace_root = ?${teamFilter.sql}${memberSql}
         ORDER BY runs.updated_at DESC, runs.run_id DESC
       `
     )
-    .all(workspaceRoot) as MetadataDiagnosticsRunRow[];
+    .all(workspaceRoot, ...teamFilter.params, ...memberParams) as MetadataDiagnosticsRunRow[];
 
   const match = rows.find((row) => {
     if (row.last_error === CODEX_SESSION_METADATA_UNAVAILABLE) {
@@ -893,26 +1449,32 @@ function optionalText(value: unknown): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
-function buildDiagnosticsState(
-  stateAdapter: DurableStateAdapter,
-  caller: NormalizedCallerMetadata
-): DurableDiagnosticsState {
-  const state = describeDurableState(stateAdapter);
-  const identity = buildWorkspaceScopedCallerIdentity({
-    workspaceRoot: state.workspaceRoot,
-    caller
-  });
-
+function buildDiagnosticsState(input: {
+  baseState: DurableStateRootDescription;
+  db: ReturnType<DurableStateAdapter["getDatabase"]>;
+  identity: NormalizedCallerIdentityLike;
+  scope: DiagnosticsScope;
+  detail: boolean;
+  truncation: DiagnosticsTruncation;
+}): DurableDiagnosticsState {
+  const { baseState, db, identity, scope, detail, truncation } = input;
+  // knownTeams ALWAYS surfaces (single-team: just the selected team; multi-team
+  // and the no-active-team fallback: the full list so the user can pick a
+  // team_name). The per-team detail (messages/tasks/events) is suppressed in the
+  // fallback so the output stays compact instead of dumping the whole workspace.
   return {
-    ...state,
-    activeBinding: readActiveBinding(stateAdapter.getDatabase(), identity.bindingKey),
-    knownTeams: readKnownTeams(stateAdapter.getDatabase(), state.workspaceRoot),
-    messageSummary: readMessageSummary(stateAdapter.getDatabase(), state.workspaceRoot),
-    taskSummary: readTaskSummary(stateAdapter.getDatabase(), state.workspaceRoot),
-    recentEvents: readRecentEventsForWorkspace(
-      stateAdapter.getDatabase(),
-      state.workspaceRoot
-    )
+    ...baseState,
+    activeBinding: readActiveBinding(db, identity.bindingKey),
+    knownTeams: readKnownTeams(db, baseState.workspaceRoot, scope),
+    messageSummary: detail
+      ? readMessageSummary(db, baseState.workspaceRoot, scope, truncation)
+      : emptyMessageSummary(),
+    taskSummary: detail
+      ? readTaskSummary(db, baseState.workspaceRoot, scope)
+      : { total: 0, by_status: {}, assigned: 0, blocked: 0 },
+    recentEvents: detail
+      ? readRecentEventsForWorkspace(db, baseState.workspaceRoot, scope, truncation)
+      : []
   };
 }
 
@@ -966,8 +1528,21 @@ function readActiveBinding(
 
 function readKnownTeams(
   db: ReturnType<DurableStateAdapter["getDatabase"]>,
-  workspaceRoot: string
+  workspaceRoot: string,
+  scope: DiagnosticsScope
 ): DiagnosticsKnownTeam[] {
+  // Single-team: just the explicitly selected team (any status — it was chosen
+  // on purpose). Otherwise the full workspace list, archived only when opted in.
+  const clauses = ["workspace_root = ?"];
+  const params: string[] = [workspaceRoot];
+  if (scope.teamId) {
+    clauses.push("team_id = ?");
+    params.push(scope.teamId);
+  } else if (!scope.includeArchived) {
+    clauses.push("status != ?");
+    params.push(TEAM_STATUSES.archived);
+  }
+
   return db
     .prepare(
       `
@@ -979,68 +1554,86 @@ function readKnownTeams(
           lead_agent_id,
           created_at
         FROM ${TABLE_NAMES.teams}
-        WHERE workspace_root = ?
-          AND status != ?
+        WHERE ${clauses.join(" AND ")}
         ORDER BY canonical_name
       `
     )
-    .all(workspaceRoot, TEAM_STATUSES.archived) as DiagnosticsKnownTeam[];
+    .all(...params) as DiagnosticsKnownTeam[];
+}
+
+interface MessageFilterRow {
+  status: string;
+  delivery_status: string;
+  metadata_json: string | null;
+}
+
+// Shared message filters: team (single-team), teammate (recipient OR sender),
+// and the messages_since ISO lower bound. Param order matches the clause order.
+function buildMessageFilters(scope: DiagnosticsScope): {
+  sql: string;
+  params: string[];
+} {
+  let sql = "";
+  const params: string[] = [];
+  if (scope.teamId) {
+    sql += " AND teams.team_id = ?";
+    params.push(scope.teamId);
+  }
+  if (scope.teammateMemberId) {
+    sql += " AND (messages.recipient_member_id = ? OR messages.sender_member_id = ?)";
+    params.push(scope.teammateMemberId, scope.teammateMemberId);
+  }
+  if (scope.messagesSince) {
+    sql += " AND messages.created_at >= ?";
+    params.push(scope.messagesSince);
+  }
+  return { sql, params };
+}
+
+// Aggregate a newest-first message row set into the summary, applying the
+// max_messages cap and (when a truncation accumulator is supplied) recording how
+// many rows matched vs were returned. D-02: counts/statuses only — never bodies.
+function aggregateMessageRows(
+  rows: MessageFilterRow[],
+  scope: DiagnosticsScope,
+  truncation?: DiagnosticsTruncation
+): DiagnosticsMessageSummary {
+  const matched = rows.length;
+  const capped = rows.slice(0, scope.maxMessages);
+  if (truncation) {
+    truncation.messages_matched = matched;
+    truncation.messages_returned = capped.length;
+    truncation.messages_truncated = matched > capped.length;
+  }
+
+  const byDeliveryStatus: Record<string, number> = {};
+  let queued = 0;
+  for (const row of capped) {
+    byDeliveryStatus[row.delivery_status] =
+      (byDeliveryStatus[row.delivery_status] ?? 0) + 1;
+    // `queued` now counts rows still genuinely in the queued state — the status
+    // column converges to `delivered` / `read` once a row is delivered / pulled, so
+    // this no longer over-reports every row as queued (the v1.2 observability fix).
+    // Delivered / read rows are still fully represented via total + by_delivery_status.
+    if (row.status === MESSAGE_ROW_STATUSES.queued) {
+      queued += 1;
+    }
+  }
+
+  return {
+    total: capped.length,
+    queued,
+    by_delivery_status: byDeliveryStatus
+  };
 }
 
 function readMessageSummary(
   db: ReturnType<DurableStateAdapter["getDatabase"]>,
-  workspaceRoot: string
+  workspaceRoot: string,
+  scope: DiagnosticsScope,
+  truncation: DiagnosticsTruncation
 ): DiagnosticsMessageSummary {
-  const totals = db
-    .prepare(
-      `
-        SELECT
-          COUNT(*) AS total,
-          COALESCE(SUM(CASE WHEN messages.status = ? THEN 1 ELSE 0 END), 0) AS queued
-        FROM ${TABLE_NAMES.messages} AS messages
-        JOIN ${TABLE_NAMES.teams} AS teams
-          ON teams.team_id = messages.team_id
-        WHERE teams.workspace_root = ?
-      `
-    )
-    .get(MESSAGE_ROW_STATUSES.queued, workspaceRoot) as
-    | { total: number; queued: number }
-    | undefined;
-
-  return {
-    total: totals?.total ?? 0,
-    queued: totals?.queued ?? 0,
-    by_delivery_status: readMessageCountsByDeliveryStatus(db, workspaceRoot)
-  };
-}
-
-function readMessageCountsByDeliveryStatus(
-  db: ReturnType<DurableStateAdapter["getDatabase"]>,
-  workspaceRoot: string
-): Record<string, number> {
-  const rows = db
-    .prepare(
-      `
-        SELECT
-          COALESCE(messages.delivery_status, 'unknown') AS delivery_status,
-          COUNT(*) AS count
-        FROM ${TABLE_NAMES.messages} AS messages
-        JOIN ${TABLE_NAMES.teams} AS teams
-          ON teams.team_id = messages.team_id
-        WHERE teams.workspace_root = ?
-        GROUP BY COALESCE(messages.delivery_status, 'unknown')
-        ORDER BY delivery_status
-      `
-    )
-    .all(workspaceRoot) as Array<{ delivery_status: string; count: number }>;
-
-  return Object.fromEntries(rows.map((row) => [row.delivery_status, row.count]));
-}
-
-function readPaneMessageSummary(
-  db: ReturnType<DurableStateAdapter["getDatabase"]>,
-  workspaceRoot: string
-): DiagnosticsMessageSummary {
+  const filters = buildMessageFilters(scope);
   const rows = db
     .prepare(
       `
@@ -1051,38 +1644,52 @@ function readPaneMessageSummary(
         FROM ${TABLE_NAMES.messages} AS messages
         JOIN ${TABLE_NAMES.teams} AS teams
           ON teams.team_id = messages.team_id
-        WHERE teams.workspace_root = ?
+        WHERE teams.workspace_root = ?${filters.sql}
         ORDER BY messages.created_at DESC, messages.message_id DESC
       `
     )
-    .all(workspaceRoot) as Array<{
-    status: string;
-    delivery_status: string;
-    metadata_json: string;
-  }>;
+    .all(workspaceRoot, ...filters.params) as MessageFilterRow[];
+
+  return aggregateMessageRows(rows, scope, truncation);
+}
+
+function readPaneMessageSummary(
+  db: ReturnType<DurableStateAdapter["getDatabase"]>,
+  workspaceRoot: string,
+  scope: DiagnosticsScope
+): DiagnosticsMessageSummary {
+  const filters = buildMessageFilters(scope);
+  const rows = db
+    .prepare(
+      `
+        SELECT
+          messages.status,
+          COALESCE(messages.delivery_status, 'unknown') AS delivery_status,
+          messages.metadata_json
+        FROM ${TABLE_NAMES.messages} AS messages
+        JOIN ${TABLE_NAMES.teams} AS teams
+          ON teams.team_id = messages.team_id
+        WHERE teams.workspace_root = ?${filters.sql}
+        ORDER BY messages.created_at DESC, messages.message_id DESC
+      `
+    )
+    .all(workspaceRoot, ...filters.params) as MessageFilterRow[];
+  // The pane message view excludes task-assignment rows (they surface in the task
+  // summary). The cap is applied AFTER that exclusion. Truncation for the message
+  // listing is tracked by the canonical state.messageSummary, not this view.
   const explicitMessageRows = rows.filter(
     (row) => parseJsonObject(row.metadata_json).message_type !== "task_assignment"
   );
-  const byDeliveryStatus: Record<string, number> = {};
 
-  for (const row of explicitMessageRows) {
-    byDeliveryStatus[row.delivery_status] =
-      (byDeliveryStatus[row.delivery_status] ?? 0) + 1;
-  }
-
-  return {
-    total: explicitMessageRows.length,
-    queued: explicitMessageRows.filter(
-      (row) => row.status === MESSAGE_ROW_STATUSES.queued
-    ).length,
-    by_delivery_status: byDeliveryStatus
-  };
+  return aggregateMessageRows(explicitMessageRows, scope);
 }
 
 function readTaskSummary(
   db: ReturnType<DurableStateAdapter["getDatabase"]>,
-  workspaceRoot: string
+  workspaceRoot: string,
+  scope: DiagnosticsScope
 ): DiagnosticsTaskSummary {
+  const teamFilter = teamFilterClause(scope);
   const totals = db
     .prepare(
       `
@@ -1092,23 +1699,27 @@ function readTaskSummary(
         FROM ${TABLE_NAMES.tasks} AS tasks
         JOIN ${TABLE_NAMES.teams} AS teams
           ON teams.team_id = tasks.team_id
-        WHERE teams.workspace_root = ?
+        WHERE teams.workspace_root = ?${teamFilter.sql}
       `
     )
-    .get(workspaceRoot) as { total: number; assigned: number } | undefined;
+    .get(workspaceRoot, ...teamFilter.params) as
+    | { total: number; assigned: number }
+    | undefined;
 
   return {
     total: totals?.total ?? 0,
-    by_status: readTaskCountsByStatus(db, workspaceRoot),
+    by_status: readTaskCountsByStatus(db, workspaceRoot, scope),
     assigned: totals?.assigned ?? 0,
-    blocked: readBlockedTaskCount(db, workspaceRoot)
+    blocked: readBlockedTaskCount(db, workspaceRoot, scope)
   };
 }
 
 function readTaskCountsByStatus(
   db: ReturnType<DurableStateAdapter["getDatabase"]>,
-  workspaceRoot: string
+  workspaceRoot: string,
+  scope: DiagnosticsScope
 ): Record<string, number> {
+  const teamFilter = teamFilterClause(scope);
   const rows = db
     .prepare(
       `
@@ -1118,20 +1729,25 @@ function readTaskCountsByStatus(
         FROM ${TABLE_NAMES.tasks} AS tasks
         JOIN ${TABLE_NAMES.teams} AS teams
           ON teams.team_id = tasks.team_id
-        WHERE teams.workspace_root = ?
+        WHERE teams.workspace_root = ?${teamFilter.sql}
         GROUP BY tasks.status
         ORDER BY tasks.status
       `
     )
-    .all(workspaceRoot) as Array<{ status: string; count: number }>;
+    .all(workspaceRoot, ...teamFilter.params) as Array<{
+    status: string;
+    count: number;
+  }>;
 
   return Object.fromEntries(rows.map((row) => [row.status, row.count]));
 }
 
 function readBlockedTaskCount(
   db: ReturnType<DurableStateAdapter["getDatabase"]>,
-  workspaceRoot: string
+  workspaceRoot: string,
+  scope: DiagnosticsScope
 ): number {
+  const teamFilter = teamFilterClause(scope);
   const row = db
     .prepare(
       `
@@ -1145,20 +1761,29 @@ function readBlockedTaskCount(
           AND task_edges.edge_type = 'blocks'
         JOIN ${TABLE_NAMES.tasks} AS blocker
           ON blocker.task_id = task_edges.source_task_id
-        WHERE teams.workspace_root = ?
+        WHERE teams.workspace_root = ?${teamFilter.sql}
           AND blocker.status != ?
       `
     )
-    .get(workspaceRoot, TASK_STATUSES.completed) as { blocked: number } | undefined;
+    .get(workspaceRoot, ...teamFilter.params, TASK_STATUSES.completed) as
+    | { blocked: number }
+    | undefined;
 
   return row?.blocked ?? 0;
 }
 
 function readRecentEventsForWorkspace(
   db: ReturnType<DurableStateAdapter["getDatabase"]>,
-  workspaceRoot: string
+  workspaceRoot: string,
+  scope: DiagnosticsScope,
+  truncation: DiagnosticsTruncation
 ): DiagnosticsRecentEvent[] {
-  return db
+  // Single-team: restrict to the team's own events (events.team_id). The events
+  // table carries its own team_id/workspace_root, so no JOIN is needed. Fetch one
+  // beyond the cap to detect (and mark) truncation; newest first.
+  const teamSql = scope.teamId ? " AND team_id = ?" : "";
+  const teamParams = scope.teamId ? [scope.teamId] : [];
+  const rows = db
     .prepare(
       `
         SELECT
@@ -1171,12 +1796,18 @@ function readRecentEventsForWorkspace(
           error_code,
           created_at
         FROM ${TABLE_NAMES.events}
-        WHERE workspace_root = ?
+        WHERE workspace_root = ?${teamSql}
         ORDER BY created_at DESC, event_id DESC
-        LIMIT 10
+        LIMIT ?
       `
     )
-    .all(workspaceRoot) as DiagnosticsRecentEvent[];
+    .all(workspaceRoot, ...teamParams, scope.maxEvents + 1) as DiagnosticsRecentEvent[];
+
+  const truncated = rows.length > scope.maxEvents;
+  const events = truncated ? rows.slice(0, scope.maxEvents) : rows;
+  truncation.events_returned = events.length;
+  truncation.events_truncated = truncated;
+  return events;
 }
 
 function parseChangedFiles(changedFilesJson: string | null): string[] {
