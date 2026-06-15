@@ -1,6 +1,6 @@
 {
   "name": "codex-team-mcp",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Unofficial Claude Agent Team compatibility MCP server for Codex.",
   "type": "module",
   "bin": {

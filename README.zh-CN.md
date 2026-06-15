@@ -64,6 +64,9 @@ codex mcp add codex-team \
   -- npx -y codex-team-mcp@latest
 ```
 
+> [!IMPORTANT]
+> **请严格按上面的写法安装——用 `npx`,且不要设 `cwd`。** 这一条对"由 agent(例如 Codex 本身)代为安装"同样适用:必须原样使用 `npx` 写法,**不要**把包 vendoring 到某个固定目录,也**不要**给这个 server 的配置加 `cwd`。工作区根目录——决定 team 的归属、也是文件改动型 TeamMate 创建 git worktree 所基于的目标仓——取自 server 的工作目录,默认会**继承你启动 Codex 时所在的目录**。把 `cwd` 钉到安装目录会让所有 team 绑到那里,并让文件改动型 TeamMate 全部被 `workspace_isolation_required` 拦下(那个目录不是你项目的 Git 仓)。如果你确实需要从固定位置启动 server,请改为设置 `CODEX_TEAM_WORKSPACE_ROOT` 指向你的项目路径,而不要依赖 `cwd`。
+
 重新加载或重启 Codex 的 MCP 服务器,然后确认工具清单包含:
 
 ```text
@@ -129,6 +132,18 @@ npx skills add Wynne-cwb/codex-team-mcp --skill codex-team-best-practices
 | `CODEX_TEAM_CODEX_COMMAND` | 命令名称（默认 `codex`） | 在 pane 支撑的运行中用于调用 Codex 的命令。 |
 | `CODEX_TEAM_STATE_ROOT` | 路径 | 覆盖 SQLite 状态目录。 |
 | `CODEX_TEAM_WORKSPACE_ROOT` | 路径 | 覆盖解析出的工作区根目录。 |
+
+### 工作区根目录的解析方式（如果 team 绑定到了错误位置,先读这段）
+
+**工作区根目录**决定了 team 的归属范围,也是文件改动型 TeamMate 创建隔离 worktree 时所基于的目标仓。它按以下顺序解析:
+
+1. `CODEX_TEAM_WORKSPACE_ROOT`(显式,优先级最高);
+2. 否则取 MCP server 进程的**当前工作目录**(`process.cwd()`)。
+
+用推荐的 `npx` 配置(不设 `cwd`)时,Codex 启动 server 会**继承它自己的工作目录**,所以工作区根目录就是你运行 `codex` 时所在的目录——**从你的项目仓里启动 codex**,一切就能正确绑定。
+
+> [!WARNING]
+> 如果你的 `~/.codex/config.toml` 给 codex-team server 写死了 `cwd`(某些 vendored/安装器配置会这么做,例如 `cwd = "~/.codex/vendor/codex-team-mcp"`),**且**没设 `CODEX_TEAM_WORKSPACE_ROOT`,工作区根目录就会回退到那个安装目录。它不是 Git 仓,于是每个文件改动型 TeamMate 都会被 `workspace_isolation_required` 拦下,所有 team 也会绑到安装目录而非你的项目。**修复:** 删掉 `cwd` 覆盖(让它继承 Codex 的 cwd)并从项目仓启动,**或**把 `CODEX_TEAM_WORKSPACE_ROOT` 设为你的项目路径。现在当 server 检测到工作区根目录是它自身的安装目录时,会在 `TeamCreate`/`Agent`(以及 `TeamDiagnostics`)结果里给出一条 `workspace_warnings`。
 
 ## 工具
 

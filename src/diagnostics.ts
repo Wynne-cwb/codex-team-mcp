@@ -52,6 +52,11 @@ export interface DiagnosticsPayloadOptions extends CodexTeamServerOptions {
   includeDebug?: boolean;
   targetClaudeTools?: readonly string[];
   registeredTools?: readonly ToolMapping[];
+  // The MCP client capabilities the connected client (e.g. codex) declared at
+  // initialize, surfaced in the debug block. Lets us confirm whether the client
+  // advertises the `roots` capability — the prerequisite for resolving the
+  // workspace root from MCP roots instead of process.cwd().
+  clientCapabilities?: unknown;
   // Debug-only terminal-context probe (D-02): injectable for deterministic tests.
   // Defaults to process.env + the real bounded it2 command runner, the same env
   // source the pane backend uses, so production reflects the live MCP process.
@@ -462,6 +467,10 @@ export function buildDiagnosticsPayload(options: DiagnosticsPayloadOptions = {})
       options.includeDebug === true
         ? {
             callerMetadataType: typeof options.callerMetadata,
+            // The connected MCP client's declared capabilities (e.g. codex). `roots`
+            // here would mean the workspace root could be resolved from MCP roots
+            // instead of process.cwd(); null when the client declared none.
+            clientCapabilities: options.clientCapabilities ?? null,
             runs: detail
               ? readRunDebugRows(db, state.workspaceRoot, scope, truncation)
               : [],

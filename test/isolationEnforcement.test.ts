@@ -182,6 +182,15 @@ describe("ISOL-01: file-modifying work without concrete isolation is blocked", (
     // The leader tree was never touched (no git repo materialized).
     expect(existsSync(path.join(nonGitLeader, ".git"))).toBe(false);
 
+    // The Agent result now carries an actionable, sanitized remediation alongside
+    // the stable error_code — the leader learns WHY + HOW to fix, not a bare code.
+    const errored = result as { error_code?: string; error_detail?: string };
+    expect(errored.error_code).toBe("workspace_isolation_required");
+    expect(errored.error_detail).toContain("CODEX_TEAM_WORKSPACE_ROOT");
+    expect(errored.error_detail).toContain("cwd");
+    // Sanitized: the prompt body is never echoed into the remediation.
+    expect(errored.error_detail).not.toContain("implement the feature");
+
     // The specific fail-closed reason is surfaced on the auditable event: the
     // TARGET repo could not be resolved (no cwd hint + container is not a repo).
     const reviewEvent = db

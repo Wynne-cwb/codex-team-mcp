@@ -105,6 +105,10 @@ export interface AgentScheduledResult {
   backend: AgentScheduledBackend;
   delivery_status?: MessageDeliveryStatus;
   error_code?: LifecycleActionResult["error_code"];
+  // Sanitized, actionable remediation paired with error_code (e.g. why
+  // workspace_isolation_required happened and how to fix it). Surfaced verbatim in
+  // the Agent tool result so the leader is not left with a bare code.
+  error_detail?: string;
   lifecycle?: LifecycleMetadataResult;
   debug: AgentScheduledDebug;
 }
@@ -526,6 +530,9 @@ export class AgentService {
       status: lifecycleResult.status,
       delivery_status: lifecycleResult.delivery_status,
       error_code: lifecycleResult.error_code,
+      ...(lifecycleResult.error_detail
+        ? { error_detail: lifecycleResult.error_detail }
+        : {}),
       backend: lifecycleResult.backend,
       lifecycle: lifecycleResult.lifecycle,
       debug: {

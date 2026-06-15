@@ -199,7 +199,12 @@ interface DiagnosticsToolArgs {
 }
 
 function createDiagnosticsToolHandler(
-  options: CodexTeamServerOptions
+  options: CodexTeamServerOptions,
+  // Lazily reads the connected client's declared MCP capabilities at request time
+  // (the client has connected by then). Best-effort: any failure yields undefined
+  // and the debug block simply shows null. Threaded in from registerCompatibilityTools
+  // because only it holds the McpServer instance.
+  getClientCapabilities?: () => unknown
 ): (
   args: DiagnosticsToolArgs,
   extra: unknown
@@ -212,6 +217,7 @@ function createDiagnosticsToolHandler(
           buildDiagnosticsPayload({
             ...options,
             callerMetadata: extra,
+            clientCapabilities: safeGetClientCapabilities(getClientCapabilities),
             includeDebug: args.include_debug,
             // Map the focus filters (snake_case primary; camelCase alias fallback).
             teamName: args.team_name ?? args.teamName,
@@ -270,7 +276,9 @@ export function registerCompatibilityTools(
     } else if (tool.codexToolName === "TaskGet") {
       handler = createTaskGetHandler(options);
     } else if (tool.codexToolName === "TeamDiagnostics") {
-      handler = createDiagnosticsToolHandler(options);
+      handler = createDiagnosticsToolHandler(options, () =>
+        server.server.getClientCapabilities()
+      );
     } else if (tool.codexToolName === "TeamMerge") {
       handler = createTeamMergeHandler(options);
     } else if (tool.codexToolName === "CheckInbox") {
@@ -303,6 +311,22 @@ type RegisteredToolHandler = (
   args: unknown,
   extra: unknown
 ) => Promise<{ content: Array<{ type: "text"; text: string }> }>;
+
+// Best-effort read of the connected client's declared MCP capabilities. Never
+// throws into the diagnostics handler — an unavailable getter (no client yet,
+// SDK shape change) just yields undefined, surfaced as null in the debug block.
+function safeGetClientCapabilities(
+  getClientCapabilities?: () => unknown
+): unknown {
+  if (!getClientCapabilities) {
+    return undefined;
+  }
+  try {
+    return getClientCapabilities();
+  } catch {
+    return undefined;
+  }
+}
 
 // Phase 16 (§1.4(a) BACKSTOP): wrap every codex-team tool handler with a thin,
 // best-effort, NON-GATING post-step that drains recipients ALREADY idle/stopped with

@@ -101,7 +101,10 @@ export function createTeamCreateHandler(
 
       return jsonResponse({
         implemented_now: true,
-        ...result
+        ...result,
+        ...(state.warnings.length > 0
+          ? { workspace_warnings: state.warnings }
+          : {})
       });
     } catch (error) {
       if (isTeamCreateValidationFailure(error)) {

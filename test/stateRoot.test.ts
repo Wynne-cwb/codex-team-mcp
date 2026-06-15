@@ -65,14 +65,40 @@ describe("state root resolution", () => {
     );
   });
 
-  it("warns when the default state root would land under the package source", () => {
+  it("warns when the workspace root is the dev checkout package dir", () => {
     const resolved = resolveStateRoot({ workspaceRoot: "/repo/codex-team" });
 
     expect(resolved.stateRoot).toBe(path.resolve("/repo/codex-team/.codex-team/state"));
-    expect(resolved.warnings).toContainEqual({
-      code: "state_root_inside_package",
-      message:
-        "Default state root resolved under codex-team package source; pass CODEX_TEAM_WORKSPACE_ROOT or CODEX_TEAM_STATE_ROOT to isolate runtime state."
+    const warning = resolved.warnings.find(
+      (entry) => entry.code === "state_root_inside_package"
+    );
+    expect(warning).toBeDefined();
+    expect(warning?.message).toContain("CODEX_TEAM_WORKSPACE_ROOT");
+    expect(warning?.message).toContain(path.resolve("/repo/codex-team"));
+  });
+
+  it("warns when the workspace root is the published/vendored install dir", () => {
+    // edon's repro: a `cwd` override pinned process.cwd() to the vendored install
+    // dir while CODEX_TEAM_WORKSPACE_ROOT was unset, so the workspace root fell back
+    // to `.../codex-team-mcp` — a non-repo dir that blocks file-modifying TeamMates.
+    const resolved = resolveStateRoot({
+      cwd: "/Users/edon/.codex/vendor/codex-team-mcp"
     });
+
+    expect(resolved.workspaceRoot).toBe(
+      path.resolve("/Users/edon/.codex/vendor/codex-team-mcp")
+    );
+    const warning = resolved.warnings.find(
+      (entry) => entry.code === "state_root_inside_package"
+    );
+    expect(warning).toBeDefined();
+    expect(warning?.message).toContain("workspace_isolation_required");
+    expect(warning?.message).toContain("codex-team-mcp");
+  });
+
+  it("does not warn for an ordinary project workspace root", () => {
+    const resolved = resolveStateRoot({ workspaceRoot: "/Users/edon/Projects/learn-basis" });
+
+    expect(resolved.warnings).toEqual([]);
   });
 });

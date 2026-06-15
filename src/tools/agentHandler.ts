@@ -115,7 +115,10 @@ export function createAgentHandler(
 
       return jsonResponse({
         implemented_now: true,
-        ...result
+        ...result,
+        ...(state.warnings.length > 0
+          ? { workspace_warnings: state.warnings }
+          : {})
       });
     } catch (error) {
       if (isAgentValidationFailure(error) && identity) {

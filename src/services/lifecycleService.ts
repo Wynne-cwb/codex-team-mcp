@@ -203,6 +203,11 @@ export interface LifecycleActionResult {
   status: "scheduled" | "running" | "idle" | "stopped" | "failed" | "stale";
   delivery_status: MessageDeliveryStatus;
   error_code?: "workspace_isolation_required" | "backend_failed" | "backend_unavailable";
+  // Human-readable, sanitized remediation surfaced to the caller alongside a stable
+  // error_code (the code stays the machine contract). Set for workspace_isolation_
+  // required so the leader sees WHY isolation could not be prepared (e.g. the leader
+  // workspace root is not a git repo) and HOW to fix it, instead of a bare code.
+  error_detail?: string;
   // Set when a synchronous one-shot turn completed at start (D-06): the member is
   // finalized to `final_status` (idle) and the caller (AgentService) notifies the lead.
   turn_completed?: boolean;
@@ -684,6 +689,11 @@ export class LifecycleService {
         safety,
         deliveryStatus: MESSAGE_DELIVERY_STATUSES.backendUnavailable,
         errorCode: WORKSPACE_ISOLATION_ERROR_CODE,
+        errorDetail: buildWorkspaceIsolationRemediation(
+          input.identity.workspaceRoot,
+          worktreeBlockedReason,
+          normalizeOptionalText(input.cwd)
+        ),
         lastError: WORKSPACE_ISOLATION_ERROR_CODE,
         promptPresent: input.prompt_present
       });
@@ -2746,6 +2756,7 @@ export class LifecycleService {
     safety: WorkspaceSafetyResult;
     deliveryStatus: MessageDeliveryStatus;
     errorCode: LifecycleActionResult["error_code"];
+    errorDetail?: string;
     lastError?: string | null;
     promptPresent: boolean;
   }): LifecycleActionResult {
@@ -2753,6 +2764,7 @@ export class LifecycleService {
       status: "scheduled",
       delivery_status: input.deliveryStatus,
       error_code: input.errorCode,
+      ...(input.errorDetail ? { error_detail: input.errorDetail } : {}),
       backend: {
         status: input.backendDescription.backend_status,
         backend: input.backendDescription.backend,
@@ -3118,6 +3130,32 @@ function isFileModifyingWork(classification: WorkClassification): boolean {
   return (
     classification === WORK_CLASSIFICATIONS.artifactWriting ||
     classification === WORK_CLASSIFICATIONS.codeImplementation
+  );
+}
+
+// Build the sanitized, actionable remediation surfaced on a workspace_isolation_
+// required result. The error_code stays the stable machine contract; this string
+// tells the leader the concrete cause (the worktree could not be created — usually
+// because the leader workspace root is not a git repo) and the three fixes. The
+// blocked reason is already sanitized by prepareSafety; the workspace root is the
+// caller's own path (non-sensitive, already surfaced in diagnostics).
+function buildWorkspaceIsolationRemediation(
+  workspaceRoot: string,
+  worktreeBlockedReason: string | null,
+  cwd: string | null
+): string {
+  const reasonClause = worktreeBlockedReason
+    ? ` Reason: ${worktreeBlockedReason}.`
+    : "";
+  const cwdClause = cwd
+    ? `The Agent cwd '${cwd}' did not resolve to a git repository.`
+    : `No Agent cwd was provided, so the leader workspace root '${workspaceRoot}' was used as the target repo — but it is not a git repository.`;
+  return (
+    "File-modifying TeamMate work requires an isolated git worktree, which could not be created. " +
+    `${cwdClause}${reasonClause} ` +
+    "Fix one of: (1) pass `cwd` on the Agent call pointing at your project's git repo; " +
+    "(2) set CODEX_TEAM_WORKSPACE_ROOT to your project repo (and remove any `cwd` override in the MCP server config); " +
+    "(3) launch codex from inside the project repo. Read-only / review-only work needs no worktree."
   );
 }
 

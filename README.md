@@ -64,6 +64,9 @@ codex mcp add codex-team \
   -- npx -y codex-team-mcp@latest
 ```
 
+> [!IMPORTANT]
+> **Install it exactly as shown — use `npx`, and do not set a `cwd`.** This applies equally if an agent (e.g. Codex itself) is performing the install: use the `npx` form verbatim, do **not** vendor the package into a fixed directory and do **not** add a `cwd` to this server's config. The workspace root — what teams bind to, and what file-modifying TeamMates branch their git worktree from — is taken from the server's working directory, which by default inherits the directory you launch Codex from. Pinning `cwd` to an install directory makes every team bind there and blocks file-modifying TeamMates with `workspace_isolation_required` (that directory is not your project's Git repo). If you must launch the server from a fixed location, set `CODEX_TEAM_WORKSPACE_ROOT` to your project path instead of relying on `cwd`.
+
 Reload or restart Codex MCP servers, then confirm the tool inventory includes:
 
 ```text
@@ -129,6 +132,18 @@ All configuration is through environment variables.
 | `CODEX_TEAM_CODEX_COMMAND` | command name (default `codex`) | Command used to invoke Codex for pane-backed runs. |
 | `CODEX_TEAM_STATE_ROOT` | path | Override the SQLite state directory. |
 | `CODEX_TEAM_WORKSPACE_ROOT` | path | Override the resolved workspace root. |
+
+### Workspace root resolution (read this if teams bind to the wrong place)
+
+The **workspace root** is what teams are scoped to and what file-modifying TeamMates branch their isolated worktree from. It resolves in this order:
+
+1. `CODEX_TEAM_WORKSPACE_ROOT` (explicit — wins);
+2. otherwise the MCP server process's **current working directory** (`process.cwd()`).
+
+With the recommended `npx` config (no `cwd` set), Codex launches the server **inheriting its own working directory**, so the workspace root is just wherever you ran `codex` — launch it from inside your project repo and everything binds correctly.
+
+> [!WARNING]
+> If your `~/.codex/config.toml` pins a `cwd` for the codex-team server (some vendored/installer setups do, e.g. `cwd = "~/.codex/vendor/codex-team-mcp"`) **and** `CODEX_TEAM_WORKSPACE_ROOT` is unset, the workspace root falls back to that install directory. It is not a Git repo, so every file-modifying TeamMate is blocked with `workspace_isolation_required`, and all teams bind under the install dir instead of your project. **Fix:** remove the `cwd` override (let it inherit Codex's cwd) and launch from your project repo, **or** set `CODEX_TEAM_WORKSPACE_ROOT` to your project path. The server now emits a `workspace_warnings` entry on `TeamCreate`/`Agent` (and `TeamDiagnostics`) when it detects the workspace root is its own install directory.
 
 ## Tools
 

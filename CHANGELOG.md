@@ -3,6 +3,42 @@
 All notable changes to `codex-team-mcp` are documented here. This project
 follows [semantic versioning](https://semver.org/).
 
+## v0.5.1 — workspace root 误绑定的诊断与守卫(安装目录场景)
+
+修复一类难以自查的失败:当 MCP server 的 `cwd` 被(安装器/vendored 配置)写死到自身
+安装目录(如 `~/.codex/vendor/codex-team-mcp`)且未设 `CODEX_TEAM_WORKSPACE_ROOT` 时,
+工作区根目录回退到那个非 Git 目录,导致所有 team 绑到安装目录、且每个文件改动型
+TeamMate 都被 `workspace_isolation_required` 拦下——而错误信息此前零线索,看起来像
+git/worktree 问题。本版不改变解析行为,只让失败**可自解释**。
+
+### 修复 (Fixes)
+- **`workspace_isolation_required` 现在带可执行 remediation**:`Agent` 结果在隔离失败时
+  新增 `error_detail` 字段(与稳定的 `error_code` 并存),说明具体原因(worktree 建不起来——
+  通常因为 leader 工作区根不是 git 仓)+ 三种修法(传 `cwd` / 设 `CODEX_TEAM_WORKSPACE_ROOT` /
+  从项目仓启动)。文本经 sanitize,绝不回显 prompt。此前该原因只记在审计事件 payload 里,
+  工具返回只有光秃秃的 error_code。
+- **修复安装目录探测漏洞**:`state_root_inside_package` 守卫此前只认开发态 checkout 名
+  `codex-team`,认不出发布/vendored 包名 `codex-team-mcp`,所以最常见的误绑定场景连告警都
+  不触发。现改为按工作区根目录的 basename 检测(`codex-team` 或 `codex-team-mcp`),并给出
+  可执行的告警文案。
+
+### 新增 (Features)
+- **`workspace_warnings` 在工具结果中暴露**:当检测到工作区根目录是 codex-team 自身的安装
+  目录时,`TeamCreate` / `Agent` 结果会附带 `workspace_warnings`(此前该告警仅作为
+  `TeamDiagnostics` 内的死元数据,从不在创建路径上暴露给用户)。
+- **`TeamDiagnostics` debug 块新增 `clientCapabilities`**:`include_debug` 时透出已连接
+  MCP client(如 codex)声明的能力,用于确认是否支持 `roots`——这是后续“从 MCP roots 解析
+  工作区根、实现零配置”的前置判断依据。
+
+### 变更 (Changes)
+- 向后兼容、无破坏性变更:`error_detail` / `workspace_warnings` / `clientCapabilities`
+  均为新增字段;解析顺序(`CODEX_TEAM_WORKSPACE_ROOT` → `process.cwd()`)与隔离 fail-closed
+  语义不变。README / README.zh-CN 新增「工作区根目录的解析方式」一节,警示写死 `cwd` 的坑。
+- **README 安装步骤改为 agent-proof**:edon 的根因是让 Codex 读 README 代为安装时,Codex
+  自行 vendoring 并写死了 `cwd`。Quickstart 现新增一条硬约束:严格用 `npx`、不要 vendoring、
+  不要设 `cwd`(对"由 agent 代装"显式适用),并解释 workspace root 取自 server 的 cwd——
+  从源头阻止安装方即兴写死 `cwd`。
+
 ## v0.5.0 — TL 收件箱拉取优化 + 使用最佳实践 skill + 中文 README
 
 ### 新增 (Features)
